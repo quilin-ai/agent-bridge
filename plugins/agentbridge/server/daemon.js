@@ -9,6 +9,7 @@ import { spawn, execSync } from "child_process";
 import { createInterface } from "readline";
 import { EventEmitter } from "events";
 import { appendFileSync } from "fs";
+import { createHash } from "crypto";
 
 // src/state-dir.ts
 import { mkdirSync, existsSync } from "fs";
@@ -78,7 +79,9 @@ var APP_SERVER_NOTIFICATION_METHODS = [
   "turn/completed",
   "item/started",
   "item/agentMessage/delta",
-  "item/completed"
+  "item/completed",
+  "error",
+  "thread/closed"
 ];
 var TRACKED_REQUEST_METHOD_SET = new Set(APP_SERVER_TRACKED_REQUEST_METHODS);
 var SERVER_REQUEST_METHOD_SET = new Set(APP_SERVER_SERVER_REQUEST_METHODS);
@@ -145,6 +148,12 @@ class CodexAdapter extends EventEmitter {
   sessionRestoreInProgress = false;
   replayPending = new Map;
   static SESSION_REPLAY_TIMEOUT_MS = 5000;
+  pairedChatId = null;
+  injectedTurnIds = new Map;
+  pendingInjectionHashes = new Map;
+  pendingInjectionByReqId = new Map;
+  static ECHO_DEDUP_TTL_MS = 60000;
+  static PENDING_HASH_TTL_MS = 5000;
   constructor(appPort = 4500, proxyPort = 4501, logFile = new StateDirResolver().logFile) {
     super();
     this.appPort = appPort;
@@ -222,6 +231,10 @@ class CodexAdapter extends EventEmitter {
       this.log("Cannot inject: app-server WebSocket not connected");
       return false;
     }
+    if (this.sessionRestoreInProgress) {
+      this.log(`Rejected injection: shared Codex TUI session restore in progress`);
+      return false;
+    }
     if (this.turnInProgress) {
       this.log(`Rejected injection: Codex turn is in progress (thread ${this.threadId})`);
       return false;
@@ -229,6 +242,9 @@ class CodexAdapter extends EventEmitter {
     this.log(`Injecting message into Codex (${text.length} chars)`);
     const requestId = this.nextInjectionId--;
     this.trackBridgeRequestId(requestId);
+    const contentHash = this.hashInjectionContent(text);
+    this.pendingInjectionHashes.set(contentHash, Date.now() + CodexAdapter.PENDING_HASH_TTL_MS);
+    this.pendingInjectionByReqId.set(requestId, contentHash);
     try {
       this.appServerWs.send(JSON.stringify({
         method: "turn/start",
@@ -238,9 +254,49 @@ class CodexAdapter extends EventEmitter {
       return true;
     } catch (err) {
       this.untrackBridgeRequestId(requestId);
+      this.pendingInjectionByReqId.delete(requestId);
+      this.pendingInjectionHashes.delete(contentHash);
       this.log(`Injection send failed: ${err.message}`);
       return false;
     }
+  }
+  setPairedChat(chatId) {
+    this.pairedChatId = chatId;
+    this.log(`Paired chat set to: ${chatId ?? "<none>"}`);
+  }
+  isPaired(chatId) {
+    return this.pairedChatId !== null && this.pairedChatId === chatId;
+  }
+  get currentPairedChatId() {
+    return this.pairedChatId;
+  }
+  hashInjectionContent(text) {
+    return createHash("sha1").update(text).digest("hex").slice(0, 16);
+  }
+  isEchoOfInjection(content, turnId) {
+    if (typeof turnId === "string" && turnId.length > 0) {
+      const expiresAt = this.injectedTurnIds.get(turnId);
+      if (expiresAt !== undefined) {
+        if (Date.now() <= expiresAt)
+          return true;
+        this.injectedTurnIds.delete(turnId);
+      }
+    }
+    const hash = this.hashInjectionContent(content);
+    const hashExpiresAt = this.pendingInjectionHashes.get(hash);
+    if (hashExpiresAt !== undefined) {
+      if (Date.now() <= hashExpiresAt) {
+        this.pendingInjectionHashes.delete(hash);
+        return true;
+      }
+      this.pendingInjectionHashes.delete(hash);
+    }
+    return false;
+  }
+  recordInjectedTurnId(turnId, contentHash) {
+    this.injectedTurnIds.set(turnId, Date.now() + CodexAdapter.ECHO_DEDUP_TTL_MS);
+    if (contentHash)
+      this.pendingInjectionHashes.delete(contentHash);
   }
   async waitForHealthy(maxRetries = 20, delayMs = 500) {
     for (let i = 0;i < maxRetries; i++) {
@@ -436,6 +492,8 @@ class CodexAdapter extends EventEmitter {
       return;
     }
     this.sessionRestoreInProgress = true;
+    this.emit("sessionRestoreStart", { threadId: this.threadId });
+    let restoreSucceeded = false;
     try {
       this.log(`DIAGNOSTIC: replaying cached initialize to restore session (threadId=${this.threadId ?? "none"})`);
       await this.sendReplayAndAwait(this.lastInitializeRaw, "initialize");
@@ -453,6 +511,7 @@ class CodexAdapter extends EventEmitter {
         await this.sendReplayAndAwait(resumeRaw, "thread/resume");
       }
       this.log(`DIAGNOSTIC: session restored after unintentional reconnect (threadId=${this.threadId ?? "none"})`);
+      restoreSucceeded = true;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       this.log(`ERROR: session restore failed (${msg}) \u2014 closing TUI with 1011`);
@@ -467,7 +526,11 @@ class CodexAdapter extends EventEmitter {
       }
     } finally {
       this.sessionRestoreInProgress = false;
+      this.emit("sessionRestoreEnd", { threadId: this.threadId, ok: restoreSucceeded });
     }
+  }
+  get isSessionRestoreInProgress() {
+    return this.sessionRestoreInProgress;
   }
   sendReplayAndAwait(raw, method) {
     if (!this.appServerWs || this.appServerWs.readyState !== WebSocket.OPEN) {
@@ -550,11 +613,16 @@ class CodexAdapter extends EventEmitter {
       fetch(req, server) {
         const url = new URL(req.url);
         const isUpgrade = req.headers.get("upgrade")?.toLowerCase() === "websocket";
-        self.log(`HTTP ${req.method} ${url.pathname} (upgrade=${isUpgrade})`);
+        const queryToken = url.searchParams.get("abg_token") ?? "";
+        const authHeader = req.headers.get("authorization") ?? "";
+        const bearerToken = authHeader.match(/^Bearer\s+(.+)$/i)?.[1]?.trim() ?? "";
+        const token = bearerToken || queryToken;
+        const tokenSource = bearerToken ? "authorization" : queryToken ? "query" : "none";
+        self.log(`HTTP ${req.method} ${url.pathname} (upgrade=${isUpgrade}, token=${token ? token.slice(0, 8) + "\u2026" : "<none>"}, tokenSource=${tokenSource})`);
         if (url.pathname === "/healthz" || url.pathname === "/readyz") {
           return fetch(`http://127.0.0.1:${self.appPort}${url.pathname}`);
         }
-        if (server.upgrade(req, { data: { connId: 0 } }))
+        if (server.upgrade(req, { data: { connId: 0, token } }))
           return;
         self.log(`WARNING: non-upgrade HTTP request not handled: ${req.method} ${url.pathname}`);
         return new Response("AgentBridge Codex Proxy");
@@ -573,7 +641,18 @@ class CodexAdapter extends EventEmitter {
     const connId = ++this.connIdCounter;
     ws.data.connId = connId;
     if (this.tuiWs) {
-      this.log(`Secondary TUI connected (conn #${connId}, primary is #${this.tuiConnId})`);
+      const primaryToken = this.tuiWs.data.token;
+      const newToken = ws.data.token;
+      if (primaryToken !== newToken) {
+        this.log(`Rejecting second proxy TUI: token mismatch (primary conn #${this.tuiConnId} token=${primaryToken ? primaryToken.slice(0, 8) + "\u2026" : "<none>"}, new conn #${connId} token=${newToken ? newToken.slice(0, 8) + "\u2026" : "<none>"})`);
+        try {
+          ws.close(4002, "another --via-proxy TUI is already connected");
+        } catch (err) {
+          this.log(`Failed to close rejected second TUI cleanly: ${err.message}`);
+        }
+        return;
+      }
+      this.log(`Secondary TUI connected (conn #${connId}, primary is #${this.tuiConnId}, token matches)`);
       this.setupSecondaryConnection(ws, connId);
       return;
     }
@@ -581,8 +660,8 @@ class CodexAdapter extends EventEmitter {
     this.tuiConnId = connId;
     this.tuiWs = ws;
     this.threadId = null;
-    this.log(`TUI connected (conn #${this.tuiConnId})`);
-    this.emit("tuiConnected", this.tuiConnId);
+    this.log(`TUI connected (conn #${this.tuiConnId}, token=${ws.data.token ? ws.data.token.slice(0, 8) + "\u2026" : "<none>"})`);
+    this.emit("tuiConnected", this.tuiConnId, ws.data.token);
     if (previousConnId !== null) {
       this.retireConnectionState(previousConnId);
     }
@@ -924,8 +1003,22 @@ class CodexAdapter extends EventEmitter {
     if (!isNaN(numericId) && this.consumeBridgeRequestId(numericId)) {
       if (parsed.error) {
         this.log(`Bridge-originated request failed (id ${responseId}): ${parsed.error.message ?? "unknown error"}`);
+        const contentHash = this.pendingInjectionByReqId.get(numericId);
+        if (contentHash) {
+          this.pendingInjectionHashes.delete(contentHash);
+          this.pendingInjectionByReqId.delete(numericId);
+        }
       } else {
-        this.log(`Bridge-originated request completed (id ${responseId})`);
+        const result = parsed.result ?? {};
+        const turnId = result.turn?.id;
+        const contentHash = this.pendingInjectionByReqId.get(numericId);
+        this.pendingInjectionByReqId.delete(numericId);
+        if (typeof turnId === "string" && turnId.length > 0) {
+          this.recordInjectedTurnId(turnId, contentHash);
+          this.log(`Bridge-originated request completed (id ${responseId}, turnId=${turnId} dedup)`);
+        } else {
+          this.log(`Bridge-originated request completed (id ${responseId}, no turnId \u2014 falling back to content-hash dedup)`);
+        }
       }
       return null;
     }
@@ -968,9 +1061,10 @@ class CodexAdapter extends EventEmitter {
   handleServerNotification(msg) {
     const { method, params } = msg;
     switch (method) {
-      case "turn/started":
+      case "turn/started": {
         this.markTurnStarted(params?.turn?.id);
         break;
+      }
       case "item/started": {
         const item = params?.item;
         if (item?.type === "agentMessage")
@@ -1000,15 +1094,46 @@ class CodexAdapter extends EventEmitter {
               timestamp: Date.now()
             });
           }
+        } else if (item?.type === "userMessage") {
+          const content = this.extractContent(item);
+          if (content) {
+            const turnIdFromParams = typeof params?.turnId === "string" ? params.turnId : undefined;
+            if (this.isEchoOfInjection(content, turnIdFromParams)) {
+              this.log(`Suppressed userMessage echo (item ${item.id}, ${content.length} chars)`);
+            } else {
+              this.log(`User message from TUI (${content.length} chars)`);
+              this.emit("userMessage", {
+                id: item.id,
+                source: "codex",
+                content,
+                timestamp: Date.now(),
+                turnId: turnIdFromParams
+              });
+            }
+          }
         }
         break;
       }
       case "turn/completed": {
         const wasInProgress = this.turnInProgress;
-        this.markTurnCompleted(params?.turn?.id);
+        const turnId = params?.turn?.id;
+        this.markTurnCompleted(turnId);
         if (wasInProgress && !this.turnInProgress) {
-          this.emit("turnCompleted");
+          this.emit("turnCompleted", { turnId });
         }
+        break;
+      }
+      case "error": {
+        const errorParams = params ?? {};
+        const detail = errorParams.error?.message ?? "(no error message)";
+        const code = errorParams.error?.code;
+        this.log(`App-server error notification: ${detail}${code !== undefined ? ` (code ${code})` : ""}`);
+        this.emit("errorItem", { code, message: detail, data: errorParams.error?.data });
+        break;
+      }
+      case "thread/closed": {
+        const closedThreadId = params ?? {};
+        this.emit("threadClosed", { threadId: closedThreadId.threadId });
         break;
       }
     }
@@ -1108,7 +1233,7 @@ class CodexAdapter extends EventEmitter {
     }
     this.turnInProgress = this.activeTurnIds.size > 0;
     if (!wasInProgress && this.turnInProgress) {
-      this.emit("turnStarted");
+      this.emit("turnStarted", { turnId });
     }
   }
   markTurnCompleted(turnId) {
@@ -2168,6 +2293,7 @@ var CONTROL_PORT = parseInt(process.env.AGENTBRIDGE_CONTROL_PORT ?? "4502", 10);
 var TUI_DISCONNECT_GRACE_MS = parseInt(process.env.TUI_DISCONNECT_GRACE_MS ?? "2500", 10);
 var CLAUDE_DISCONNECT_GRACE_MS = 5000;
 var CLAUDE_REAP_AFTER_MS = parseInt(process.env.AGENTBRIDGE_CLAUDE_REAP_MS ?? "600000", 10);
+var PAIR_REAP_MS = parseInt(process.env.AGENTBRIDGE_PAIR_REAP_MS ?? "30000", 10);
 var MAX_BUFFERED_MESSAGES = parseInt(process.env.AGENTBRIDGE_MAX_BUFFERED_MESSAGES ?? "100", 10);
 var FILTER_MODE = process.env.AGENTBRIDGE_FILTER_MODE === "full" ? "full" : "filtered";
 var IDLE_SHUTDOWN_MS = parseInt(process.env.AGENTBRIDGE_IDLE_SHUTDOWN_MS ?? String(config.idleShutdownSeconds * 1000), 10);
@@ -2181,6 +2307,7 @@ var codexBootstrapped = false;
 var shuttingDown = false;
 var idleShutdownTimer = null;
 var chats = new Map;
+var proxyTuiSlot = null;
 var tuiConnectionState = new TuiConnectionState({
   disconnectGraceMs: TUI_DISCONNECT_GRACE_MS,
   log,
@@ -2194,19 +2321,183 @@ var tuiConnectionState = new TuiConnectionState({
 codex.on("ready", (threadId) => {
   tuiConnectionState.markBridgeReady();
   log(`Codex TUI thread ready: ${threadId} (bridge fully operational)`);
+  if (proxyTuiSlot) {
+    proxyTuiSlot.readiness = "ready";
+    if (proxyTuiSlot.pairedChatId) {
+      const state = chats.get(proxyTuiSlot.pairedChatId);
+      if (state && !state.ready) {
+        state.ready = true;
+        emitToChat(state, systemMessage("system_pair_ready", `\u2705 Shared Codex TUI thread is now ready (threadId=${threadId}). Replies sent via the reply tool will appear in the right pane's TUI.`));
+      }
+    }
+  }
 });
-codex.on("tuiConnected", (connId) => {
+codex.on("tuiConnected", (connId, token = "") => {
   tuiConnectionState.handleTuiConnected(connId);
   cancelIdleShutdown();
-  log(`Codex TUI connected (conn #${connId})`);
+  log(`Codex TUI connected (conn #${connId}, token=${token ? token.slice(0, 8) + "\u2026" : "<none>"})`);
+  if (token && !proxyTuiSlot) {
+    proxyTuiSlot = {
+      token,
+      pairedChatId: null,
+      readiness: "not-ready",
+      attachedAt: Date.now(),
+      pairReapTimer: null
+    };
+    log(`Proxy TUI slot allocated (token=${token.slice(0, 8)}\u2026)`);
+  }
   broadcastStatus();
 });
 codex.on("tuiDisconnected", (connId) => {
   tuiConnectionState.handleTuiDisconnected(connId);
   log(`Codex TUI disconnected (conn #${connId})`);
+  if (proxyTuiSlot) {
+    const wasPairedChat = proxyTuiSlot.pairedChatId;
+    if (proxyTuiSlot.pairReapTimer)
+      clearTimeout(proxyTuiSlot.pairReapTimer);
+    proxyTuiSlot = null;
+    codex.setPairedChat(null);
+    if (wasPairedChat) {
+      const state = chats.get(wasPairedChat);
+      if (state) {
+        log(`Transitioning paired chat ${wasPairedChat} to isolated (TUI disconnect)`);
+        transitionToIsolated(state, "Shared Codex TUI thread is gone");
+      }
+    }
+  }
   broadcastStatus();
   scheduleIdleShutdown();
 });
+codex.on("agentMessage", (msg) => {
+  const paired = getPairedChatState();
+  if (!paired)
+    return;
+  log(`[${paired.chatId}] CodexAdapter \u2192 paired Claude (agentMessage, ${msg.content.length} chars)`);
+  paired.pairedTurnSawAgentMessage = true;
+  paired.replyReceivedDuringTurn = true;
+  emitToChat(paired, msg);
+});
+codex.on("userMessage", (payload) => {
+  const paired = getPairedChatState();
+  if (!paired)
+    return;
+  if (!payload.content)
+    return;
+  log(`[${paired.chatId}] CodexAdapter \u2192 paired Claude (userMessage from TUI, ${payload.content.length} chars)`);
+  paired.replyReceivedDuringTurn = true;
+  emitToChat(paired, {
+    id: payload.id ?? `tui_user_${Date.now()}`,
+    source: "codex",
+    content: `[IMPORTANT] Human typed in the paired Codex TUI:
+${payload.content}`,
+    timestamp: Date.now()
+  });
+});
+codex.on("turnStarted", () => {
+  const paired = getPairedChatState();
+  if (!paired)
+    return;
+  paired.pairedTurnSawAgentMessage = false;
+  emitToChat(paired, systemMessage("system_codex_turn_started", "[system] Codex turn started"));
+});
+codex.on("turnCompleted", () => {
+  const paired = getPairedChatState();
+  if (!paired)
+    return;
+  if (!paired.pairedTurnSawAgentMessage) {
+    log(`[${paired.chatId}] Codex turn completed with no agentMessage \u2014 surfacing as failure signal`);
+    paired.replyReceivedDuringTurn = true;
+    emitToChat(paired, systemMessage("system_codex_turn_completed_no_output", "[system] Codex turn completed without any agentMessage \u2014 likely a failure or empty response."));
+  } else {
+    emitToChat(paired, systemMessage("system_codex_turn_completed", "[system] Codex turn completed"));
+  }
+  paired.replyRequired = false;
+  paired.replyReceivedDuringTurn = false;
+});
+codex.on("errorItem", (payload) => {
+  const paired = getPairedChatState();
+  if (!paired)
+    return;
+  paired.replyReceivedDuringTurn = true;
+  emitToChat(paired, systemMessage("system_codex_error", `[error] ${payload.message ?? "(no message)"}${payload.code !== undefined ? ` (code ${payload.code})` : ""}`));
+  paired.replyRequired = false;
+});
+codex.on("sessionRestoreStart", () => {
+  if (!proxyTuiSlot)
+    return;
+  log(`Shared Codex session restore started \u2014 flipping paired readiness to not-ready`);
+  proxyTuiSlot.readiness = "not-ready";
+  const paired = getPairedChatState();
+  if (paired)
+    paired.ready = false;
+});
+codex.on("sessionRestoreEnd", (payload = {}) => {
+  if (!proxyTuiSlot)
+    return;
+  if (payload.ok === false) {
+    log(`Shared Codex session restore FAILED \u2014 keeping paired readiness=not-ready, awaiting TUI tear-down`);
+    return;
+  }
+  log(`Shared Codex session restore succeeded \u2014 flipping paired readiness back to ready`);
+  proxyTuiSlot.readiness = "ready";
+  const paired = getPairedChatState();
+  if (paired) {
+    paired.ready = true;
+    emitToChat(paired, systemMessage("system_pair_restored", "\u2705 Shared Codex TUI session restored. Replies can flow again."));
+  }
+});
+codex.on("threadClosed", () => {
+  const paired = getPairedChatState();
+  log(`Codex emitted thread/closed`);
+  if (proxyTuiSlot) {
+    const wasPairedChat = proxyTuiSlot.pairedChatId;
+    proxyTuiSlot = null;
+    codex.setPairedChat(null);
+    if (wasPairedChat && paired) {
+      log(`Transitioning paired chat ${wasPairedChat} to isolated (thread/closed)`);
+      transitionToIsolated(paired, "Shared Codex thread closed");
+    }
+  }
+});
+function getPairedChatState() {
+  if (!proxyTuiSlot?.pairedChatId)
+    return null;
+  return chats.get(proxyTuiSlot.pairedChatId) ?? null;
+}
+function pairChat(state) {
+  if (!proxyTuiSlot)
+    return;
+  if (proxyTuiSlot.pairedChatId)
+    return;
+  proxyTuiSlot.pairedChatId = state.chatId;
+  state.paired = true;
+  codex.setPairedChat(state.chatId);
+  state.ready = proxyTuiSlot.readiness === "ready";
+  log(`Paired chat ${state.chatId} with proxy TUI (readiness=${proxyTuiSlot.readiness})`);
+  if (state.ready) {
+    emitToChat(state, systemMessage("system_paired_ready", "\u2705 This Claude session is paired with the right-pane Codex TUI. Replies will appear there; user typing in the TUI will be forwarded to you with an [IMPORTANT] prefix."));
+  } else {
+    emitToChat(state, systemMessage("system_paired_provisioning", "\u2705 This Claude session is paired with the right-pane Codex TUI. Waiting for the shared thread to finish provisioning before replies can flow."));
+  }
+}
+function transitionToIsolated(state, reason) {
+  state.paired = false;
+  emitToChat(state, systemMessage("system_pair_torn_down", `[system] ${reason}. Future replies will use a fresh isolated Codex thread (no prior shared-TUI context carried over).`));
+  state.thread = new ClaudeThread({
+    appServerUrl: codex.appServerUrl,
+    chatId: state.chatId,
+    logFile: stateDir.logFile,
+    cwd: process.cwd()
+  });
+  state.ready = false;
+  wireClaudeThreadEvents(state);
+  state.thread.bootstrap().then((threadId) => {
+    state.ready = true;
+    emitToChat(state, systemMessage("system_isolated_ready", `\u2705 Fresh isolated Codex thread ready (threadId=${threadId}).`));
+  }).catch((err) => {
+    emitToChat(state, systemMessage("system_isolated_failed", `\u274C Failed to bootstrap isolated Codex thread: ${err?.message ?? err}.`));
+  });
+}
 codex.on("error", (err) => {
   log(`Codex error: ${err.message}`);
 });
@@ -2321,6 +2612,12 @@ async function attachClaude(ws, requestedChatId) {
   cancelIdleShutdown();
   log(`New Claude session attached: chatId=${chatId} (#${ws.data.clientId}, total=${chats.size})`);
   sendStatus(ws);
+  if (proxyTuiSlot && proxyTuiSlot.pairedChatId === null) {
+    emitToChat(state, systemMessage("system_bridge_provisioning", "\u2705 AgentBridge daemon attached. Pairing with the right-pane Codex TUI for shared-thread mode..."));
+    pairChat(state);
+    broadcastStatus();
+    return;
+  }
   emitToChat(state, systemMessage("system_bridge_provisioning", "\u2705 AgentBridge daemon attached. Provisioning your dedicated Codex thread..."));
   try {
     const threadId = await state.thread.bootstrap();
@@ -2344,6 +2641,8 @@ function createChatState(chatId) {
       cwd: process.cwd()
     }),
     ready: false,
+    paired: false,
+    pairedTurnSawAgentMessage: false,
     inAttentionWindow: false,
     attentionWindowTimer: null,
     replyRequired: false,
@@ -2357,6 +2656,11 @@ function createChatState(chatId) {
     nextSystemMessageId: 0
   };
   state.statusBuffer = new StatusBuffer((summary) => emitToChat(state, summary));
+  wireClaudeThreadEvents(state);
+  return state;
+}
+function wireClaudeThreadEvents(state) {
+  const chatId = state.chatId;
   state.thread.on("agentMessage", (msg) => {
     if (msg.source !== "codex")
       return;
@@ -2415,15 +2719,45 @@ function createChatState(chatId) {
   state.thread.on("error", (err) => {
     log(`[${chatId}] ClaudeThread error: ${err?.message ?? err}`);
   });
-  return state;
 }
 function detachClaudeWs(state, reason) {
   if (!state.ws)
     return;
-  log(`Claude WS detached: chatId=${state.chatId} (#${state.ws.data.clientId}, ${reason})`);
+  log(`Claude WS detached: chatId=${state.chatId} (#${state.ws.data.clientId}, ${reason}, paired=${state.paired})`);
   state.ws = null;
   scheduleDisconnectTimer(state);
   scheduleReaperTimer(state);
+  if (state.paired && proxyTuiSlot && proxyTuiSlot.pairedChatId === state.chatId) {
+    if (proxyTuiSlot.pairReapTimer)
+      clearTimeout(proxyTuiSlot.pairReapTimer);
+    proxyTuiSlot.pairReapTimer = setTimeout(() => {
+      if (!proxyTuiSlot)
+        return;
+      const currentState = chats.get(state.chatId);
+      if (currentState?.ws) {
+        log(`Paired Claude ${state.chatId} reconnected during grace; not clearing pair`);
+        return;
+      }
+      log(`Paired Claude ${state.chatId} did not reconnect within ${PAIR_REAP_MS}ms \u2014 clearing pair slot and reaping chat state`);
+      proxyTuiSlot.pairedChatId = null;
+      proxyTuiSlot.pairReapTimer = null;
+      codex.setPairedChat(null);
+      if (currentState) {
+        try {
+          currentState.thread.close();
+        } catch {}
+        currentState.statusBuffer.dispose();
+        if (currentState.attentionWindowTimer)
+          clearTimeout(currentState.attentionWindowTimer);
+        if (currentState.disconnectTimer)
+          clearTimeout(currentState.disconnectTimer);
+        if (currentState.reaperTimer)
+          clearTimeout(currentState.reaperTimer);
+        chats.delete(state.chatId);
+        broadcastStatus();
+      }
+    }, PAIR_REAP_MS);
+  }
   scheduleIdleShutdown();
 }
 function scheduleReaperTimer(state) {
@@ -2495,11 +2829,23 @@ function handleClaudeToCodex(ws, message) {
     });
   }
   if (!state.ready) {
+    let errorMsg;
+    if (state.paired) {
+      if (codex.isSessionRestoreInProgress) {
+        errorMsg = "Restoring shared Codex TUI session, retry shortly.";
+      } else if (proxyTuiSlot) {
+        errorMsg = "Shared Codex TUI thread is still provisioning. Retry shortly.";
+      } else {
+        errorMsg = "Shared Codex TUI is no longer connected. Wait for transition to isolated mode.";
+      }
+    } else {
+      errorMsg = "Your Codex thread is still provisioning. Wait for system_thread_ready.";
+    }
     return sendProtocolMessage(ws, {
       type: "claude_to_codex_result",
       requestId: message.requestId,
       success: false,
-      error: "Your Codex thread is still provisioning. Wait for system_thread_ready."
+      error: errorMsg
     });
   }
   const requireReply = !!message.requireReply;
@@ -2512,10 +2858,13 @@ function handleClaudeToCodex(ws, message) {
     state.replyReceivedDuringTurn = false;
     log(`[${chatId}] Reply required flag set`);
   }
-  log(`[${chatId}] Forwarding Claude \u2192 Codex (${message.message.content.length} chars, requireReply=${requireReply})`);
-  const injected = state.thread.injectMessage(contentWithReminder);
+  log(`[${chatId}] Forwarding Claude \u2192 Codex (${message.message.content.length} chars, requireReply=${requireReply}, paired=${state.paired})`);
+  const injected = state.paired ? codex.injectMessage(contentWithReminder) : state.thread.injectMessage(contentWithReminder);
   if (!injected) {
-    const reason = state.thread.isTurnInProgress ? "Codex is busy executing a turn on your thread. Wait for it to finish." : "Injection failed: thread WS not connected.";
+    const reason = state.paired ? "Shared Codex TUI is busy with another turn. Retry." : state.thread.isTurnInProgress ? "Codex is busy executing a turn on your thread. Wait for it to finish." : "Injection failed: thread WS not connected.";
+    if (requireReply) {
+      state.replyRequired = false;
+    }
     return sendProtocolMessage(ws, {
       type: "claude_to_codex_result",
       requestId: message.requestId,
@@ -2621,7 +2970,8 @@ function currentStatus() {
     proxyUrl: codex.proxyUrl,
     appServerUrl: codex.appServerUrl,
     pid: process.pid,
-    attachedClaudeCount: [...chats.values()].filter((s) => s.ws).length
+    attachedClaudeCount: [...chats.values()].filter((s) => s.ws).length,
+    proxyTuiConnected: proxyTuiSlot !== null
   };
 }
 function systemMessage(idPrefix, content) {

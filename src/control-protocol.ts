@@ -9,6 +9,12 @@ export interface DaemonStatus {
   appServerUrl: string;
   pid: number;
   attachedClaudeCount?: number;
+  /**
+   * Spec v2.2 §7: true when a `--via-proxy` TUI is currently connected.
+   * CLI uses this for pre-flight check before launching a second
+   * `agentbridge codex --via-proxy` instance.
+   */
+  proxyTuiConnected?: boolean;
 }
 
 /**

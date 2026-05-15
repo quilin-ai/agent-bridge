@@ -17,6 +17,25 @@ import { StderrRingBuffer } from "../stderr-ring-buffer";
 import { checkOwnedFlagConflicts } from "./claude";
 
 /**
+ * Spec v2.2 §7: fetch live daemon /healthz JSON for pre-flight checks.
+ * Returns null if the daemon is unreachable (CLI falls through to its normal
+ * "ensure running" flow and surfaces a clearer error elsewhere).
+ */
+async function fetchLiveDaemonStatus(
+  controlPort: number,
+): Promise<{ proxyTuiConnected?: boolean } | null> {
+  try {
+    const res = await fetch(`http://127.0.0.1:${controlPort}/healthz`, {
+      signal: AbortSignal.timeout(2000),
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as { proxyTuiConnected?: boolean };
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Write a timestamped entry to the codex wrapper log.
  *
  * Silent on IO failure — logging must never break the wrapper itself.
@@ -40,9 +59,10 @@ function appendWrapperLog(path: string, entry: string): void {
  * up in `~/.codex/log/codex-tui.log` and on stderr (which we also tee).
  * User-provided values take precedence — we only set defaults.
  */
-function buildChildEnv(): NodeJS.ProcessEnv {
+function buildChildEnv(extraEnv: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   return {
     ...process.env,
+    ...extraEnv,
     RUST_BACKTRACE: process.env.RUST_BACKTRACE ?? "full",
     RUST_LOG:
       process.env.RUST_LOG ??
@@ -51,7 +71,7 @@ function buildChildEnv(): NodeJS.ProcessEnv {
 }
 
 /** Flags that AgentBridge owns for codex command. */
-const OWNED_FLAGS = ["--remote"];
+const OWNED_FLAGS = ["--remote", "--remote-auth-token-env"];
 
 /**
  * Connection mode for `agentbridge codex`:
@@ -135,10 +155,16 @@ export async function runCodex(rawArgs: string[]) {
   //
   // direct mode → app-server port (each TUI is an independent client of the
   //               same codex backend; gets its own thread; no proxy).
-  // proxy mode  → daemon's proxy port (legacy; intercepts agentMessage events
-  //               for the multi-Claude broadcast that the multi-Claude daemon
-  //               no longer uses).
+  // proxy mode  → daemon's proxy port. Spec v2.2 §4.6: `--via-proxy` now
+  //               participates in the shared-thread pairing protocol. A
+  //               unique bearer token is passed via Codex's native
+  //               --remote-auth-token-env option so the daemon can
+  //               distinguish this TUI's secondary picker connection from a
+  //               foreign second instance. codex-cli rejects query strings in
+  //               --remote (accepted forms are ws://host:port / wss://host:port).
   let remoteUrl: string;
+  const childEnv: NodeJS.ProcessEnv = {};
+  const remoteAuthArgs: string[] = [];
   const status = lifecycle.readStatus();
   if (mode === "direct") {
     if (status?.appServerUrl) {
@@ -148,12 +174,31 @@ export async function runCodex(rawArgs: string[]) {
       console.error(`[agentbridge] No daemon status found, using config default app-server URL: ${remoteUrl}`);
     }
   } else {
+    // Spec v2.2 §7: pre-flight check — daemon should only have one proxy TUI
+    // at a time. Hit /healthz for the live state (status.json is stale).
+    const liveStatus = await fetchLiveDaemonStatus(controlPort);
+    if (liveStatus?.proxyTuiConnected) {
+      console.error("");
+      console.error("[agentbridge] Error: another `agentbridge codex --via-proxy` TUI is already connected to the daemon.");
+      console.error("");
+      console.error("Shared-thread mode supports at most one proxy TUI at a time.");
+      console.error("Either close the other TUI window first, or use `agentbridge codex` (direct mode) to run an independent parallel session.");
+      console.error("");
+      process.exit(1);
+    }
+
+    // Spec v2.2 §4.6: generate the token so codex-rs's primary AND secondary
+    // picker connections inherit it via the Authorization header.
+    const abgToken = (await import("node:crypto")).randomBytes(8).toString("hex");
     if (status?.proxyUrl) {
       remoteUrl = status.proxyUrl;
     } else {
       remoteUrl = `ws://127.0.0.1:${config.codex.proxyPort}`;
       console.error(`[agentbridge] No daemon status found, using config default proxy URL: ${remoteUrl}`);
     }
+    childEnv.AGENTBRIDGE_PROXY_TOKEN = abgToken;
+    remoteAuthArgs.push("--remote-auth-token-env", "AGENTBRIDGE_PROXY_TOKEN");
+    console.error(`[agentbridge] Shared-thread mode active. Token=${abgToken.slice(0, 8)}…`);
   }
 
   try {
@@ -219,6 +264,7 @@ export async function runCodex(rawArgs: string[]) {
   const fullArgs = [
     "--enable", "tui_app_server",
     "--remote", remoteUrl,
+    ...remoteAuthArgs,
     ...args,
   ];
 
@@ -238,7 +284,7 @@ export async function runCodex(rawArgs: string[]) {
   const child = spawn("codex", fullArgs, {
     // inherit stdin + stdout (TUI needs raw TTY), pipe stderr so we can tee.
     stdio: ["inherit", "inherit", "pipe"],
-    env: buildChildEnv(),
+    env: buildChildEnv(childEnv),
   });
 
   if (typeof child.pid === "number") {
