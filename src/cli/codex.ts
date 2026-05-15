@@ -53,7 +53,40 @@ function buildChildEnv(): NodeJS.ProcessEnv {
 /** Flags that AgentBridge owns for codex command. */
 const OWNED_FLAGS = ["--remote"];
 
-export async function runCodex(args: string[]) {
+/**
+ * Connection mode for `agentbridge codex`:
+ *   - "direct" (default): connect each TUI straight to the codex app-server
+ *     so multiple TUI windows can run in parallel, each with its own thread.
+ *     Pre-multi-Claude AgentBridge proxied every TUI through one port, with
+ *     a "primary + secondary picker" assumption that breaks for two
+ *     long-lived TUI windows.
+ *   - "proxy": legacy behavior — route through the daemon's proxy port so
+ *     the proxy can intercept agentMessage events. Useful if you depend on
+ *     the daemon's TUI broadcast (which the multi-Claude daemon no longer
+ *     uses anyway). Opt in with `--via-proxy`.
+ */
+type CodexConnectionMode = "direct" | "proxy";
+
+function extractConnectionMode(args: string[]): { mode: CodexConnectionMode; rest: string[] } {
+  const rest: string[] = [];
+  let mode: CodexConnectionMode = "direct";
+  for (const a of args) {
+    if (a === "--via-proxy") {
+      mode = "proxy";
+      continue;
+    }
+    if (a === "--direct") {
+      mode = "direct";
+      continue;
+    }
+    rest.push(a);
+  }
+  return { mode, rest };
+}
+
+export async function runCodex(rawArgs: string[]) {
+  const { mode, rest: args } = extractConnectionMode(rawArgs);
+
   // Check for owned flag conflicts
   checkOwnedFlagConflicts(args, "agentbridge codex", OWNED_FLAGS);
 
@@ -98,25 +131,40 @@ export async function runCodex(args: string[]) {
     process.exit(1);
   }
 
-  // Read proxyUrl from daemon status or fall back to config
-  let proxyUrl: string;
+  // Resolve the WebSocket URL to hand to codex --remote.
+  //
+  // direct mode → app-server port (each TUI is an independent client of the
+  //               same codex backend; gets its own thread; no proxy).
+  // proxy mode  → daemon's proxy port (legacy; intercepts agentMessage events
+  //               for the multi-Claude broadcast that the multi-Claude daemon
+  //               no longer uses).
+  let remoteUrl: string;
   const status = lifecycle.readStatus();
-  if (status?.proxyUrl) {
-    proxyUrl = status.proxyUrl;
+  if (mode === "direct") {
+    if (status?.appServerUrl) {
+      remoteUrl = status.appServerUrl;
+    } else {
+      remoteUrl = `ws://127.0.0.1:${config.codex.appPort}`;
+      console.error(`[agentbridge] No daemon status found, using config default app-server URL: ${remoteUrl}`);
+    }
   } else {
-    proxyUrl = `ws://127.0.0.1:${config.codex.proxyPort}`;
-    console.error(`[agentbridge] No daemon status found, using config default: ${proxyUrl}`);
+    if (status?.proxyUrl) {
+      remoteUrl = status.proxyUrl;
+    } else {
+      remoteUrl = `ws://127.0.0.1:${config.codex.proxyPort}`;
+      console.error(`[agentbridge] No daemon status found, using config default proxy URL: ${remoteUrl}`);
+    }
   }
 
   try {
-    await waitForProxyReady(proxyUrl);
+    await waitForProxyReady(remoteUrl);
   } catch (err: any) {
     console.error(`[agentbridge] ${err.message}`);
     process.exit(1);
   }
 
   // Save terminal state and launch Codex with protection
-  console.log(`Connecting Codex TUI to AgentBridge at ${proxyUrl}...`);
+  console.log(`Connecting Codex TUI to AgentBridge at ${remoteUrl} (mode=${mode})...`);
 
   // Save terminal state
   let savedStty: string | null = null;
@@ -170,7 +218,7 @@ export async function runCodex(args: string[]) {
 
   const fullArgs = [
     "--enable", "tui_app_server",
-    "--remote", proxyUrl,
+    "--remote", remoteUrl,
     ...args,
   ];
 
