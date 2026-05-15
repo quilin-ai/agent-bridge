@@ -2,7 +2,7 @@
 // @bun
 
 // src/daemon.ts
-import { appendFileSync as appendFileSync2 } from "fs";
+import { appendFileSync as appendFileSync3 } from "fs";
 
 // src/codex-adapter.ts
 import { spawn, execSync } from "child_process";
@@ -1282,6 +1282,287 @@ class CodexAdapter extends EventEmitter {
   }
 }
 
+// src/claude-thread.ts
+import { EventEmitter as EventEmitter2 } from "events";
+import { appendFileSync as appendFileSync2 } from "fs";
+var RPC_TIMEOUT_MS = 30000;
+
+class ClaudeThread extends EventEmitter2 {
+  chatId;
+  appServerUrl;
+  logFile;
+  cwd;
+  ws = null;
+  threadId = null;
+  nextId = 1;
+  pending = new Map;
+  turnInProgress = false;
+  agentMessageBuffers = new Map;
+  bootstrapped = false;
+  closed = false;
+  constructor(opts) {
+    super();
+    this.chatId = opts.chatId;
+    this.appServerUrl = opts.appServerUrl;
+    this.logFile = opts.logFile;
+    this.cwd = opts.cwd;
+  }
+  get activeThreadId() {
+    return this.threadId;
+  }
+  get isTurnInProgress() {
+    return this.turnInProgress;
+  }
+  get isReady() {
+    return this.bootstrapped && this.threadId !== null;
+  }
+  async bootstrap() {
+    if (this.bootstrapped && this.threadId)
+      return this.threadId;
+    await this.openSocket();
+    await this.callRpc("initialize", {
+      clientInfo: { name: "agentbridge-claude-thread", version: "0.1.0" },
+      capabilities: { experimentalApi: false }
+    });
+    const params = {};
+    if (this.cwd)
+      params.cwd = this.cwd;
+    const startRes = await this.callRpc("thread/start", params);
+    const tid = startRes?.thread?.id ?? startRes?.threadId ?? null;
+    if (typeof tid !== "string" || tid.length === 0) {
+      throw new Error("thread/start did not return a threadId");
+    }
+    this.threadId = tid;
+    this.bootstrapped = true;
+    this.log(`bootstrap ok threadId=${tid}`);
+    this.emit("ready", tid);
+    return tid;
+  }
+  injectMessage(text) {
+    if (!this.threadId) {
+      this.log("inject rejected: not bootstrapped");
+      return false;
+    }
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      this.log("inject rejected: ws not open");
+      return false;
+    }
+    if (this.turnInProgress) {
+      this.log(`inject rejected: turn already in progress`);
+      return false;
+    }
+    const id = this.nextId++;
+    const msg = {
+      jsonrpc: "2.0",
+      id,
+      method: "turn/start",
+      params: {
+        threadId: this.threadId,
+        input: [{ type: "text", text }]
+      }
+    };
+    try {
+      this.ws.send(JSON.stringify(msg));
+      return true;
+    } catch (err) {
+      this.log(`inject send failed: ${err.message}`);
+      return false;
+    }
+  }
+  close() {
+    if (this.closed)
+      return;
+    this.closed = true;
+    if (this.ws) {
+      try {
+        this.ws.close();
+      } catch {}
+      this.ws = null;
+    }
+    for (const [, p] of this.pending) {
+      clearTimeout(p.timer);
+      p.reject(new Error("ClaudeThread closed"));
+    }
+    this.pending.clear();
+  }
+  openSocket() {
+    return new Promise((resolve, reject) => {
+      const ws = new WebSocket(this.appServerUrl);
+      let settled = false;
+      ws.onopen = () => {
+        if (settled)
+          return;
+        settled = true;
+        this.ws = ws;
+        this.attachHandlers(ws);
+        resolve();
+      };
+      ws.onerror = (e) => {
+        if (settled)
+          return;
+        settled = true;
+        reject(new Error(`ws connect failed: ${e?.message ?? "unknown"}`));
+      };
+      ws.onclose = (e) => {
+        if (!settled) {
+          settled = true;
+          reject(new Error(`ws closed during handshake (code=${e?.code})`));
+          return;
+        }
+      };
+    });
+  }
+  attachHandlers(ws) {
+    ws.onmessage = (event) => {
+      const raw = typeof event.data === "string" ? event.data : event.data.toString();
+      this.handlePayload(raw);
+    };
+    ws.onclose = () => {
+      this.log(`ws closed (chatId=${this.chatId}, threadId=${this.threadId})`);
+      this.ws = null;
+      this.emit("close");
+    };
+    ws.onerror = (e) => {
+      this.log(`ws error: ${e?.message ?? "unknown"}`);
+      this.emit("error", e);
+    };
+  }
+  handlePayload(raw) {
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return;
+    }
+    if (typeof parsed.id === "number" && this.pending.has(parsed.id) && (parsed.result !== undefined || parsed.error !== undefined)) {
+      const pending = this.pending.get(parsed.id);
+      this.pending.delete(parsed.id);
+      clearTimeout(pending.timer);
+      if (parsed.error) {
+        pending.reject(new Error(`${pending.method} failed: ${JSON.stringify(parsed.error).slice(0, 200)}`));
+      } else {
+        pending.resolve(parsed.result);
+      }
+      return;
+    }
+    if (parsed.id !== undefined && typeof parsed.method === "string") {
+      const tid = parsed.params?.threadId;
+      if (tid && this.threadId && tid !== this.threadId)
+        return;
+      try {
+        this.ws?.send(JSON.stringify({
+          jsonrpc: "2.0",
+          id: parsed.id,
+          error: { code: -32601, message: "auto-denied by ClaudeThread (no UI to approve)" }
+        }));
+      } catch {}
+      return;
+    }
+    if (typeof parsed.method === "string" && parsed.id === undefined) {
+      const tid = parsed.params?.threadId;
+      if (tid && this.threadId && tid !== this.threadId) {
+        return;
+      }
+      this.handleNotification(parsed.method, parsed.params ?? {});
+    }
+  }
+  handleNotification(method, params) {
+    switch (method) {
+      case "turn/started": {
+        if (!this.turnInProgress) {
+          this.turnInProgress = true;
+          this.emit("turnStarted");
+        }
+        break;
+      }
+      case "item/started": {
+        const item = params?.item;
+        if (item?.type === "agentMessage")
+          this.agentMessageBuffers.set(item.id, []);
+        break;
+      }
+      case "item/agentMessage/delta": {
+        const itemId = params?.itemId;
+        const delta = params?.delta;
+        if (typeof itemId === "string") {
+          const buf = this.agentMessageBuffers.get(itemId);
+          if (buf && typeof delta === "string")
+            buf.push(delta);
+        }
+        break;
+      }
+      case "item/completed": {
+        const item = params?.item;
+        if (item?.type === "agentMessage") {
+          const content = this.extractContent(item);
+          this.agentMessageBuffers.delete(item.id);
+          if (content) {
+            const bridgeMsg = {
+              id: item.id,
+              source: "codex",
+              content,
+              timestamp: Date.now()
+            };
+            this.emit("agentMessage", bridgeMsg);
+          }
+        }
+        break;
+      }
+      case "turn/completed": {
+        if (this.turnInProgress) {
+          this.turnInProgress = false;
+          this.emit("turnCompleted");
+        }
+        break;
+      }
+      case "turn/failed": {
+        if (this.turnInProgress) {
+          this.turnInProgress = false;
+          this.emit("turnCompleted");
+        }
+        this.emit("turnFailed", params);
+        break;
+      }
+    }
+  }
+  extractContent(item) {
+    if (item.content?.length) {
+      return item.content.filter((c) => c.type === "text" && c.text).map((c) => c.text).join("");
+    }
+    return this.agentMessageBuffers.get(item.id)?.join("") ?? "";
+  }
+  callRpc(method, params) {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      return Promise.reject(new Error("callRpc: ws not open"));
+    }
+    const id = this.nextId++;
+    const msg = JSON.stringify({ jsonrpc: "2.0", id, method, params });
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        if (this.pending.delete(id)) {
+          reject(new Error(`${method} timed out after ${RPC_TIMEOUT_MS}ms`));
+        }
+      }, RPC_TIMEOUT_MS);
+      this.pending.set(id, { resolve, reject, method, timer });
+      try {
+        this.ws.send(msg);
+      } catch (err) {
+        clearTimeout(timer);
+        this.pending.delete(id);
+        reject(err);
+      }
+    });
+  }
+  log(s) {
+    const line = `[${new Date().toISOString()}] [ClaudeThread:${this.chatId}] ${s}
+`;
+    process.stderr.write(line);
+    try {
+      appendFileSync2(this.logFile, line);
+    } catch {}
+  }
+}
+
 // src/message-filter.ts
 var MARKER_REGEX = /^\s*\[(IMPORTANT|STATUS|FYI)\]\s*/i;
 function parseMarker(content) {
@@ -1852,6 +2133,7 @@ var CODEX_PROXY_PORT = parseInt(process.env.CODEX_PROXY_PORT ?? String(config.co
 var CONTROL_PORT = parseInt(process.env.AGENTBRIDGE_CONTROL_PORT ?? "4502", 10);
 var TUI_DISCONNECT_GRACE_MS = parseInt(process.env.TUI_DISCONNECT_GRACE_MS ?? "2500", 10);
 var CLAUDE_DISCONNECT_GRACE_MS = 5000;
+var CLAUDE_REAP_AFTER_MS = parseInt(process.env.AGENTBRIDGE_CLAUDE_REAP_MS ?? "600000", 10);
 var MAX_BUFFERED_MESSAGES = parseInt(process.env.AGENTBRIDGE_MAX_BUFFERED_MESSAGES ?? "100", 10);
 var FILTER_MODE = process.env.AGENTBRIDGE_FILTER_MODE === "full" ? "full" : "filtered";
 var IDLE_SHUTDOWN_MS = parseInt(process.env.AGENTBRIDGE_IDLE_SHUTDOWN_MS ?? String(config.idleShutdownSeconds * 1000), 10);
@@ -1860,98 +2142,24 @@ var daemonLifecycle = new DaemonLifecycle({ stateDir, controlPort: CONTROL_PORT,
 var codex = new CodexAdapter(CODEX_APP_PORT, CODEX_PROXY_PORT, stateDir.logFile);
 var attachCmd = `codex --enable tui_app_server --remote ${codex.proxyUrl}`;
 var controlServer = null;
-var attachedClaude = null;
 var nextControlClientId = 0;
-var nextSystemMessageId = 0;
 var codexBootstrapped = false;
-var attentionWindowTimer = null;
-var inAttentionWindow = false;
-var replyRequired = false;
-var replyReceivedDuringTurn = false;
 var shuttingDown = false;
 var idleShutdownTimer = null;
-var claudeDisconnectTimer = null;
-var claudeOnlineNoticeSent = false;
-var claudeOfflineNoticeShown = false;
-var codexCollaborationKickoffSent = false;
-var lastAttachStatusSentTs = 0;
-var ATTACH_STATUS_COOLDOWN_MS = 30000;
-var bufferedMessages = [];
+var chats = new Map;
 var tuiConnectionState = new TuiConnectionState({
   disconnectGraceMs: TUI_DISCONNECT_GRACE_MS,
   log,
   onDisconnectPersisted: (connId) => {
-    emitToClaude(systemMessage("system_tui_disconnected", `\u26A0\uFE0F Codex TUI disconnected (conn #${connId}). Codex is still running in the background \u2014 reconnect the TUI to resume.`));
+    broadcastToAllClaudes(systemMessage("system_tui_disconnected", `\u26A0\uFE0F Codex TUI disconnected (conn #${connId}). Codex is still running in the background \u2014 reconnect the TUI to resume.`));
   },
   onReconnectAfterNotice: (connId) => {
-    emitToClaude(systemMessage("system_tui_reconnected", `\u2705 Codex TUI reconnected (conn #${connId}). Bridge restored, communication can continue.`));
-    codex.injectMessage("\u2705 Claude Code is still online, bridge restored. Bidirectional communication can continue.");
-  }
-});
-var statusBuffer = new StatusBuffer((summary) => emitToClaude(summary));
-codex.on("turnStarted", () => {
-  log("Codex turn started");
-  emitToClaude(systemMessage("system_turn_started", "\u23F3 Codex is working on the current task. Wait for completion before sending a reply."));
-});
-codex.on("agentMessage", (msg) => {
-  if (msg.source !== "codex")
-    return;
-  const result = classifyMessage(msg.content, FILTER_MODE);
-  if (replyRequired) {
-    log(`Codex \u2192 Claude [${result.marker}/force-forward-reply-required] (${msg.content.length} chars)`);
-    replyReceivedDuringTurn = true;
-    if (statusBuffer.size > 0) {
-      statusBuffer.flush("reply-required message arrived");
-    }
-    emitToClaude(msg);
-    return;
-  }
-  if (inAttentionWindow && result.marker === "status") {
-    log(`Codex \u2192 Claude [${result.marker}/buffer-attention] (${msg.content.length} chars)`);
-    statusBuffer.add(msg);
-    return;
-  }
-  log(`Codex \u2192 Claude [${result.marker}/${result.action}] (${msg.content.length} chars)`);
-  switch (result.action) {
-    case "forward":
-      if (result.marker === "important" && statusBuffer.size > 0) {
-        statusBuffer.flush("important message arrived");
-      }
-      emitToClaude(msg);
-      if (result.marker === "important") {
-        startAttentionWindow();
-      }
-      break;
-    case "buffer":
-      statusBuffer.add(msg);
-      break;
-    case "drop":
-      break;
-  }
-});
-codex.on("turnCompleted", () => {
-  log("Codex turn completed");
-  statusBuffer.flush("turn completed");
-  if (replyRequired && !replyReceivedDuringTurn) {
-    log("\u26A0\uFE0F Reply was required but Codex did not send any agentMessage");
-    emitToClaude(systemMessage("system_reply_missing", "\u26A0\uFE0F Codex completed the turn without sending a reply (require_reply was set). Codex may not have generated an agentMessage. You may want to retry or rephrase."));
-  }
-  replyRequired = false;
-  replyReceivedDuringTurn = false;
-  emitToClaude(systemMessage("system_turn_completed", "\u2705 Codex finished the current turn. You can reply now if needed."));
-  startAttentionWindow();
-  if (attachedClaude && shouldNotifyCodexClaudeOnline()) {
-    notifyCodexClaudeOnline();
+    broadcastToAllClaudes(systemMessage("system_tui_reconnected", `\u2705 Codex TUI reconnected (conn #${connId}). Bridge restored.`));
   }
 });
 codex.on("ready", (threadId) => {
   tuiConnectionState.markBridgeReady();
-  log(`Codex ready \u2014 thread ${threadId}`);
-  log("Bridge fully operational");
-  emitToClaude(systemMessage("system_ready", currentReadyMessage()));
-  if (attachedClaude && shouldNotifyCodexClaudeOnline()) {
-    notifyCodexClaudeOnline();
-  }
+  log(`Codex TUI thread ready: ${threadId} (bridge fully operational)`);
 });
 codex.on("tuiConnected", (connId) => {
   tuiConnectionState.handleTuiConnected(connId);
@@ -1969,14 +2177,16 @@ codex.on("error", (err) => {
   log(`Codex error: ${err.message}`);
 });
 codex.on("exit", (code) => {
-  log(`Codex process exited (code ${code})`);
+  log(`Codex app-server process exited (code ${code})`);
   codexBootstrapped = false;
-  statusBuffer.flush("codex exited");
   tuiConnectionState.handleCodexExit();
-  clearPendingClaudeDisconnect("Codex process exited");
-  claudeOnlineNoticeSent = false;
-  claudeOfflineNoticeShown = false;
-  emitToClaude(systemMessage("system_codex_exit", `\u26A0\uFE0F Codex app-server exited (code ${code ?? "unknown"}). AgentBridge daemon is still running, but the Codex side needs to be restarted.`));
+  broadcastToAllClaudes(systemMessage("system_codex_exit", `\u26A0\uFE0F Codex app-server exited (code ${code ?? "unknown"}). All ClaudeThread sessions terminated.`));
+  for (const state of chats.values()) {
+    try {
+      state.thread.close();
+    } catch {}
+    state.ready = false;
+  }
   broadcastStatus();
 });
 function startControlServer() {
@@ -1985,13 +2195,12 @@ function startControlServer() {
     hostname: "127.0.0.1",
     fetch(req, server) {
       const url = new URL(req.url);
-      if (url.pathname === "/healthz") {
+      if (url.pathname === "/healthz")
         return Response.json(currentStatus());
-      }
       if (url.pathname === "/readyz") {
         return Response.json(currentStatus(), { status: codexBootstrapped ? 200 : 503 });
       }
-      if (url.pathname === "/ws" && server.upgrade(req, { data: { clientId: 0, attached: false } })) {
+      if (url.pathname === "/ws" && server.upgrade(req, { data: { clientId: 0, attached: false, chatId: null } })) {
         return;
       }
       return new Response("AgentBridge daemon");
@@ -2004,9 +2213,13 @@ function startControlServer() {
         log(`Frontend socket opened (#${ws.data.clientId})`);
       },
       close: (ws, code, reason) => {
-        log(`Frontend socket closed (#${ws.data.clientId}, code=${code}, reason=${reason || "none"}, wasAttached=${attachedClaude === ws})`);
-        if (attachedClaude === ws) {
-          detachClaude(ws, "frontend socket closed");
+        const chatId = ws.data.chatId;
+        log(`Frontend socket closed (#${ws.data.clientId}, code=${code}, reason=${reason || "none"}, chatId=${chatId ?? "-"})`);
+        if (chatId) {
+          const state = chats.get(chatId);
+          if (state && state.ws === ws) {
+            detachClaudeWs(state, "frontend socket closed");
+          }
         }
       },
       message: (ws, raw) => {
@@ -2026,195 +2239,301 @@ function handleControlMessage(ws, raw) {
   }
   switch (message.type) {
     case "claude_connect":
-      attachClaude(ws);
+      attachClaude(ws, message.chatId);
       return;
-    case "claude_disconnect":
-      detachClaude(ws, "frontend requested disconnect");
+    case "claude_disconnect": {
+      const chatId = message.chatId ?? ws.data.chatId;
+      if (!chatId)
+        return;
+      const state = chats.get(chatId);
+      if (state)
+        detachClaudeWs(state, "frontend requested disconnect");
       return;
+    }
     case "status":
       sendStatus(ws);
       return;
-    case "claude_to_codex": {
-      if (message.message.source !== "claude") {
-        sendProtocolMessage(ws, {
-          type: "claude_to_codex_result",
-          requestId: message.requestId,
-          success: false,
-          error: "Invalid message source"
-        });
-        return;
-      }
-      if (!tuiConnectionState.canReply()) {
-        sendProtocolMessage(ws, {
-          type: "claude_to_codex_result",
-          requestId: message.requestId,
-          success: false,
-          error: "Codex is not ready. Wait for TUI to connect and create a thread."
-        });
-        return;
-      }
-      const requireReply = !!message.requireReply;
-      let contentWithReminder = message.message.content + `
-
-` + BRIDGE_CONTRACT_REMINDER;
-      if (requireReply) {
-        contentWithReminder += REPLY_REQUIRED_INSTRUCTION;
-        replyRequired = true;
-        replyReceivedDuringTurn = false;
-        log(`Reply required flag set for this message`);
-      }
-      log(`Forwarding Claude \u2192 Codex (${message.message.content.length} chars, requireReply=${requireReply})`);
-      const injected = codex.injectMessage(contentWithReminder);
-      if (!injected) {
-        const reason = codex.turnInProgress ? "Codex is busy executing a turn. Wait for it to finish before sending another message." : "Injection failed: no active thread or WebSocket not connected.";
-        log(`Injection rejected: ${reason}`);
-        sendProtocolMessage(ws, {
-          type: "claude_to_codex_result",
-          requestId: message.requestId,
-          success: false,
-          error: reason
-        });
-        return;
-      }
-      clearAttentionWindow();
-      sendProtocolMessage(ws, {
-        type: "claude_to_codex_result",
-        requestId: message.requestId,
-        success: true
-      });
+    case "claude_to_codex":
+      handleClaudeToCodex(ws, message);
       return;
-    }
   }
 }
-function attachClaude(ws) {
-  if (attachedClaude && attachedClaude !== ws && attachedClaude.readyState !== WebSocket.CLOSED) {
-    log(`Rejecting Claude frontend #${ws.data.clientId} \u2014 another session (#${attachedClaude.data.clientId}) is already attached (readyState=${attachedClaude.readyState})`);
-    ws.close(CLOSE_CODE_REPLACED, "another Claude session is already connected");
+async function attachClaude(ws, requestedChatId) {
+  const chatId = requestedChatId ?? `auto_${ws.data.clientId}_${Date.now()}`;
+  ws.data.chatId = chatId;
+  let state = chats.get(chatId);
+  if (state) {
+    if (state.ws && state.ws !== ws && state.ws.readyState !== WebSocket.CLOSED) {
+      log(`Replacing prior WS for chatId=${chatId} (#${state.ws.data.clientId} \u2192 #${ws.data.clientId})`);
+      try {
+        state.ws.close(CLOSE_CODE_REPLACED, "replaced by newer connection for same chatId");
+      } catch {}
+    }
+    state.ws = ws;
+    ws.data.attached = true;
+    clearDisconnectTimer(state, "claude resumed");
+    clearReaperTimer(state, "claude resumed");
+    cancelIdleShutdown();
+    log(`Claude resumed chatId=${chatId} (#${ws.data.clientId})`);
+    statusBufferFlushIfPaused(state, "claude resumed");
+    flushBufferedMessages(state);
+    sendStatus(ws);
     return;
   }
-  clearPendingClaudeDisconnect("Claude frontend attached");
-  attachedClaude = ws;
+  state = createChatState(chatId);
+  chats.set(chatId, state);
+  state.ws = ws;
   ws.data.attached = true;
   cancelIdleShutdown();
-  log(`Claude frontend attached (#${ws.data.clientId})`);
-  statusBuffer.flush("claude reconnected");
+  log(`New Claude session attached: chatId=${chatId} (#${ws.data.clientId}, total=${chats.size})`);
   sendStatus(ws);
-  const now = Date.now();
-  const isRapidReattach = now - lastAttachStatusSentTs < ATTACH_STATUS_COOLDOWN_MS;
-  if (bufferedMessages.length > 0) {
-    flushBufferedMessages(ws);
-  } else if (!isRapidReattach) {
-    if (tuiConnectionState.canReply()) {
-      sendBridgeMessage(ws, systemMessage("system_ready", currentReadyMessage()));
-    } else if (codexBootstrapped) {
-      sendBridgeMessage(ws, systemMessage("system_waiting", currentWaitingMessage()));
-    }
-  }
-  lastAttachStatusSentTs = now;
-  if (tuiConnectionState.canReply() && shouldNotifyCodexClaudeOnline()) {
-    notifyCodexClaudeOnline();
+  emitToChat(state, systemMessage("system_bridge_provisioning", "\u2705 AgentBridge daemon attached. Provisioning your dedicated Codex thread..."));
+  try {
+    const threadId = await state.thread.bootstrap();
+    state.ready = true;
+    log(`ClaudeThread ready: chatId=${chatId} threadId=${threadId}`);
+    emitToChat(state, systemMessage("system_thread_ready", `\u2705 Your Codex thread is ready (threadId=${threadId}). You can now send messages via the reply tool.`));
+    broadcastStatus();
+  } catch (err) {
+    log(`ClaudeThread bootstrap failed for chatId=${chatId}: ${err?.message ?? err}`);
+    emitToChat(state, systemMessage("system_thread_failed", `\u274C Failed to provision Codex thread: ${err?.message ?? err}. Reconnect to retry.`));
   }
 }
-function detachClaude(ws, reason) {
-  if (attachedClaude !== ws)
+function createChatState(chatId) {
+  const state = {
+    chatId,
+    ws: null,
+    thread: new ClaudeThread({
+      appServerUrl: codex.appServerUrl,
+      chatId,
+      logFile: stateDir.logFile,
+      cwd: process.cwd()
+    }),
+    ready: false,
+    inAttentionWindow: false,
+    attentionWindowTimer: null,
+    replyRequired: false,
+    replyReceivedDuringTurn: false,
+    bufferedMessages: [],
+    statusBuffer: null,
+    disconnectTimer: null,
+    reaperTimer: null,
+    lastAttachStatusSentTs: 0,
+    onlineNoticeSent: false,
+    nextSystemMessageId: 0
+  };
+  state.statusBuffer = new StatusBuffer((summary) => emitToChat(state, summary));
+  state.thread.on("agentMessage", (msg) => {
+    if (msg.source !== "codex")
+      return;
+    const result = classifyMessage(msg.content, FILTER_MODE);
+    if (state.replyRequired) {
+      log(`[${chatId}] Codex \u2192 Claude [${result.marker}/force-forward-reply-required] (${msg.content.length} chars)`);
+      state.replyReceivedDuringTurn = true;
+      if (state.statusBuffer.size > 0) {
+        state.statusBuffer.flush("reply-required message arrived");
+      }
+      emitToChat(state, msg);
+      return;
+    }
+    if (state.inAttentionWindow && result.marker === "status") {
+      log(`[${chatId}] Codex \u2192 Claude [${result.marker}/buffer-attention] (${msg.content.length} chars)`);
+      state.statusBuffer.add(msg);
+      return;
+    }
+    log(`[${chatId}] Codex \u2192 Claude [${result.marker}/${result.action}] (${msg.content.length} chars)`);
+    switch (result.action) {
+      case "forward":
+        if (result.marker === "important" && state.statusBuffer.size > 0) {
+          state.statusBuffer.flush("important message arrived");
+        }
+        emitToChat(state, msg);
+        if (result.marker === "important")
+          startAttentionWindow(state);
+        break;
+      case "buffer":
+        state.statusBuffer.add(msg);
+        break;
+      case "drop":
+        break;
+    }
+  });
+  state.thread.on("turnStarted", () => {
+    log(`[${chatId}] Codex turn started`);
+    emitToChat(state, systemMessage("system_turn_started", "\u23F3 Codex is working on the current task. Wait for completion before sending a reply."));
+  });
+  state.thread.on("turnCompleted", () => {
+    log(`[${chatId}] Codex turn completed`);
+    state.statusBuffer.flush("turn completed");
+    if (state.replyRequired && !state.replyReceivedDuringTurn) {
+      log(`[${chatId}] \u26A0\uFE0F Reply was required but Codex did not send any agentMessage`);
+      emitToChat(state, systemMessage("system_reply_missing", "\u26A0\uFE0F Codex completed the turn without sending a reply (require_reply was set)."));
+    }
+    state.replyRequired = false;
+    state.replyReceivedDuringTurn = false;
+    emitToChat(state, systemMessage("system_turn_completed", "\u2705 Codex finished the current turn. You can reply now if needed."));
+    startAttentionWindow(state);
+  });
+  state.thread.on("close", () => {
+    log(`[${chatId}] ClaudeThread WS closed`);
+    state.ready = false;
+  });
+  state.thread.on("error", (err) => {
+    log(`[${chatId}] ClaudeThread error: ${err?.message ?? err}`);
+  });
+  return state;
+}
+function detachClaudeWs(state, reason) {
+  if (!state.ws)
     return;
-  attachedClaude = null;
-  ws.data.attached = false;
-  log(`Claude frontend detached (#${ws.data.clientId}, ${reason})`);
-  scheduleClaudeDisconnectNotification(ws.data.clientId);
+  log(`Claude WS detached: chatId=${state.chatId} (#${state.ws.data.clientId}, ${reason})`);
+  state.ws = null;
+  scheduleDisconnectTimer(state);
+  scheduleReaperTimer(state);
   scheduleIdleShutdown();
 }
-function startAttentionWindow() {
-  clearAttentionWindow();
-  inAttentionWindow = true;
-  statusBuffer.pause();
-  log(`Attention window started (${ATTENTION_WINDOW_MS}ms)`);
-  attentionWindowTimer = setTimeout(() => {
-    attentionWindowTimer = null;
-    inAttentionWindow = false;
-    statusBuffer.resume();
-    log("Attention window ended");
-  }, ATTENTION_WINDOW_MS);
-}
-function clearAttentionWindow() {
-  if (attentionWindowTimer) {
-    clearTimeout(attentionWindowTimer);
-    attentionWindowTimer = null;
-  }
-  if (inAttentionWindow) {
-    statusBuffer.resume();
-  }
-  inAttentionWindow = false;
-}
-function scheduleIdleShutdown() {
-  cancelIdleShutdown();
-  if (attachedClaude)
-    return;
-  const snapshot = tuiConnectionState.snapshot();
-  if (snapshot.tuiConnected)
-    return;
-  log(`No clients connected. Daemon will shut down in ${IDLE_SHUTDOWN_MS}ms if no one reconnects.`);
-  idleShutdownTimer = setTimeout(() => {
-    if (attachedClaude || tuiConnectionState.snapshot().tuiConnected) {
-      log("Idle shutdown cancelled: client reconnected during grace period");
+function scheduleReaperTimer(state) {
+  if (state.reaperTimer)
+    clearTimeout(state.reaperTimer);
+  state.reaperTimer = setTimeout(() => {
+    state.reaperTimer = null;
+    if (state.ws)
       return;
-    }
-    shutdown("idle \u2014 no clients connected");
-  }, IDLE_SHUTDOWN_MS);
+    log(`Reaping idle chat: chatId=${state.chatId} (no WS for ${CLAUDE_REAP_AFTER_MS}ms)`);
+    try {
+      state.thread.close();
+    } catch {}
+    state.statusBuffer.dispose();
+    if (state.attentionWindowTimer)
+      clearTimeout(state.attentionWindowTimer);
+    chats.delete(state.chatId);
+    broadcastStatus();
+  }, CLAUDE_REAP_AFTER_MS);
 }
-function cancelIdleShutdown() {
-  if (idleShutdownTimer) {
-    clearTimeout(idleShutdownTimer);
-    idleShutdownTimer = null;
+function clearReaperTimer(state, _reason) {
+  if (state.reaperTimer) {
+    clearTimeout(state.reaperTimer);
+    state.reaperTimer = null;
   }
 }
-function clearPendingClaudeDisconnect(reason) {
-  if (!claudeDisconnectTimer)
-    return;
-  clearTimeout(claudeDisconnectTimer);
-  claudeDisconnectTimer = null;
-  if (reason) {
-    log(`Cleared pending Claude disconnect notification (${reason})`);
-  }
-}
-function scheduleClaudeDisconnectNotification(clientId) {
-  clearPendingClaudeDisconnect("rescheduled");
-  claudeDisconnectTimer = setTimeout(() => {
-    claudeDisconnectTimer = null;
-    if (attachedClaude) {
-      log(`Skipping Claude disconnect notification for client #${clientId} because Claude already reconnected`);
-      return;
-    }
-    if (!tuiConnectionState.canReply()) {
-      log(`Suppressing Claude disconnect notification for client #${clientId} because Codex cannot reply`);
-      return;
-    }
-    if (!claudeOnlineNoticeSent) {
-      log(`Suppressing Claude disconnect notification for client #${clientId} because Claude was never announced online`);
-      return;
-    }
-    codex.injectMessage("\u26A0\uFE0F Claude Code went offline. AgentBridge is still running in the background; it will reconnect automatically when Claude reopens.");
-    claudeOnlineNoticeSent = false;
-    claudeOfflineNoticeShown = true;
-    log(`Claude disconnect persisted past grace window (client #${clientId})`);
+function scheduleDisconnectTimer(state) {
+  if (state.disconnectTimer)
+    clearTimeout(state.disconnectTimer);
+  state.disconnectTimer = setTimeout(() => {
+    state.disconnectTimer = null;
   }, CLAUDE_DISCONNECT_GRACE_MS);
 }
-function emitToClaude(message) {
-  if (attachedClaude && attachedClaude.readyState === WebSocket.OPEN) {
-    if (trySendBridgeMessage(attachedClaude, message))
-      return;
-    log("Send to Claude failed, buffering message for retry on reconnect");
-  }
-  bufferedMessages.push(message);
-  if (bufferedMessages.length > MAX_BUFFERED_MESSAGES) {
-    const dropped = bufferedMessages.length - MAX_BUFFERED_MESSAGES;
-    bufferedMessages.splice(0, dropped);
-    log(`Message buffer overflow: dropped ${dropped} oldest message(s), ${MAX_BUFFERED_MESSAGES} remaining`);
+function clearDisconnectTimer(state, _reason) {
+  if (state.disconnectTimer) {
+    clearTimeout(state.disconnectTimer);
+    state.disconnectTimer = null;
   }
 }
-function trySendBridgeMessage(ws, message) {
+function statusBufferFlushIfPaused(state, reason) {
+  if (state.statusBuffer.size > 0)
+    state.statusBuffer.flush(reason);
+}
+function handleClaudeToCodex(ws, message) {
+  const chatId = message.chatId ?? ws.data.chatId;
+  if (!chatId) {
+    return sendProtocolMessage(ws, {
+      type: "claude_to_codex_result",
+      requestId: message.requestId,
+      success: false,
+      error: "No chatId \u2014 claude_connect was never sent."
+    });
+  }
+  const state = chats.get(chatId);
+  if (!state) {
+    return sendProtocolMessage(ws, {
+      type: "claude_to_codex_result",
+      requestId: message.requestId,
+      success: false,
+      error: `Unknown chatId ${chatId}. Reattach via claude_connect.`
+    });
+  }
+  if (message.message.source !== "claude") {
+    return sendProtocolMessage(ws, {
+      type: "claude_to_codex_result",
+      requestId: message.requestId,
+      success: false,
+      error: "Invalid message source"
+    });
+  }
+  if (!state.ready) {
+    return sendProtocolMessage(ws, {
+      type: "claude_to_codex_result",
+      requestId: message.requestId,
+      success: false,
+      error: "Your Codex thread is still provisioning. Wait for system_thread_ready."
+    });
+  }
+  const requireReply = !!message.requireReply;
+  let contentWithReminder = message.message.content + `
+
+` + BRIDGE_CONTRACT_REMINDER;
+  if (requireReply) {
+    contentWithReminder += REPLY_REQUIRED_INSTRUCTION;
+    state.replyRequired = true;
+    state.replyReceivedDuringTurn = false;
+    log(`[${chatId}] Reply required flag set`);
+  }
+  log(`[${chatId}] Forwarding Claude \u2192 Codex (${message.message.content.length} chars, requireReply=${requireReply})`);
+  const injected = state.thread.injectMessage(contentWithReminder);
+  if (!injected) {
+    const reason = state.thread.isTurnInProgress ? "Codex is busy executing a turn on your thread. Wait for it to finish." : "Injection failed: thread WS not connected.";
+    return sendProtocolMessage(ws, {
+      type: "claude_to_codex_result",
+      requestId: message.requestId,
+      success: false,
+      error: reason
+    });
+  }
+  clearAttentionWindow(state);
+  sendProtocolMessage(ws, {
+    type: "claude_to_codex_result",
+    requestId: message.requestId,
+    success: true
+  });
+}
+function startAttentionWindow(state) {
+  clearAttentionWindow(state);
+  state.inAttentionWindow = true;
+  state.statusBuffer.pause();
+  log(`[${state.chatId}] Attention window started (${ATTENTION_WINDOW_MS}ms)`);
+  state.attentionWindowTimer = setTimeout(() => {
+    state.attentionWindowTimer = null;
+    state.inAttentionWindow = false;
+    state.statusBuffer.resume();
+    log(`[${state.chatId}] Attention window ended`);
+  }, ATTENTION_WINDOW_MS);
+}
+function clearAttentionWindow(state) {
+  if (state.attentionWindowTimer) {
+    clearTimeout(state.attentionWindowTimer);
+    state.attentionWindowTimer = null;
+  }
+  if (state.inAttentionWindow)
+    state.statusBuffer.resume();
+  state.inAttentionWindow = false;
+}
+function emitToChat(state, message) {
+  if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+    if (trySendBridgeMessage(state.ws, message, state.chatId))
+      return;
+    log(`[${state.chatId}] Send to Claude failed, buffering`);
+  }
+  state.bufferedMessages.push(message);
+  if (state.bufferedMessages.length > MAX_BUFFERED_MESSAGES) {
+    const dropped = state.bufferedMessages.length - MAX_BUFFERED_MESSAGES;
+    state.bufferedMessages.splice(0, dropped);
+    log(`[${state.chatId}] Message buffer overflow: dropped ${dropped} oldest`);
+  }
+}
+function trySendBridgeMessage(ws, message, chatId) {
   try {
-    const result = ws.send(JSON.stringify({ type: "codex_to_claude", message }));
+    const payload = { type: "codex_to_claude", chatId, message };
+    const result = ws.send(JSON.stringify(payload));
     if (typeof result === "number" && result <= 0) {
       log(`Bridge message send returned ${result} (0=dropped, -1=backpressure)`);
       return false;
@@ -2225,28 +2544,31 @@ function trySendBridgeMessage(ws, message) {
     return false;
   }
 }
-function flushBufferedMessages(ws) {
-  const messages = bufferedMessages.splice(0, bufferedMessages.length);
+function flushBufferedMessages(state) {
+  if (!state.ws || state.bufferedMessages.length === 0)
+    return;
+  const messages = state.bufferedMessages.splice(0, state.bufferedMessages.length);
   for (const message of messages) {
-    if (!trySendBridgeMessage(ws, message)) {
-      const failedIndex = messages.indexOf(message);
-      const remaining = messages.slice(failedIndex);
-      bufferedMessages.unshift(...remaining);
-      log(`Flush interrupted: re-buffered ${remaining.length} message(s) after send failure`);
+    if (!trySendBridgeMessage(state.ws, message, state.chatId)) {
+      const idx = messages.indexOf(message);
+      state.bufferedMessages.unshift(...messages.slice(idx));
+      log(`[${state.chatId}] Flush interrupted: re-buffered ${messages.length - idx} message(s)`);
       return;
     }
   }
 }
-function sendBridgeMessage(ws, message) {
-  trySendBridgeMessage(ws, message);
+function broadcastToAllClaudes(message) {
+  for (const state of chats.values())
+    emitToChat(state, message);
 }
 function sendStatus(ws) {
   sendProtocolMessage(ws, { type: "status", status: currentStatus() });
 }
 function broadcastStatus() {
-  if (!attachedClaude)
-    return;
-  sendStatus(attachedClaude);
+  for (const state of chats.values()) {
+    if (state.ws && state.ws.readyState === WebSocket.OPEN)
+      sendStatus(state.ws);
+  }
 }
 function sendProtocolMessage(ws, message) {
   try {
@@ -2258,51 +2580,44 @@ function sendProtocolMessage(ws, message) {
 function currentStatus() {
   const snapshot = tuiConnectionState.snapshot();
   return {
-    bridgeReady: tuiConnectionState.canReply(),
+    bridgeReady: tuiConnectionState.canReply() || codexBootstrapped,
     tuiConnected: snapshot.tuiConnected,
     threadId: codex.activeThreadId,
-    queuedMessageCount: bufferedMessages.length + statusBuffer.size,
+    queuedMessageCount: [...chats.values()].reduce((n, s) => n + s.bufferedMessages.length + s.statusBuffer.size, 0),
     proxyUrl: codex.proxyUrl,
     appServerUrl: codex.appServerUrl,
-    pid: process.pid
+    pid: process.pid,
+    attachedClaudeCount: [...chats.values()].filter((s) => s.ws).length
   };
-}
-function currentWaitingMessage() {
-  return `\u23F3 Waiting for Codex TUI to connect. Run in another terminal:
-${attachCmd}`;
-}
-function currentReadyMessage() {
-  return `\u2705 Codex TUI connected (${codex.activeThreadId}). Bridge ready.`;
-}
-function notifyCodexClaudeOnline() {
-  const message = !codexCollaborationKickoffSent ? [
-    "\uD83E\uDD1D Claude Code has connected via AgentBridge.",
-    "You are now in a multi-agent collaboration session.",
-    "When you receive a complex task, propose a division of labor to Claude.",
-    "Claude can send you messages \u2014 they will appear as injected user messages.",
-    "Respond naturally and Claude will receive your output via AgentBridge."
-  ].join(`
-`) : "\u2705 AgentBridge connected to Claude Code.";
-  const delivered = codex.injectMessage(message);
-  if (!delivered) {
-    log("Deferred Claude-online notice to Codex \u2014 will retry after current turn completes");
-    return false;
-  }
-  claudeOnlineNoticeSent = true;
-  claudeOfflineNoticeShown = false;
-  codexCollaborationKickoffSent = true;
-  return true;
-}
-function shouldNotifyCodexClaudeOnline() {
-  return !claudeOnlineNoticeSent || claudeOfflineNoticeShown;
 }
 function systemMessage(idPrefix, content) {
   return {
-    id: `${idPrefix}_${++nextSystemMessageId}`,
+    id: `${idPrefix}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
     source: "codex",
     content,
     timestamp: Date.now()
   };
+}
+function scheduleIdleShutdown() {
+  cancelIdleShutdown();
+  if ([...chats.values()].some((s) => s.ws !== null))
+    return;
+  if (tuiConnectionState.snapshot().tuiConnected)
+    return;
+  log(`No clients connected. Daemon will shut down in ${IDLE_SHUTDOWN_MS}ms if no one reconnects.`);
+  idleShutdownTimer = setTimeout(() => {
+    if ([...chats.values()].some((s) => s.ws !== null) || tuiConnectionState.snapshot().tuiConnected) {
+      log("Idle shutdown cancelled: client reconnected during grace period");
+      return;
+    }
+    shutdown("idle \u2014 no clients connected");
+  }, IDLE_SHUTDOWN_MS);
+}
+function cancelIdleShutdown() {
+  if (idleShutdownTimer) {
+    clearTimeout(idleShutdownTimer);
+    idleShutdownTimer = null;
+  }
 }
 function writePidFile() {
   daemonLifecycle.writePid();
@@ -2322,7 +2637,7 @@ function removeStatusFile() {
   daemonLifecycle.removeStatusFile();
 }
 async function bootCodex() {
-  log("Starting AgentBridge daemon...");
+  log("Starting AgentBridge daemon (multi-Claude variant)...");
   log(`Codex app-server: ${codex.appServerUrl}`);
   log(`Codex proxy: ${codex.proxyUrl}`);
   log(`Control server: ws://127.0.0.1:${CONTROL_PORT}/ws`);
@@ -2330,11 +2645,10 @@ async function bootCodex() {
     await codex.start();
     codexBootstrapped = true;
     writeStatusFile();
-    emitToClaude(systemMessage("system_waiting", currentWaitingMessage()));
     broadcastStatus();
   } catch (err) {
     log(`Failed to start Codex: ${err.message}`);
-    emitToClaude(systemMessage("system_codex_start_failed", `\u274C AgentBridge failed to start Codex app-server: ${err.message}`));
+    broadcastToAllClaudes(systemMessage("system_codex_start_failed", `\u274C AgentBridge failed to start Codex app-server: ${err.message}`));
     broadcastStatus();
   }
 }
@@ -2344,7 +2658,19 @@ function shutdown(reason) {
   shuttingDown = true;
   log(`Shutting down daemon (${reason})...`);
   tuiConnectionState.dispose(`daemon shutdown (${reason})`);
-  clearPendingClaudeDisconnect(`daemon shutdown (${reason})`);
+  for (const state of chats.values()) {
+    if (state.attentionWindowTimer)
+      clearTimeout(state.attentionWindowTimer);
+    if (state.disconnectTimer)
+      clearTimeout(state.disconnectTimer);
+    if (state.reaperTimer)
+      clearTimeout(state.reaperTimer);
+    state.statusBuffer.dispose();
+    try {
+      state.thread.close();
+    } catch {}
+  }
+  chats.clear();
   controlServer?.stop();
   controlServer = null;
   codex.stop();
@@ -2369,7 +2695,7 @@ function log(msg) {
 `;
   process.stderr.write(line);
   try {
-    appendFileSync2(stateDir.logFile, line);
+    appendFileSync3(stateDir.logFile, line);
   } catch {}
 }
 if (daemonLifecycle.wasKilled()) {
