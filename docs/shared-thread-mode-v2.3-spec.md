@@ -756,8 +756,8 @@ Unchanged. The offline buffer is per-chat (already), so cross-pair leakage is im
   work     ws://...:4510       ws://...:4511        ●    chat_def          1
   side     (not live)          (not live)           ○    -                 0
   ```
-- `abg pairs rm NAME [--forget]` → calls `destroy_pair(NAME, { forget })`. Without `--forget`, the registry entry stays so the same name + ports can be re-ensured later. With `--forget`, the registry entry is deleted and a fresh `ensure_pair(NAME)` will allocate a new stride.
-- `abg pairs rm NAME` is rejected if `NAME` is currently paired with a live Claude unless `--force` is also passed (avoids accidentally killing a working session).
+- `abg pairs rm NAME [--forget] [--force]` → calls `destroy_pair(NAME, { forget, force })`. Without `--forget`, the registry entry stays so the same name + ports can be re-ensured later. With `--forget`, the registry entry is deleted and a fresh `ensure_pair(NAME)` will allocate a new stride.
+- `--force` is required when `NAME` is currently paired with a live Claude (avoids accidentally killing a working session). Without `--force`, the protocol responds `pair_error PAIR_BUSY_NOT_FORCED` and the CLI prints a message pointing at the paired Claude.
 - `abg pairs` with no subcommand prints help.
 
 ### 8.3 `agentbridge claude` flag changes
@@ -774,7 +774,7 @@ Per D5, `abg kill` must walk `<stateDir>/pairs/*/codex.pid` and SIGTERM each bef
 | # | Scenario | Resolution |
 |---|---|---|
 | ME1 | `ensure_pair("work")` racing with `ensure_pair("work")` from two CLI clients | `ensurePairInFlight` mutex (§6.2 / D2). Both subscribers see the same resolved URLs. |
-| ME2 | `ensure_pair("work")` racing with `ensure_pair("side")` from two CLI clients | No conflict — different pairId. Two independent promises, two atomic registry writes. Registry writes use temp+rename so concurrent renames serialize via filesystem. |
+| ME2 | `ensure_pair("work")` racing with `ensure_pair("side")` from two CLI clients | Different pairId means `ensurePairInFlight` cannot dedup them — they get independent promises. The daemon-wide `registryWriteMutex` (§6.2 v0.4) serializes their registry read-modify-write sequences so neither allocation sees stale state; atomic temp+rename provides the on-disk crash safety. |
 | ME3 | Registry corruption (manual edit, partial write before crash) | Daemon validates each entry on startup (port range, name regex); invalid entries are dropped with a logged warning and the user gets a clean slate for those names. Valid entries continue to work. |
 | ME4 | Daemon restart with stale `pairs/<pair>/codex.pid` files | Next `ensure_pair(pair)` checks `pid` against `isProcessAlive`. If dead → file removed, fresh app-server spawned. If alive but unowned (foreign user) → `PAIR_PORTS_BUSY` per D2. |
 | ME5 | `destroy_pair("work")` while a paired Claude is mid-turn | Tear-down proceeds: the chat is transitioned to isolated (§6.5), but the in-flight turn is abandoned — the paired Claude sees `system_pair_torn_down` and a subsequent retry error. v2.2 had no equivalent because singleton tear-down meant the whole daemon went down. Documented in D3. |
@@ -800,7 +800,7 @@ Mirrors v2.2 spec §9 — probe scripts under `probes/multi-pair/` plus daemon-l
 | M03 | Two `abg codex --pair work` invocations in series; second exits 1 with "already connected" message scoped to pair "work". | Pre-flight rejection works per-pair. |
 | M04 | Claude with `AGENTBRIDGE_PAIR=work` attaches before TUI ensures "work". | `claude_connect_result.error === "PAIR_NOT_FOUND"`. Bridge enters disabled state with a clear system message. |
 | M05 | Three Claudes attach with no `AGENTBRIDGE_PAIR`; two pairs live (`default`, `work`); user typed in TUI of each. | FIFO claim: Claude 1 → default (paired), Claude 2 → work (paired), Claude 3 → isolated against default's app-server. |
-| M06 | `destroy_pair("work")` while paired Claude is mid-turn. | Paired Claude receives `system_pair_torn_down`; new ClaudeThread created targeting default; bootstrap retries exhausted (work's app-server is dying); chat reaped with "reconnect Claude" instruction. |
+| M06 | `destroy_pair("work")` while paired Claude is mid-turn, default pair live. | Paired Claude receives `system_pair_torn_down`; `transitionPairedChatOnTeardown` Path A bootstraps a fresh ClaudeThread on default's app-server; chat continues isolated. (If default were NOT live, Path B would reap the chat with the "reconnect Claude" instruction instead.) |
 | M07 | `ensure_pair("work")` registered with port 4510; user starts an unrelated process on 4510; `abg codex --pair work --via-proxy` retried. | `pair_error PAIR_PORTS_BUSY` with `conflictPid` populated; CLI message includes the PID. |
 | M08 | Daemon restart with `default` and `work` previously live. | Registry survives; both pairs absent from `pairs` map until each is `ensure_pair`'d again. CLI's first `abg codex --pair work` rehydrates work with the same ports. |
 | M09 | Concurrent `ensure_pair("work")` from two CLI clients (race ME1). | Both see the same `pair_ensured` payload; only one CodexAdapter constructed; registry written once. |
@@ -821,7 +821,7 @@ Sandbox note (same as v2.2 §12): Codex cannot bind local listeners. Probes are 
 | U05 | `attachClaude` FIFO across pairs | Two live unpaired pairs; two Claudes attach without `pairId`; first claims pair 1, second claims pair 2. |
 | U06 | `attachClaude` PAIR_BUSY | Pair with `pairedChatId` set; Claude attaches with explicit `pairId` for same pair; receives `claude_connect_result.error === "PAIR_BUSY"`. |
 | U07 | `attachClaude` PAIR_NOT_FOUND | Pair not in pairs map; explicit `pairId` attach receives error. |
-| U08 | `transitionChatToIsolatedAcrossPairs` flag reset | Pair-paired chat with `replyRequired=true`; trigger tear-down; chat's flag is `false` after transition (carries over the v2.2 bug fix from 54e806e). |
+| U08 | `transitionPairedChatOnTeardown` flag reset | Pair-paired chat with `replyRequired=true`; trigger tear-down with default live; chat's `replyRequired` / `replyReceivedDuringTurn` / `pairedTurnSawAgentMessage` all `false` after transition; chat re-bootstraps against default's app-server (Path A). Carries over the v2.2 bug fix from commit 54e806e. |
 | U09 | `destroyPair` with `forget=false` keeps registry; `forget=true` removes | Verify registry.json contents after each. |
 | U10 | Daemon restart reconciliation | Pre-seeded registry + stale `codex.pid` pointing to a dead PID; `ensurePair` on that pair cleans the pid file and spawns fresh. |
 
@@ -855,4 +855,4 @@ Same model as v2.2 (`docs/shared-thread-mode-spec.md` §12), with one caveat lea
 
 ---
 
-**Status**: Draft v0.4. §0-§4 locked at v0.3; §5-§12 revised per Codex final-pass review (codex_msg_5753c73beafc_78). Ready for P1 implementation pending one short Codex re-pass on the v0.4 deltas.
+**Status**: Draft v0.4 (final spec). §0-§4 locked at v0.3, §5-§12 revised per Codex final-pass review (codex_msg_5753c73beafc_78) and re-confirmed GO for P1 by Codex (codex_msg_5753c73beafc_83) plus 4 editorial nits applied. Implementation phase begins with P1.
