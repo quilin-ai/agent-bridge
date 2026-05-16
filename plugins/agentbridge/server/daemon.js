@@ -2337,152 +2337,181 @@ var defaultPairState = {
   },
   set proxyTuiSlot(v) {
     proxyTuiSlot = v;
-  }
+  },
+  handlerRefs: [],
+  isLive: false
 };
 var pairs = new Map([["default", defaultPairState]]);
-codex.on("ready", (threadId) => {
-  tuiConnectionState.markBridgeReady();
-  log(`Codex TUI thread ready: ${threadId} (bridge fully operational)`);
-  if (proxyTuiSlot) {
-    proxyTuiSlot.readiness = "ready";
-    if (proxyTuiSlot.pairedChatId) {
-      const state = chats.get(proxyTuiSlot.pairedChatId);
-      if (state && !state.ready) {
-        state.ready = true;
-        emitToChat(state, systemMessage("system_pair_ready", `\u2705 Shared Codex TUI thread is now ready (threadId=${threadId}). Replies sent via the reply tool will appear in the right pane's TUI.`));
+function attachPairHandlers(pair) {
+  if (pair.handlerRefs.length > 0) {
+    log(`[pair=${pair.pairId}] attachPairHandlers called but ${pair.handlerRefs.length} handler(s) already attached \u2014 no-op`);
+    return;
+  }
+  const on = (eventName, handler) => {
+    pair.codex.on(eventName, handler);
+    pair.handlerRefs.push({ eventName, handler });
+  };
+  on("ready", (threadId) => {
+    pair.tuiConnectionState.markBridgeReady();
+    log(`[pair=${pair.pairId}] Codex TUI thread ready: ${threadId} (bridge fully operational)`);
+    if (pair.proxyTuiSlot) {
+      pair.proxyTuiSlot.readiness = "ready";
+      if (pair.proxyTuiSlot.pairedChatId) {
+        const state = chats.get(pair.proxyTuiSlot.pairedChatId);
+        if (state && !state.ready) {
+          state.ready = true;
+          emitToChat(state, systemMessage("system_pair_ready", `\u2705 Shared Codex TUI thread is now ready (threadId=${threadId}). Replies sent via the reply tool will appear in the right pane's TUI.`));
+        }
       }
     }
-  }
-});
-codex.on("tuiConnected", (connId, token = "") => {
-  tuiConnectionState.handleTuiConnected(connId);
-  cancelIdleShutdown();
-  log(`Codex TUI connected (conn #${connId}, token=${token ? token.slice(0, 8) + "\u2026" : "<none>"})`);
-  if (token && !proxyTuiSlot) {
-    proxyTuiSlot = {
-      token,
-      pairedChatId: null,
-      readiness: "not-ready",
-      attachedAt: Date.now(),
-      pairReapTimer: null
-    };
-    log(`Proxy TUI slot allocated (token=${token.slice(0, 8)}\u2026)`);
-  }
-  broadcastStatus();
-});
-codex.on("tuiDisconnected", (connId) => {
-  tuiConnectionState.handleTuiDisconnected(connId);
-  log(`Codex TUI disconnected (conn #${connId})`);
-  if (proxyTuiSlot) {
-    const wasPairedChat = proxyTuiSlot.pairedChatId;
-    if (proxyTuiSlot.pairReapTimer)
-      clearTimeout(proxyTuiSlot.pairReapTimer);
-    proxyTuiSlot = null;
-    codex.setPairedChat(null);
-    if (wasPairedChat) {
-      const state = chats.get(wasPairedChat);
-      if (state) {
-        log(`Transitioning paired chat ${wasPairedChat} to isolated (TUI disconnect)`);
-        transitionToIsolated(state, "Shared Codex TUI thread is gone");
-      }
-    }
-  }
-  broadcastStatus();
-  scheduleIdleShutdown();
-});
-codex.on("agentMessage", (msg) => {
-  const paired = getPairedChatState();
-  if (!paired)
-    return;
-  log(`[${paired.chatId}] CodexAdapter \u2192 paired Claude (agentMessage, ${msg.content.length} chars)`);
-  paired.pairedTurnSawAgentMessage = true;
-  paired.replyReceivedDuringTurn = true;
-  emitToChat(paired, msg);
-});
-codex.on("userMessage", (payload) => {
-  const paired = getPairedChatState();
-  if (!paired)
-    return;
-  if (!payload.content)
-    return;
-  log(`[${paired.chatId}] CodexAdapter \u2192 paired Claude (userMessage from TUI, ${payload.content.length} chars)`);
-  paired.replyReceivedDuringTurn = true;
-  emitToChat(paired, {
-    id: payload.id ?? `tui_user_${Date.now()}`,
-    source: "codex",
-    content: `[IMPORTANT] Human typed in the paired Codex TUI:
-${payload.content}`,
-    timestamp: Date.now()
   });
-});
-codex.on("turnStarted", () => {
-  const paired = getPairedChatState();
-  if (!paired)
-    return;
-  paired.pairedTurnSawAgentMessage = false;
-  emitToChat(paired, systemMessage("system_codex_turn_started", "[system] Codex turn started"));
-});
-codex.on("turnCompleted", () => {
-  const paired = getPairedChatState();
-  if (!paired)
-    return;
-  if (!paired.pairedTurnSawAgentMessage && paired.replyRequired) {
-    log(`[${paired.chatId}] Codex turn completed with no agentMessage while replyRequired \u2014 surfacing as failure signal`);
-    paired.replyReceivedDuringTurn = true;
-    emitToChat(paired, systemMessage("system_codex_turn_completed_no_output", "[system] Codex turn completed without any agentMessage \u2014 likely a failure or empty response."));
-  } else {
-    emitToChat(paired, systemMessage("system_codex_turn_completed", "[system] Codex turn completed"));
-  }
-  paired.replyRequired = false;
-  paired.replyReceivedDuringTurn = false;
-});
-codex.on("errorItem", (payload) => {
-  const paired = getPairedChatState();
-  if (!paired)
-    return;
-  paired.replyReceivedDuringTurn = true;
-  emitToChat(paired, systemMessage("system_codex_error", `[error] ${payload.message ?? "(no message)"}${payload.code !== undefined ? ` (code ${payload.code})` : ""}`));
-  paired.pairedTurnSawAgentMessage = true;
-  paired.replyRequired = false;
-  paired.replyReceivedDuringTurn = false;
-});
-codex.on("sessionRestoreStart", () => {
-  if (!proxyTuiSlot)
-    return;
-  log(`Shared Codex session restore started \u2014 flipping paired readiness to not-ready`);
-  proxyTuiSlot.readiness = "not-ready";
-  const paired = getPairedChatState();
-  if (paired)
-    paired.ready = false;
-});
-codex.on("sessionRestoreEnd", (payload = {}) => {
-  if (!proxyTuiSlot)
-    return;
-  if (payload.ok === false) {
-    log(`Shared Codex session restore FAILED \u2014 keeping paired readiness=not-ready, awaiting TUI tear-down`);
-    return;
-  }
-  log(`Shared Codex session restore succeeded \u2014 flipping paired readiness back to ready`);
-  proxyTuiSlot.readiness = "ready";
-  const paired = getPairedChatState();
-  if (paired) {
-    paired.ready = true;
-    emitToChat(paired, systemMessage("system_pair_restored", "\u2705 Shared Codex TUI session restored. Replies can flow again."));
-  }
-});
-codex.on("threadClosed", () => {
-  const paired = getPairedChatState();
-  log(`Codex emitted thread/closed`);
-  if (proxyTuiSlot) {
-    const wasPairedChat = proxyTuiSlot.pairedChatId;
-    proxyTuiSlot = null;
-    codex.setPairedChat(null);
-    if (wasPairedChat && paired) {
-      log(`Transitioning paired chat ${wasPairedChat} to isolated (thread/closed)`);
-      transitionToIsolated(paired, "Shared Codex thread closed");
+  on("tuiConnected", (connId, token = "") => {
+    pair.tuiConnectionState.handleTuiConnected(connId);
+    cancelIdleShutdown();
+    log(`[pair=${pair.pairId}] Codex TUI connected (conn #${connId}, token=${token ? token.slice(0, 8) + "\u2026" : "<none>"})`);
+    if (token && !pair.proxyTuiSlot) {
+      pair.proxyTuiSlot = {
+        token,
+        pairedChatId: null,
+        readiness: "not-ready",
+        attachedAt: Date.now(),
+        pairReapTimer: null
+      };
+      log(`[pair=${pair.pairId}] Proxy TUI slot allocated (token=${token.slice(0, 8)}\u2026)`);
     }
-  }
-});
+    broadcastStatus();
+  });
+  on("tuiDisconnected", (connId) => {
+    pair.tuiConnectionState.handleTuiDisconnected(connId);
+    log(`[pair=${pair.pairId}] Codex TUI disconnected (conn #${connId})`);
+    if (pair.proxyTuiSlot) {
+      const wasPairedChat = pair.proxyTuiSlot.pairedChatId;
+      if (pair.proxyTuiSlot.pairReapTimer)
+        clearTimeout(pair.proxyTuiSlot.pairReapTimer);
+      pair.proxyTuiSlot = null;
+      pair.codex.setPairedChat(null);
+      if (wasPairedChat) {
+        const state = chats.get(wasPairedChat);
+        if (state) {
+          log(`[pair=${pair.pairId}] Transitioning paired chat ${wasPairedChat} to isolated (TUI disconnect)`);
+          transitionToIsolated(state, "Shared Codex TUI thread is gone");
+        }
+      }
+    }
+    broadcastStatus();
+    scheduleIdleShutdown();
+  });
+  on("agentMessage", (msg) => {
+    const paired = getPairedChatState();
+    if (!paired)
+      return;
+    log(`[${paired.chatId}] CodexAdapter \u2192 paired Claude (agentMessage, ${msg.content.length} chars)`);
+    paired.pairedTurnSawAgentMessage = true;
+    paired.replyReceivedDuringTurn = true;
+    emitToChat(paired, msg);
+  });
+  on("userMessage", (payload) => {
+    const paired = getPairedChatState();
+    if (!paired)
+      return;
+    if (!payload.content)
+      return;
+    log(`[${paired.chatId}] CodexAdapter \u2192 paired Claude (userMessage from TUI, ${payload.content.length} chars)`);
+    paired.replyReceivedDuringTurn = true;
+    emitToChat(paired, {
+      id: payload.id ?? `tui_user_${Date.now()}`,
+      source: "codex",
+      content: `[IMPORTANT] Human typed in the paired Codex TUI:
+${payload.content}`,
+      timestamp: Date.now()
+    });
+  });
+  on("turnStarted", () => {
+    const paired = getPairedChatState();
+    if (!paired)
+      return;
+    paired.pairedTurnSawAgentMessage = false;
+    emitToChat(paired, systemMessage("system_codex_turn_started", "[system] Codex turn started"));
+  });
+  on("turnCompleted", () => {
+    const paired = getPairedChatState();
+    if (!paired)
+      return;
+    if (!paired.pairedTurnSawAgentMessage && paired.replyRequired) {
+      log(`[${paired.chatId}] Codex turn completed with no agentMessage while replyRequired \u2014 surfacing as failure signal`);
+      paired.replyReceivedDuringTurn = true;
+      emitToChat(paired, systemMessage("system_codex_turn_completed_no_output", "[system] Codex turn completed without any agentMessage \u2014 likely a failure or empty response."));
+    } else {
+      emitToChat(paired, systemMessage("system_codex_turn_completed", "[system] Codex turn completed"));
+    }
+    paired.replyRequired = false;
+    paired.replyReceivedDuringTurn = false;
+  });
+  on("errorItem", (payload) => {
+    const paired = getPairedChatState();
+    if (!paired)
+      return;
+    paired.replyReceivedDuringTurn = true;
+    emitToChat(paired, systemMessage("system_codex_error", `[error] ${payload.message ?? "(no message)"}${payload.code !== undefined ? ` (code ${payload.code})` : ""}`));
+    paired.pairedTurnSawAgentMessage = true;
+    paired.replyRequired = false;
+    paired.replyReceivedDuringTurn = false;
+  });
+  on("sessionRestoreStart", () => {
+    if (!pair.proxyTuiSlot)
+      return;
+    log(`[pair=${pair.pairId}] Shared Codex session restore started \u2014 flipping paired readiness to not-ready`);
+    pair.proxyTuiSlot.readiness = "not-ready";
+    const paired = getPairedChatState();
+    if (paired)
+      paired.ready = false;
+  });
+  on("sessionRestoreEnd", (payload = {}) => {
+    if (!pair.proxyTuiSlot)
+      return;
+    if (payload.ok === false) {
+      log(`[pair=${pair.pairId}] Shared Codex session restore FAILED \u2014 keeping readiness=not-ready, awaiting TUI tear-down`);
+      return;
+    }
+    log(`[pair=${pair.pairId}] Shared Codex session restore succeeded \u2014 flipping readiness back to ready`);
+    pair.proxyTuiSlot.readiness = "ready";
+    const paired = getPairedChatState();
+    if (paired) {
+      paired.ready = true;
+      emitToChat(paired, systemMessage("system_pair_restored", "\u2705 Shared Codex TUI session restored. Replies can flow again."));
+    }
+  });
+  on("threadClosed", () => {
+    const paired = getPairedChatState();
+    log(`[pair=${pair.pairId}] Codex emitted thread/closed`);
+    if (pair.proxyTuiSlot) {
+      const wasPairedChat = pair.proxyTuiSlot.pairedChatId;
+      pair.proxyTuiSlot = null;
+      pair.codex.setPairedChat(null);
+      if (wasPairedChat && paired) {
+        log(`[pair=${pair.pairId}] Transitioning paired chat ${wasPairedChat} to isolated (thread/closed)`);
+        transitionToIsolated(paired, "Shared Codex thread closed");
+      }
+    }
+  });
+  on("error", (err) => {
+    log(`[pair=${pair.pairId}] Codex error: ${err.message}`);
+  });
+  on("exit", (code) => {
+    log(`[pair=${pair.pairId}] Codex app-server process exited (code ${code})`);
+    codexBootstrapped = false;
+    pair.tuiConnectionState.handleCodexExit();
+    broadcastToAllClaudes(systemMessage("system_codex_exit", `\u26A0\uFE0F Codex app-server exited (code ${code ?? "unknown"}). All ClaudeThread sessions terminated.`));
+    for (const state of chats.values()) {
+      try {
+        state.thread.close();
+      } catch {}
+      state.ready = false;
+    }
+    broadcastStatus();
+  });
+}
+attachPairHandlers(defaultPairState);
 function getPairedChatState() {
   if (!proxyTuiSlot?.pairedChatId)
     return null;
@@ -2573,22 +2602,6 @@ function transitionToIsolated(state, reason) {
   wireClaudeThreadEvents(state);
   bootstrapIsolatedThread(state);
 }
-codex.on("error", (err) => {
-  log(`Codex error: ${err.message}`);
-});
-codex.on("exit", (code) => {
-  log(`Codex app-server process exited (code ${code})`);
-  codexBootstrapped = false;
-  tuiConnectionState.handleCodexExit();
-  broadcastToAllClaudes(systemMessage("system_codex_exit", `\u26A0\uFE0F Codex app-server exited (code ${code ?? "unknown"}). All ClaudeThread sessions terminated.`));
-  for (const state of chats.values()) {
-    try {
-      state.thread.close();
-    } catch {}
-    state.ready = false;
-  }
-  broadcastStatus();
-});
 function startControlServer() {
   controlServer = Bun.serve({
     port: CONTROL_PORT,
@@ -3096,13 +3109,28 @@ function writeStatusFile() {
 function removeStatusFile() {
   daemonLifecycle.removeStatusFile();
 }
+async function ensurePair(pairId) {
+  if (pairId !== "default") {
+    throw new Error(`ensurePair: pairId="${pairId}" not yet supported in P2 (default only)`);
+  }
+  const pair = pairs.get(pairId);
+  if (!pair) {
+    throw new Error(`ensurePair: pair "${pairId}" missing from registry (P2 invariant violated)`);
+  }
+  if (pair.isLive)
+    return pair;
+  log(`[pair=${pair.pairId}] ensurePair: starting codex app-server (appPort=${pair.codex.appServerUrl}, proxyPort=${pair.codex.proxyUrl})`);
+  await pair.codex.start();
+  pair.isLive = true;
+  return pair;
+}
 async function bootCodex() {
   log("Starting AgentBridge daemon (multi-Claude variant)...");
   log(`Codex app-server: ${codex.appServerUrl}`);
   log(`Codex proxy: ${codex.proxyUrl}`);
   log(`Control server: ws://127.0.0.1:${CONTROL_PORT}/ws`);
   try {
-    await codex.start();
+    await ensurePair("default");
     codexBootstrapped = true;
     writeStatusFile();
     broadcastStatus();

@@ -191,11 +191,27 @@ const tuiConnectionState = new TuiConnectionState({
  * mutations through either access path (direct variable assignment or
  * `pairs.get("default")!.proxyTuiSlot = X`) stay in sync.
  */
+/**
+ * STM v2.3 §D9 P2: each event handler registered on a pair's CodexAdapter
+ * is tracked here so `detachPairHandlers(pair)` can call `codex.off(name,
+ * ref)` for exactly the handlers `attachPairHandlers(pair)` registered.
+ * Avoids `removeAllListeners()` which would wipe diagnostics/internal
+ * listeners that the daemon does not own.
+ */
+interface PairHandlerRegistration {
+  eventName: string;
+  handler: (...args: any[]) => void;
+}
+
 interface PairState {
   readonly pairId: string;
   readonly codex: CodexAdapter;
   readonly tuiConnectionState: TuiConnectionState;
   proxyTuiSlot: ProxyTuiSlot | null;
+  /** D9 handler refs populated by `attachPairHandlers`. */
+  handlerRefs: PairHandlerRegistration[];
+  /** P2: live = handlers attached + codex started. Toggled by ensurePair/destroyPair. */
+  isLive: boolean;
 }
 
 const defaultPairState: PairState = {
@@ -204,203 +220,247 @@ const defaultPairState: PairState = {
   tuiConnectionState,
   get proxyTuiSlot() { return proxyTuiSlot; },
   set proxyTuiSlot(v: ProxyTuiSlot | null) { proxyTuiSlot = v; },
+  handlerRefs: [],
+  isLive: false, // bootCodex / ensurePair("default") flips this to true on success
 };
 const pairs = new Map<string, PairState>([["default", defaultPairState]]);
-void pairs; // P1: structure introduced; P2+ migrates daemon code to use it directly.
 
 // ── TUI / app-server event wiring ────────────────────────────────
 // Codex TUI activity is INTENTIONALLY not cross-broadcast to Claude sessions.
 // We only listen for lifecycle events that affect all chats (TUI connected,
 // codex ready, codex exit, etc.).
-
-codex.on("ready", (threadId: string) => {
-  tuiConnectionState.markBridgeReady();
-  log(`Codex TUI thread ready: ${threadId} (bridge fully operational)`);
-  // Spec v2.2 §5: thread/started observed → flip readiness so paired Claude
-  // replies stop returning the "provisioning" error.
-  if (proxyTuiSlot) {
-    proxyTuiSlot.readiness = "ready";
-    if (proxyTuiSlot.pairedChatId) {
-      const state = chats.get(proxyTuiSlot.pairedChatId);
-      if (state && !state.ready) {
-        state.ready = true;
-        emitToChat(state, systemMessage("system_pair_ready",
-          `✅ Shared Codex TUI thread is now ready (threadId=${threadId}). Replies sent via the reply tool will appear in the right pane's TUI.`));
-      }
-    }
-  }
-});
-
-codex.on("tuiConnected", (connId: number, token: string = "") => {
-  tuiConnectionState.handleTuiConnected(connId);
-  cancelIdleShutdown();
-  log(`Codex TUI connected (conn #${connId}, token=${token ? token.slice(0, 8) + "…" : "<none>"})`);
-  // Spec v2.2 §5: a TUI carrying a non-empty shared-mode token is a proxy TUI.
-  // Initialize the slot. Empty token = direct/legacy TUI; no pairing intent.
-  if (token && !proxyTuiSlot) {
-    proxyTuiSlot = {
-      token,
-      pairedChatId: null,
-      readiness: "not-ready",
-      attachedAt: Date.now(),
-      pairReapTimer: null,
-    };
-    log(`Proxy TUI slot allocated (token=${token.slice(0, 8)}…)`);
-    // Spec v2.2 §5.1: PAIR_RACE_MS=0 — Claude-first stays isolated. Do NOT
-    // retroactively pair an already-attached isolated Claude. Only chats that
-    // attach AFTER this point (in attachClaude) can claim the slot.
-  }
-  broadcastStatus();
-});
-
-codex.on("tuiDisconnected", (connId: number) => {
-  tuiConnectionState.handleTuiDisconnected(connId);
-  log(`Codex TUI disconnected (conn #${connId})`);
-  // Spec v2.2 §5: TUI disconnect tears down the proxy slot. Paired Claude (if
-  // any) transitions to isolated mode with a system notice. No prior context
-  // is replayed.
-  if (proxyTuiSlot) {
-    const wasPairedChat = proxyTuiSlot.pairedChatId;
-    if (proxyTuiSlot.pairReapTimer) clearTimeout(proxyTuiSlot.pairReapTimer);
-    proxyTuiSlot = null;
-    codex.setPairedChat(null);
-    if (wasPairedChat) {
-      const state = chats.get(wasPairedChat);
-      if (state) {
-        log(`Transitioning paired chat ${wasPairedChat} to isolated (TUI disconnect)`);
-        transitionToIsolated(state, "Shared Codex TUI thread is gone");
-      }
-    }
-  }
-  broadcastStatus();
-  scheduleIdleShutdown();
-});
-
-// ── Spec v2.2 §4.3 — shared transport outbound routing ────────
 //
-// When a chat is paired via proxyTuiSlot, CodexAdapter is the transport. All
-// shared-thread events route to the paired chat only.
+// STM v2.3 §D9 P2: every handler registers on `pair.codex` (currently only
+// the default pair's adapter; multi-pair lifecycle in P3+). Each
+// registration is tracked in `pair.handlerRefs` so `detachPairHandlers`
+// can use targeted `off()` without `removeAllListeners()`-style overreach
+// that would clobber diagnostics listeners we do not own.
+//
+// In P2 the handler bodies still call out to module-level helpers
+// (`getPairedChatState`, `chats`, `transitionToIsolated`, etc.). The
+// handler bodies use `pair.X` for state owned by the PairState (codex,
+// proxyTuiSlot, tuiConnectionState) to make pair scoping explicit even
+// though the P1 alias keeps the module-level names pointed at the same
+// objects. P3+ will progressively migrate the called-out helpers to be
+// pair-aware as well.
 
-codex.on("agentMessage", (msg: BridgeMessage) => {
-  const paired = getPairedChatState();
-  if (!paired) return;
-  log(`[${paired.chatId}] CodexAdapter → paired Claude (agentMessage, ${msg.content.length} chars)`);
-  paired.pairedTurnSawAgentMessage = true;
-  paired.replyReceivedDuringTurn = true;
-  emitToChat(paired, msg);
-});
-
-codex.on("userMessage", (payload: { content: string; id?: string; turnId?: string }) => {
-  const paired = getPairedChatState();
-  if (!paired) return;
-  if (!payload.content) return;
-  log(`[${paired.chatId}] CodexAdapter → paired Claude (userMessage from TUI, ${payload.content.length} chars)`);
-  paired.replyReceivedDuringTurn = true;
-  emitToChat(paired, {
-    id: payload.id ?? `tui_user_${Date.now()}`,
-    source: "codex",
-    content: `[IMPORTANT] Human typed in the paired Codex TUI:\n${payload.content}`,
-    timestamp: Date.now(),
-  });
-});
-
-codex.on("turnStarted", () => {
-  const paired = getPairedChatState();
-  if (!paired) return;
-  // Spec v2.2 §4.3: emit as diagnostic, MUST NOT satisfy requireReply.
-  // Reset per-turn agentMessage tracker so turn/completed can detect the
-  // "no-output failure" mode.
-  paired.pairedTurnSawAgentMessage = false;
-  emitToChat(paired, systemMessage("system_codex_turn_started", "[system] Codex turn started"));
-});
-
-codex.on("turnCompleted", () => {
-  const paired = getPairedChatState();
-  if (!paired) return;
-  // Bug fix (2026-05-16): only surface "no-output failure" when Claude was
-  // actually waiting for a reply (replyRequired=true). User-typed TUI turns
-  // can legitimately complete without an agentMessage (e.g. silent ack) —
-  // emitting failure wording there confused paired Claude. Spec v2.2 §4.3
-  // describes this as the "no-output failure signal" but does not require
-  // it for non-Claude-originated turns.
-  if (!paired.pairedTurnSawAgentMessage && paired.replyRequired) {
-    log(`[${paired.chatId}] Codex turn completed with no agentMessage while replyRequired — surfacing as failure signal`);
-    paired.replyReceivedDuringTurn = true;
-    emitToChat(paired, systemMessage("system_codex_turn_completed_no_output",
-      "[system] Codex turn completed without any agentMessage — likely a failure or empty response."));
-  } else {
-    emitToChat(paired, systemMessage("system_codex_turn_completed", "[system] Codex turn completed"));
-  }
-  // Cleanup: reset per-turn flags so a future transition to isolated mode
-  // starts from a clean slate.
-  paired.replyRequired = false;
-  paired.replyReceivedDuringTurn = false;
-});
-
-codex.on("errorItem", (payload: { code?: number; message?: string }) => {
-  const paired = getPairedChatState();
-  if (!paired) return;
-  // Spec v2.2 §4.3: error notification satisfies requireReply.
-  paired.replyReceivedDuringTurn = true;
-  emitToChat(paired, systemMessage("system_codex_error",
-    `[error] ${payload.message ?? "(no message)"}${payload.code !== undefined ? ` (code ${payload.code})` : ""}`));
-  // Bug fix (2026-05-16): mark the turn as "Claude has been informed" so a
-  // subsequent turn/completed does not fire a spurious no-output failure on
-  // top of the error we already surfaced. Naming is slightly stretched here
-  // ("sawAgentMessage" is now "saw something Claude needs to know about")
-  // but renaming would touch too many call sites for a minor fix.
-  paired.pairedTurnSawAgentMessage = true;
-  paired.replyRequired = false;
-  // Symmetric reset (Codex review 2026-05-16): match the cleanup in the
-  // turn/completed handler so an error doesn't leave a stale "received during
-  // turn" flag that could confuse later logic.
-  paired.replyReceivedDuringTurn = false;
-});
-
-// Spec v2.2 §8 E8: app-server reconnect restore flips paired readiness back
-// to not-ready, surfacing "restoring shared Codex TUI session, retry shortly"
-// to paired Claude until restore completes.
-codex.on("sessionRestoreStart", () => {
-  if (!proxyTuiSlot) return;
-  log(`Shared Codex session restore started — flipping paired readiness to not-ready`);
-  proxyTuiSlot.readiness = "not-ready";
-  const paired = getPairedChatState();
-  if (paired) paired.ready = false;
-});
-
-codex.on("sessionRestoreEnd", (payload: { ok?: boolean; threadId?: string } = {}) => {
-  if (!proxyTuiSlot) return;
-  if (payload.ok === false) {
-    // Spec v2.2 §8 E8: restore failure path. Keep paired readiness=not-ready.
-    // CodexAdapter's catch branch closes the TUI with 1011, which will fire
-    // tuiDisconnected and tear down the pair via the normal path. We just
-    // don't lie to paired Claude in the meantime.
-    log(`Shared Codex session restore FAILED — keeping paired readiness=not-ready, awaiting TUI tear-down`);
+function attachPairHandlers(pair: PairState): void {
+  if (pair.handlerRefs.length > 0) {
+    log(`[pair=${pair.pairId}] attachPairHandlers called but ${pair.handlerRefs.length} handler(s) already attached — no-op`);
     return;
   }
-  log(`Shared Codex session restore succeeded — flipping paired readiness back to ready`);
-  proxyTuiSlot.readiness = "ready";
-  const paired = getPairedChatState();
-  if (paired) {
-    paired.ready = true;
-    emitToChat(paired, systemMessage("system_pair_restored",
-      "✅ Shared Codex TUI session restored. Replies can flow again."));
-  }
-});
+  const on = <E extends string>(eventName: E, handler: (...args: any[]) => void) => {
+    pair.codex.on(eventName, handler);
+    pair.handlerRefs.push({ eventName, handler });
+  };
 
-codex.on("threadClosed", () => {
-  const paired = getPairedChatState();
-  log(`Codex emitted thread/closed`);
-  if (proxyTuiSlot) {
-    const wasPairedChat = proxyTuiSlot.pairedChatId;
-    proxyTuiSlot = null;
-    codex.setPairedChat(null);
-    if (wasPairedChat && paired) {
-      log(`Transitioning paired chat ${wasPairedChat} to isolated (thread/closed)`);
-      transitionToIsolated(paired, "Shared Codex thread closed");
+  on("ready", (threadId: string) => {
+    pair.tuiConnectionState.markBridgeReady();
+    log(`[pair=${pair.pairId}] Codex TUI thread ready: ${threadId} (bridge fully operational)`);
+    // Spec v2.2 §5: thread/started observed → flip readiness so paired Claude
+    // replies stop returning the "provisioning" error.
+    if (pair.proxyTuiSlot) {
+      pair.proxyTuiSlot.readiness = "ready";
+      if (pair.proxyTuiSlot.pairedChatId) {
+        const state = chats.get(pair.proxyTuiSlot.pairedChatId);
+        if (state && !state.ready) {
+          state.ready = true;
+          emitToChat(state, systemMessage("system_pair_ready",
+            `✅ Shared Codex TUI thread is now ready (threadId=${threadId}). Replies sent via the reply tool will appear in the right pane's TUI.`));
+        }
+      }
     }
+  });
+
+  on("tuiConnected", (connId: number, token: string = "") => {
+    pair.tuiConnectionState.handleTuiConnected(connId);
+    cancelIdleShutdown();
+    log(`[pair=${pair.pairId}] Codex TUI connected (conn #${connId}, token=${token ? token.slice(0, 8) + "…" : "<none>"})`);
+    // Spec v2.2 §5: a TUI carrying a non-empty shared-mode token is a proxy TUI.
+    // Initialize the slot. Empty token = direct/legacy TUI; no pairing intent.
+    if (token && !pair.proxyTuiSlot) {
+      pair.proxyTuiSlot = {
+        token,
+        pairedChatId: null,
+        readiness: "not-ready",
+        attachedAt: Date.now(),
+        pairReapTimer: null,
+      };
+      log(`[pair=${pair.pairId}] Proxy TUI slot allocated (token=${token.slice(0, 8)}…)`);
+      // Spec v2.2 §5.1: PAIR_RACE_MS=0 — Claude-first stays isolated. Do NOT
+      // retroactively pair an already-attached isolated Claude. Only chats that
+      // attach AFTER this point (in attachClaude) can claim the slot.
+    }
+    broadcastStatus();
+  });
+
+  on("tuiDisconnected", (connId: number) => {
+    pair.tuiConnectionState.handleTuiDisconnected(connId);
+    log(`[pair=${pair.pairId}] Codex TUI disconnected (conn #${connId})`);
+    // Spec v2.2 §5: TUI disconnect tears down the proxy slot. Paired Claude (if
+    // any) transitions to isolated mode with a system notice. No prior context
+    // is replayed.
+    if (pair.proxyTuiSlot) {
+      const wasPairedChat = pair.proxyTuiSlot.pairedChatId;
+      if (pair.proxyTuiSlot.pairReapTimer) clearTimeout(pair.proxyTuiSlot.pairReapTimer);
+      pair.proxyTuiSlot = null;
+      pair.codex.setPairedChat(null);
+      if (wasPairedChat) {
+        const state = chats.get(wasPairedChat);
+        if (state) {
+          log(`[pair=${pair.pairId}] Transitioning paired chat ${wasPairedChat} to isolated (TUI disconnect)`);
+          transitionToIsolated(state, "Shared Codex TUI thread is gone");
+        }
+      }
+    }
+    broadcastStatus();
+    scheduleIdleShutdown();
+  });
+
+  // ── Spec v2.2 §4.3 — shared transport outbound routing ────────
+  //
+  // When a chat is paired via proxyTuiSlot, CodexAdapter is the transport. All
+  // shared-thread events route to the paired chat only.
+
+  on("agentMessage", (msg: BridgeMessage) => {
+    const paired = getPairedChatState();
+    if (!paired) return;
+    log(`[${paired.chatId}] CodexAdapter → paired Claude (agentMessage, ${msg.content.length} chars)`);
+    paired.pairedTurnSawAgentMessage = true;
+    paired.replyReceivedDuringTurn = true;
+    emitToChat(paired, msg);
+  });
+
+  on("userMessage", (payload: { content: string; id?: string; turnId?: string }) => {
+    const paired = getPairedChatState();
+    if (!paired) return;
+    if (!payload.content) return;
+    log(`[${paired.chatId}] CodexAdapter → paired Claude (userMessage from TUI, ${payload.content.length} chars)`);
+    paired.replyReceivedDuringTurn = true;
+    emitToChat(paired, {
+      id: payload.id ?? `tui_user_${Date.now()}`,
+      source: "codex",
+      content: `[IMPORTANT] Human typed in the paired Codex TUI:\n${payload.content}`,
+      timestamp: Date.now(),
+    });
+  });
+
+  on("turnStarted", () => {
+    const paired = getPairedChatState();
+    if (!paired) return;
+    // Spec v2.2 §4.3: emit as diagnostic, MUST NOT satisfy requireReply.
+    // Reset per-turn agentMessage tracker so turn/completed can detect the
+    // "no-output failure" mode.
+    paired.pairedTurnSawAgentMessage = false;
+    emitToChat(paired, systemMessage("system_codex_turn_started", "[system] Codex turn started"));
+  });
+
+  on("turnCompleted", () => {
+    const paired = getPairedChatState();
+    if (!paired) return;
+    // Bug fix (2026-05-16): only surface "no-output failure" when Claude was
+    // actually waiting for a reply (replyRequired=true). User-typed TUI turns
+    // can legitimately complete without an agentMessage (e.g. silent ack) —
+    // emitting failure wording there confused paired Claude.
+    if (!paired.pairedTurnSawAgentMessage && paired.replyRequired) {
+      log(`[${paired.chatId}] Codex turn completed with no agentMessage while replyRequired — surfacing as failure signal`);
+      paired.replyReceivedDuringTurn = true;
+      emitToChat(paired, systemMessage("system_codex_turn_completed_no_output",
+        "[system] Codex turn completed without any agentMessage — likely a failure or empty response."));
+    } else {
+      emitToChat(paired, systemMessage("system_codex_turn_completed", "[system] Codex turn completed"));
+    }
+    paired.replyRequired = false;
+    paired.replyReceivedDuringTurn = false;
+  });
+
+  on("errorItem", (payload: { code?: number; message?: string }) => {
+    const paired = getPairedChatState();
+    if (!paired) return;
+    paired.replyReceivedDuringTurn = true;
+    emitToChat(paired, systemMessage("system_codex_error",
+      `[error] ${payload.message ?? "(no message)"}${payload.code !== undefined ? ` (code ${payload.code})` : ""}`));
+    paired.pairedTurnSawAgentMessage = true;
+    paired.replyRequired = false;
+    paired.replyReceivedDuringTurn = false;
+  });
+
+  // Spec v2.2 §8 E8: app-server reconnect restore flips paired readiness
+  // back to not-ready, surfacing "restoring shared Codex TUI session" to
+  // paired Claude until restore completes.
+  on("sessionRestoreStart", () => {
+    if (!pair.proxyTuiSlot) return;
+    log(`[pair=${pair.pairId}] Shared Codex session restore started — flipping paired readiness to not-ready`);
+    pair.proxyTuiSlot.readiness = "not-ready";
+    const paired = getPairedChatState();
+    if (paired) paired.ready = false;
+  });
+
+  on("sessionRestoreEnd", (payload: { ok?: boolean; threadId?: string } = {}) => {
+    if (!pair.proxyTuiSlot) return;
+    if (payload.ok === false) {
+      log(`[pair=${pair.pairId}] Shared Codex session restore FAILED — keeping readiness=not-ready, awaiting TUI tear-down`);
+      return;
+    }
+    log(`[pair=${pair.pairId}] Shared Codex session restore succeeded — flipping readiness back to ready`);
+    pair.proxyTuiSlot.readiness = "ready";
+    const paired = getPairedChatState();
+    if (paired) {
+      paired.ready = true;
+      emitToChat(paired, systemMessage("system_pair_restored",
+        "✅ Shared Codex TUI session restored. Replies can flow again."));
+    }
+  });
+
+  on("threadClosed", () => {
+    const paired = getPairedChatState();
+    log(`[pair=${pair.pairId}] Codex emitted thread/closed`);
+    if (pair.proxyTuiSlot) {
+      const wasPairedChat = pair.proxyTuiSlot.pairedChatId;
+      pair.proxyTuiSlot = null;
+      pair.codex.setPairedChat(null);
+      if (wasPairedChat && paired) {
+        log(`[pair=${pair.pairId}] Transitioning paired chat ${wasPairedChat} to isolated (thread/closed)`);
+        transitionToIsolated(paired, "Shared Codex thread closed");
+      }
+    }
+  });
+
+  on("error", (err: Error) => {
+    log(`[pair=${pair.pairId}] Codex error: ${err.message}`);
+  });
+
+  on("exit", (code: number | null) => {
+    log(`[pair=${pair.pairId}] Codex app-server process exited (code ${code})`);
+    codexBootstrapped = false;
+    pair.tuiConnectionState.handleCodexExit();
+    broadcastToAllClaudes(
+      systemMessage(
+        "system_codex_exit",
+        `⚠️ Codex app-server exited (code ${code ?? "unknown"}). All ClaudeThread sessions terminated.`,
+      ),
+    );
+    for (const state of chats.values()) {
+      try { state.thread.close(); } catch {}
+      state.ready = false;
+    }
+    broadcastStatus();
+  });
+}
+
+/** STM v2.3 §D9 P2: targeted off() — symmetric counterpart to attachPairHandlers. */
+function detachPairHandlers(pair: PairState): void {
+  for (const { eventName, handler } of pair.handlerRefs) {
+    pair.codex.off(eventName, handler);
   }
-});
+  pair.handlerRefs = [];
+}
+
+// Register the default pair's listeners now. In P2 this happens at module
+// load (matching v2.2 behavior — daemon starts listening before bootCodex
+// fires). P3 moves this call inside `ensurePair("default")` and gates it
+// on lazy creation.
+attachPairHandlers(defaultPairState);
 
 function getPairedChatState(): ChatState | null {
   if (!proxyTuiSlot?.pairedChatId) return null;
@@ -529,27 +589,6 @@ function transitionToIsolated(state: ChatState, reason: string): void {
   wireClaudeThreadEvents(state);
   bootstrapIsolatedThread(state);
 }
-
-codex.on("error", (err: Error) => {
-  log(`Codex error: ${err.message}`);
-});
-
-codex.on("exit", (code: number | null) => {
-  log(`Codex app-server process exited (code ${code})`);
-  codexBootstrapped = false;
-  tuiConnectionState.handleCodexExit();
-  broadcastToAllClaudes(
-    systemMessage(
-      "system_codex_exit",
-      `⚠️ Codex app-server exited (code ${code ?? "unknown"}). All ClaudeThread sessions terminated.`,
-    ),
-  );
-  for (const state of chats.values()) {
-    try { state.thread.close(); } catch {}
-    state.ready = false;
-  }
-  broadcastStatus();
-});
 
 // ── Control server / Claude WS handling ─────────────────────────
 
@@ -1144,6 +1183,58 @@ function writeStatusFile() {
 
 function removeStatusFile() { daemonLifecycle.removeStatusFile(); }
 
+/**
+ * STM v2.3 §6.2 P2: bring a pair live — start its Codex app-server.
+ *
+ * In P2 the only legal `pairId` is `"default"` and the PairState is
+ * pre-constructed at module load (handlers attached). This function just
+ * runs the codex.start() flow and flips `isLive`. Calling it on an
+ * already-live pair is idempotent.
+ *
+ * P3 generalizes this to:
+ *   - validate pairId per D1
+ *   - check `ensurePairInFlight` dedup mutex
+ *   - look up / allocate ports via registry
+ *   - construct CodexAdapter on demand for non-default pairs
+ *   - attachPairHandlers for the new PairState
+ *   - await codex.start() and flip isLive
+ *   - return URLs to caller
+ */
+async function ensurePair(pairId: string): Promise<PairState> {
+  if (pairId !== "default") {
+    throw new Error(`ensurePair: pairId="${pairId}" not yet supported in P2 (default only)`);
+  }
+  const pair = pairs.get(pairId);
+  if (!pair) {
+    throw new Error(`ensurePair: pair "${pairId}" missing from registry (P2 invariant violated)`);
+  }
+  if (pair.isLive) return pair;
+  log(`[pair=${pair.pairId}] ensurePair: starting codex app-server (appPort=${pair.codex.appServerUrl}, proxyPort=${pair.codex.proxyUrl})`);
+  await pair.codex.start();
+  pair.isLive = true;
+  return pair;
+}
+
+/**
+ * STM v2.3 §6.3 P2: tear a pair down — stop codex, detach handlers.
+ *
+ * In P2 the default pair is the only entry; destroying it puts the daemon
+ * into an effectively-shutdown state (no Codex to talk to). Real callers
+ * arrive in P3 with the `destroy_pair` control protocol; P2 just defines
+ * the symmetric counterpart of `ensurePair` so the lifecycle is closed.
+ */
+async function destroyPair(pairId: string): Promise<void> {
+  const pair = pairs.get(pairId);
+  if (!pair) return;
+  log(`[pair=${pair.pairId}] destroyPair: stopping codex + detaching handlers`);
+  detachPairHandlers(pair);
+  try { pair.codex.stop(); } catch (err: any) {
+    log(`[pair=${pair.pairId}] destroyPair: codex.stop() threw — ${err?.message ?? err}`);
+  }
+  pair.isLive = false;
+  // P3+ will also remove from the pairs Map for non-default pairs.
+}
+
 async function bootCodex() {
   log("Starting AgentBridge daemon (multi-Claude variant)...");
   log(`Codex app-server: ${codex.appServerUrl}`);
@@ -1151,7 +1242,7 @@ async function bootCodex() {
   log(`Control server: ws://127.0.0.1:${CONTROL_PORT}/ws`);
 
   try {
-    await codex.start();
+    await ensurePair("default");
     codexBootstrapped = true;
     writeStatusFile();
     broadcastStatus();
