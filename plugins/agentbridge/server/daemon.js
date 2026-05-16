@@ -154,11 +154,16 @@ class CodexAdapter extends EventEmitter {
   pendingInjectionByReqId = new Map;
   static ECHO_DEDUP_TTL_MS = 60000;
   static PENDING_HASH_TTL_MS = 5000;
-  constructor(appPort = 4500, proxyPort = 4501, logFile = new StateDirResolver().logFile) {
+  _pairId;
+  constructor(opts) {
     super();
-    this.appPort = appPort;
-    this.proxyPort = proxyPort;
-    this.logFile = logFile;
+    this._pairId = opts.pairId ?? "default";
+    this.appPort = opts.appPort;
+    this.proxyPort = opts.proxyPort;
+    this.logFile = opts.logFile ?? new StateDirResolver().logFile;
+  }
+  get pairId() {
+    return this._pairId;
   }
   get appServerUrl() {
     return `ws://127.0.0.1:${this.appPort}`;
@@ -2299,7 +2304,12 @@ var FILTER_MODE = process.env.AGENTBRIDGE_FILTER_MODE === "full" ? "full" : "fil
 var IDLE_SHUTDOWN_MS = parseInt(process.env.AGENTBRIDGE_IDLE_SHUTDOWN_MS ?? String(config.idleShutdownSeconds * 1000), 10);
 var ATTENTION_WINDOW_MS = parseInt(process.env.AGENTBRIDGE_ATTENTION_WINDOW_MS ?? String(config.turnCoordination.attentionWindowSeconds * 1000), 10);
 var daemonLifecycle = new DaemonLifecycle({ stateDir, controlPort: CONTROL_PORT, log });
-var codex = new CodexAdapter(CODEX_APP_PORT, CODEX_PROXY_PORT, stateDir.logFile);
+var codex = new CodexAdapter({
+  pairId: "default",
+  appPort: CODEX_APP_PORT,
+  proxyPort: CODEX_PROXY_PORT,
+  logFile: stateDir.logFile
+});
 var attachCmd = `codex --enable tui_app_server --remote ${codex.proxyUrl}`;
 var controlServer = null;
 var nextControlClientId = 0;
@@ -2318,6 +2328,18 @@ var tuiConnectionState = new TuiConnectionState({
     broadcastToAllClaudes(systemMessage("system_tui_reconnected", `\u2705 Codex TUI reconnected (conn #${connId}). Bridge restored.`));
   }
 });
+var defaultPairState = {
+  pairId: "default",
+  codex,
+  tuiConnectionState,
+  get proxyTuiSlot() {
+    return proxyTuiSlot;
+  },
+  set proxyTuiSlot(v) {
+    proxyTuiSlot = v;
+  }
+};
+var pairs = new Map([["default", defaultPairState]]);
 codex.on("ready", (threadId) => {
   tuiConnectionState.markBridgeReady();
   log(`Codex TUI thread ready: ${threadId} (bridge fully operational)`);
@@ -2686,6 +2708,7 @@ async function attachClaude(ws, requestedChatId) {
 function createChatState(chatId) {
   const state = {
     chatId,
+    homePairId: "default",
     ws: null,
     thread: new ClaudeThread({
       appServerUrl: codex.appServerUrl,
@@ -3156,6 +3179,7 @@ var __testing = {
   },
   chats,
   codex,
+  pairs,
   fns: {
     pairChat,
     transitionToIsolated,

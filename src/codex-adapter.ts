@@ -168,13 +168,25 @@ export class CodexAdapter extends EventEmitter {
   private static readonly ECHO_DEDUP_TTL_MS = 60_000;
   private static readonly PENDING_HASH_TTL_MS = 5_000;
 
-  constructor(appPort = 4500, proxyPort = 4501, logFile = new StateDirResolver().logFile) {
+  /**
+   * STM v2.3 P1: pair identifier for this adapter instance. Defaults to
+   * "default" (the only legal value in P1). Surfaced via the `pairId`
+   * getter so daemon-side per-pair event handlers can log correlated
+   * messages without keeping a separate map. Not used by the adapter's
+   * own logic — the adapter does not need to know its pair id to do its
+   * job (see spec v2.3 §5.2).
+   */
+  private readonly _pairId: string;
+
+  constructor(opts: { pairId?: string; appPort: number; proxyPort: number; logFile?: string }) {
     super();
-    this.appPort = appPort;
-    this.proxyPort = proxyPort;
-    this.logFile = logFile;
+    this._pairId = opts.pairId ?? "default";
+    this.appPort = opts.appPort;
+    this.proxyPort = opts.proxyPort;
+    this.logFile = opts.logFile ?? new StateDirResolver().logFile;
   }
 
+  get pairId() { return this._pairId; }
   get appServerUrl() { return `ws://127.0.0.1:${this.appPort}`; }
   get proxyUrl() { return `ws://127.0.0.1:${this.proxyPort}`; }
   get activeThreadId() { return this.threadId; }

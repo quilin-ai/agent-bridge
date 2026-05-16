@@ -44,6 +44,13 @@ interface ControlSocketData {
 
 interface ChatState {
   chatId: string;
+  /**
+   * STM v2.3 §6.1 P1: every chat is associated with one pair (its "home
+   * pair"). In P1 this is always `"default"` because only the default
+   * pair exists. P5 introduces FIFO claiming across multiple pairs and
+   * the optional `null` value for isolated chats with no live pair.
+   */
+  homePairId: string;
   ws: ServerWebSocket<ControlSocketData> | null;
   thread: ClaudeThread;
   ready: boolean;
@@ -121,7 +128,12 @@ const ATTENTION_WINDOW_MS = parseInt(
 
 const daemonLifecycle = new DaemonLifecycle({ stateDir, controlPort: CONTROL_PORT, log });
 
-const codex = new CodexAdapter(CODEX_APP_PORT, CODEX_PROXY_PORT, stateDir.logFile);
+const codex = new CodexAdapter({
+  pairId: "default",
+  appPort: CODEX_APP_PORT,
+  proxyPort: CODEX_PROXY_PORT,
+  logFile: stateDir.logFile,
+});
 const attachCmd = `codex --enable tui_app_server --remote ${codex.proxyUrl}`;
 
 let controlServer: ReturnType<typeof Bun.serve> | null = null;
@@ -133,7 +145,19 @@ let idleShutdownTimer: ReturnType<typeof setTimeout> | null = null;
 /** chatId → ChatState. Survives WS disconnects (lazy reap, see CLAUDE_REAP_AFTER_MS). */
 const chats = new Map<string, ChatState>();
 
-/** Spec v2.2 §5: single-slot proxy TUI tracking. null when no `--via-proxy` TUI connected. */
+/**
+ * Spec v2.2 §5: single-slot proxy TUI tracking. null when no `--via-proxy`
+ * TUI connected.
+ *
+ * STM v2.3 P1: this module-level variable is a transitional alias for
+ * `pairs.get("default")!.proxyTuiSlot` — the PairState is the canonical
+ * container per spec v2.3 §6.1, but the existing ~40 reference sites
+ * continue to work unchanged by reading/writing this variable. The
+ * PairState entry below uses getter/setter to delegate to this variable
+ * so direct accesses (e.g. `proxyTuiSlot = null`) and Map-based accesses
+ * (`pairs.get("default")!.proxyTuiSlot = null`) refer to the same slot.
+ * P2+ will phase out the direct accesses.
+ */
 let proxyTuiSlot: ProxyTuiSlot | null = null;
 
 const tuiConnectionState = new TuiConnectionState({
@@ -156,6 +180,33 @@ const tuiConnectionState = new TuiConnectionState({
     );
   },
 });
+
+/**
+ * STM v2.3 §6.1 P1: pairs registry. In P1 there is exactly one entry —
+ * `"default"` — and its fields are proxies for the module-level singletons
+ * declared above. P2 introduces the full PairState shape (per-pair
+ * lifecycle / readiness / reap timers) and P5 admits N pairs.
+ *
+ * The default entry uses property getters/setters for `proxyTuiSlot` so
+ * mutations through either access path (direct variable assignment or
+ * `pairs.get("default")!.proxyTuiSlot = X`) stay in sync.
+ */
+interface PairState {
+  readonly pairId: string;
+  readonly codex: CodexAdapter;
+  readonly tuiConnectionState: TuiConnectionState;
+  proxyTuiSlot: ProxyTuiSlot | null;
+}
+
+const defaultPairState: PairState = {
+  pairId: "default",
+  codex,
+  tuiConnectionState,
+  get proxyTuiSlot() { return proxyTuiSlot; },
+  set proxyTuiSlot(v: ProxyTuiSlot | null) { proxyTuiSlot = v; },
+};
+const pairs = new Map<string, PairState>([["default", defaultPairState]]);
+void pairs; // P1: structure introduced; P2+ migrates daemon code to use it directly.
 
 // ── TUI / app-server event wiring ────────────────────────────────
 // Codex TUI activity is INTENTIONALLY not cross-broadcast to Claude sessions.
@@ -639,6 +690,9 @@ async function attachClaude(
 function createChatState(chatId: string): ChatState {
   const state: ChatState = {
     chatId,
+    // STM v2.3 §6.1 P1: every chat is associated with the default pair.
+    // Multi-pair claim logic arrives in P4/P5.
+    homePairId: "default",
     ws: null,
     thread: new ClaudeThread({
       appServerUrl: codex.appServerUrl,
@@ -1196,6 +1250,13 @@ export const __testing = {
   chats,
   /** Direct handle to the singleton CodexAdapter — tests can emit events on it. */
   codex,
+  /**
+   * STM v2.3 §6.1 P1: pair registry. In P1 contains exactly the default
+   * entry whose fields proxy the module-level singletons (codex /
+   * proxyTuiSlot / tuiConnectionState). Tests can read but should not
+   * mutate the Map shape — use `setProxyTuiSlot` / `chats` for state changes.
+   */
+  pairs,
   /** Daemon-level functions exposed for direct invocation in tests. */
   fns: {
     pairChat,
