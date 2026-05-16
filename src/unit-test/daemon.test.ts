@@ -587,6 +587,152 @@ describe("daemon bug regressions (2026-05-16 STM v2.2 review)", () => {
     expect(sent[0].code).toBe("PAIR_BUSY_NOT_FORCED");
   });
 
+  // ── P3-cleanup (Codex P3-series review codex_msg_5753c73beafc_107) ─────
+
+  test("P3-cleanup HIGH#2: same-pair concurrent ensurePair calls dedupe via ensurePairInFlight", async () => {
+    const { CodexAdapter } = await import("../codex-adapter");
+    const originalStart = (CodexAdapter.prototype as any).start;
+    let startCallCount = 0;
+    (CodexAdapter.prototype as any).start = async function () {
+      startCallCount++;
+      // Small delay to keep both racers in-flight at the same time.
+      await new Promise((r) => setTimeout(r, 20));
+    };
+    if (__testing.pairRegistry.has("dedup-pair")) {
+      await __testing.runUnderRegistryMutex(async () => {
+        __testing.pairRegistry.remove("dedup-pair");
+        __testing.pairRegistry.save();
+      });
+    }
+    try {
+      const [a, b] = await Promise.all([
+        fns.ensurePair("dedup-pair"),
+        fns.ensurePair("dedup-pair"),
+      ]);
+      // Both calls resolve to the exact same PairState instance —
+      // ensurePairInFlight dedup worked.
+      expect(a).toBe(b);
+      // codex.start called exactly once.
+      expect(startCallCount).toBe(1);
+    } finally {
+      (CodexAdapter.prototype as any).start = originalStart;
+      const pair = __testing.pairs.get("dedup-pair");
+      if (pair) {
+        try { fns.detachPairHandlers(pair); } catch {}
+        __testing.pairs.delete("dedup-pair");
+      }
+      await __testing.runUnderRegistryMutex(async () => {
+        __testing.pairRegistry.remove("dedup-pair");
+        __testing.pairRegistry.save();
+      });
+    }
+  });
+
+  test("P3-cleanup HIGH#3+4: destroy_pair on live non-default pair removes from pairs Map + clears slot", async () => {
+    const { CodexAdapter } = await import("../codex-adapter");
+    const originalStart = (CodexAdapter.prototype as any).start;
+    const originalStop = (CodexAdapter.prototype as any).stop;
+    (CodexAdapter.prototype as any).start = async () => {};
+    (CodexAdapter.prototype as any).stop = () => {};
+
+    try {
+      // Bring up a fresh non-default pair.
+      await fns.ensurePair("teardown-pair");
+      const pair = __testing.pairs.get("teardown-pair");
+      expect(pair).toBeDefined();
+      expect(pair?.isLive).toBe(true);
+      expect(pair?.handlerRefs.length).toBeGreaterThan(0);
+
+      // Seed a fake slot + paired chat so we can verify teardown handles them.
+      pair!.proxyTuiSlot = {
+        token: "t",
+        pairedChatId: "td-chat",
+        readiness: "ready",
+        attachedAt: Date.now(),
+        pairReapTimer: setTimeout(() => {}, 60_000),
+      };
+      const chat = fns.createChatState("td-chat");
+      chat.paired = true;
+      chat.homePairId = "teardown-pair";
+      __testing.chats.set("td-chat", chat);
+
+      const { ws, sent } = makeMockWs();
+      await fns.handleDestroyPair(ws, {
+        type: "destroy_pair",
+        requestId: "req-td",
+        pairId: "teardown-pair",
+        force: true,
+      });
+      expect(sent[0].type).toBe("pair_destroyed");
+      expect(sent[0].wasLive).toBe(true);
+
+      // Full teardown: removed from pairs Map, slot cleared, isLive=false,
+      // handlers detached.
+      expect(__testing.pairs.has("teardown-pair")).toBe(false);
+      expect(pair?.isLive).toBe(false);
+      expect(pair?.proxyTuiSlot).toBeNull();
+      expect(pair?.handlerRefs.length).toBe(0);
+
+      // The previously-paired chat was transitioned to isolated.
+      expect(chat.paired).toBe(false);
+      expect(chat.homePairId).toBe("default");
+    } finally {
+      (CodexAdapter.prototype as any).start = originalStart;
+      (CodexAdapter.prototype as any).stop = originalStop;
+      __testing.chats.delete("td-chat");
+      const pair = __testing.pairs.get("teardown-pair");
+      if (pair) {
+        try { fns.detachPairHandlers(pair); } catch {}
+        __testing.pairs.delete("teardown-pair");
+      }
+      await __testing.runUnderRegistryMutex(async () => {
+        __testing.pairRegistry.remove("teardown-pair");
+        __testing.pairRegistry.save();
+      });
+    }
+  });
+
+  test("P3-cleanup MEDIUM: codex.start EADDRINUSE maps to PAIR_PORTS_BUSY with details", async () => {
+    const { CodexAdapter } = await import("../codex-adapter");
+    const originalStart = (CodexAdapter.prototype as any).start;
+    (CodexAdapter.prototype as any).start = async function () {
+      const err: any = new Error("Failed to start app-server: EADDRINUSE :4520");
+      err.code = "EADDRINUSE";
+      throw err;
+    };
+    if (__testing.pairRegistry.has("busy-pair")) {
+      await __testing.runUnderRegistryMutex(async () => {
+        __testing.pairRegistry.remove("busy-pair");
+        __testing.pairRegistry.save();
+      });
+    }
+
+    try {
+      const { ws, sent } = makeMockWs();
+      await fns.handleEnsurePair(ws, {
+        type: "ensure_pair",
+        requestId: "req-busy",
+        pairId: "busy-pair",
+      });
+
+      expect(sent[0].type).toBe("pair_error");
+      expect(sent[0].code).toBe("PAIR_PORTS_BUSY");
+      expect(sent[0].message).toContain("busy-pair");
+    } finally {
+      (CodexAdapter.prototype as any).start = originalStart;
+      // PairState may have been partially constructed before start threw.
+      const pair = __testing.pairs.get("busy-pair");
+      if (pair) {
+        try { fns.detachPairHandlers(pair); } catch {}
+        __testing.pairs.delete("busy-pair");
+      }
+      await __testing.runUnderRegistryMutex(async () => {
+        __testing.pairRegistry.remove("busy-pair");
+        __testing.pairRegistry.save();
+      });
+    }
+  });
+
   test("P3b list_pairs: returns live + registry-only entries", async () => {
     // Allocate a registry-only "scratch-list" entry.
     await __testing.runUnderRegistryMutex(async () => {

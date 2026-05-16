@@ -46,12 +46,16 @@ interface ControlSocketData {
 interface ChatState {
   chatId: string;
   /**
-   * STM v2.3 §6.1 P1: every chat is associated with one pair (its "home
-   * pair"). In P1 this is always `"default"` because only the default
-   * pair exists. P5 introduces FIFO claiming across multiple pairs and
-   * the optional `null` value for isolated chats with no live pair.
+   * STM v2.3 §6.1 / §6.4: pair this chat is bound to.
+   *
+   * P1/P3 always populate this with `"default"` (the only pair until P5
+   * introduces multi-pair FIFO claiming). The spec allows `null` for
+   * chats with no live home pair — e.g. an isolated chat created after
+   * default has been destroyed, or any chat that hasn't yet successfully
+   * bound to a pair. Type-widening lands here in P3-cleanup so P5 can
+   * use null without a follow-up schema change.
    */
-  homePairId: string;
+  homePairId: string | null;
   ws: ServerWebSocket<ControlSocketData> | null;
   thread: ClaudeThread;
   ready: boolean;
@@ -759,15 +763,23 @@ function handleControlMessage(ws: ServerWebSocket<ControlSocketData>, raw: strin
 
 // ── STM v2.3 §D6 P3 — pair management control protocol handlers ────────
 //
-// In P3b: `ensure_pair("default")` runs the full P2 ensurePair flow + saves
-// the registry. `ensure_pair("<other>")` validates + allocates a registry
-// entry but does NOT spawn a CodexAdapter — the actual non-default
-// activation lands in P3c once helpers (`getPairedChatState`, `pairChat`,
-// `transitionToIsolated`) become pair-aware. Until then, attaching the
-// shared event handlers on a non-default pair would route work-pair events
-// through default's paired-chat tracking (Codex P2 review warning).
-// `destroy_pair` handles both live default + registry-only entries.
-// `list_pairs` reports every registry entry plus their live status.
+// `ensure_pair(pairId)` validates the name (D1), allocates / reuses a
+// registry entry under the daemon-wide write mutex, constructs a fresh
+// PairState for non-default pairs (own CodexAdapter + TuiConnectionState,
+// pair-scoped handlers via attachPairHandlers' closure-local getPaired),
+// and starts the Codex app-server. Same-pair concurrent ensures dedupe
+// through `ensurePairInFlight`. Port-binding failures surface as
+// PAIR_PORTS_BUSY with structured details.
+//
+// `destroy_pair(pairId, { forget, force })` performs the full §6.3
+// teardown: cancel timers, detach handlers, transition any paired chat
+// to isolated, stop codex, clear slot, remove non-default pairs from
+// the pairs Map, broadcast status, and optionally remove the registry
+// entry. PAIR_BUSY_NOT_FORCED guards against silent loss of paired
+// work.
+//
+// `list_pairs` reports the union of live pairs (with full runtime state)
+// and registry-only entries (URLs from registry, isLive=false).
 
 async function handleEnsurePair(
   ws: ServerWebSocket<ControlSocketData>,
@@ -792,6 +804,7 @@ async function handleEnsurePair(
         pairId,
         code: err.code,
         message: err.message,
+        ...(err.details ? { details: err.details } : {}),
       });
       return;
     }
@@ -1675,14 +1688,48 @@ async function ensurePairCore(pairId: string): Promise<PairState> {
   }
 
   log(`[pair=${pair.pairId}] ensurePair: starting codex app-server (appPort=${pair.codex.appServerUrl}, proxyPort=${pair.codex.proxyUrl})`);
-  await pair.codex.start();
+  try {
+    await pair.codex.start();
+  } catch (err: any) {
+    // STM v2.3 §D2 P3-cleanup: map port-binding failures to PAIR_PORTS_BUSY
+    // with structured details. CodexAdapter / Bun.serve surface port
+    // conflicts via EADDRINUSE on `error.code` or in the message text.
+    // Other start errors propagate as ALLOCATION_FAILED upstream.
+    const errCode = err?.code ?? "";
+    const errMsg = err?.message ?? String(err);
+    const looksLikePortBusy =
+      errCode === "EADDRINUSE" ||
+      /EADDRINUSE/i.test(errMsg) ||
+      /address already in use/i.test(errMsg) ||
+      /port.*in use/i.test(errMsg);
+    if (looksLikePortBusy) {
+      // Try to extract which port conflicted from the message so the CLI
+      // can surface a specific PID/port pointer. Pattern: `:NNNN` or `port NNNN`.
+      let conflictPort: number | undefined;
+      const portMatch = errMsg.match(/(?::|port[\s=]+|address[\s=]+[\w:.]+:)(\d{2,5})/i);
+      if (portMatch) {
+        const candidate = parseInt(portMatch[1], 10);
+        if (Number.isFinite(candidate)) conflictPort = candidate;
+      }
+      throw new PairError(
+        "PAIR_PORTS_BUSY",
+        `pair "${pair.pairId}" ports (appPort=${pair.codex.appServerUrl}, proxyPort=${pair.codex.proxyUrl}) are held by another process: ${errMsg}`,
+        { conflictPort },
+      );
+    }
+    throw err;
+  }
   pair.isLive = true;
   return pair;
 }
 
 /** STM v2.3 §D6 P3c — error class carrying a pair-protocol error code. */
 class PairError extends Error {
-  constructor(public readonly code: import("./control-protocol").PairErrorCode, message: string) {
+  constructor(
+    public readonly code: import("./control-protocol").PairErrorCode,
+    message: string,
+    public readonly details?: import("./control-protocol").PairErrorDetails,
+  ) {
     super(message);
     this.name = "PairError";
   }

@@ -2950,7 +2950,8 @@ async function handleEnsurePair(ws, message) {
         requestId,
         pairId,
         code: err.code,
-        message: err.message
+        message: err.message,
+        ...err.details ? { details: err.details } : {}
       });
       return;
     }
@@ -3660,16 +3661,35 @@ async function ensurePairCore(pairId) {
     attachPairHandlers(pair);
   }
   log(`[pair=${pair.pairId}] ensurePair: starting codex app-server (appPort=${pair.codex.appServerUrl}, proxyPort=${pair.codex.proxyUrl})`);
-  await pair.codex.start();
+  try {
+    await pair.codex.start();
+  } catch (err) {
+    const errCode = err?.code ?? "";
+    const errMsg = err?.message ?? String(err);
+    const looksLikePortBusy = errCode === "EADDRINUSE" || /EADDRINUSE/i.test(errMsg) || /address already in use/i.test(errMsg) || /port.*in use/i.test(errMsg);
+    if (looksLikePortBusy) {
+      let conflictPort;
+      const portMatch = errMsg.match(/(?::|port[\s=]+|address[\s=]+[\w:.]+:)(\d{2,5})/i);
+      if (portMatch) {
+        const candidate = parseInt(portMatch[1], 10);
+        if (Number.isFinite(candidate))
+          conflictPort = candidate;
+      }
+      throw new PairError("PAIR_PORTS_BUSY", `pair "${pair.pairId}" ports (appPort=${pair.codex.appServerUrl}, proxyPort=${pair.codex.proxyUrl}) are held by another process: ${errMsg}`, { conflictPort });
+    }
+    throw err;
+  }
   pair.isLive = true;
   return pair;
 }
 
 class PairError extends Error {
   code;
-  constructor(code, message) {
+  details;
+  constructor(code, message, details) {
     super(message);
     this.code = code;
+    this.details = details;
     this.name = "PairError";
   }
 }
