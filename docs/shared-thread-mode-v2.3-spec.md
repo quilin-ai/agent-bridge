@@ -1,6 +1,6 @@
 # Shared Thread Mode — Multi-Pair Vertical Upgrade (v2.3)
 
-**Status:** Draft v0.3 — Codex second-pass review (codex_msg_5753c73beafc_70) integrated. §0-§4 awaiting third-pass (lock) review before §5-§12 are drafted.
+**Status:** Draft v0.4 — Codex final-pass review of §5-§12 (codex_msg_5753c73beafc_78) integrated. §0-§12 ready for P1 implementation.
 **Builds on:** `docs/shared-thread-mode-spec.md` (v2.2, implemented in commits `f84346e` + `54e806e`).
 **Author:** Claude (Opus 4.7), cross-reviewed by Codex.
 **Date:** 2026-05-16
@@ -17,7 +17,7 @@ v2.3 lifts this restriction by generalizing the daemon's cardinality from "one s
 - §3 Architecture: added explicit singleton-vs-per-pair table; removed misleading "TUI passes pair id at WS handshake" wording — pair identity is implicit in the per-pair proxy port, which CLI obtains by `ensurePair`-ing the daemon first.
 - §4: revised D2/D3/D4 per Codex finding; added pair-name validation rules to D1; added migration-impact details to D5; introduced D6-D9 (duplicate TUI, status schema, resource limits, event routing).
 
-### v0.2 → v0.3 (this revision)
+### v0.2 → v0.3
 
 Codex second-pass review (codex_msg_5753c73beafc_70) flagged spec-level protocol/lifecycle gaps. Architecture direction was approved; this revision tightens contracts before §5-§12 depend on them.
 
@@ -27,6 +27,17 @@ Codex second-pass review (codex_msg_5753c73beafc_70) flagged spec-level protocol
 - **D5**: corrected migration-impact list per Codex investigation — `e2e-cli.test.ts` does not actually read root `codex-wrapper.log`; the real touch points are `codex-tui.pid`, top-level `status.json` field readers, fake daemon status fixtures, `state-dir.test`, and `kill.ts`'s single-pid walk. Added an explicit implementation-order constraint: **P1 must not move filesystem layout — D5 changes land in P3 alongside the `ensurePair` API**.
 - **D6**: added `requestId` correlation to all pair-management control messages; added `claude_connect_result` to the protocol shape so the bridge can surface explicit-pair failures as a user-visible disabled state; clarified `/readyz` semantics — in v2.3 daemon readiness means "control-plane ready", pair readiness is conveyed by `ensurePair`'s response.
 - **D9**: replaced `removeAllListeners()` with targeted `off(name, ref)` tracking — pair tear-down only removes the handlers it registered, leaving diagnostics or future internal listeners intact.
+
+### v0.3 → v0.4 (this revision)
+
+§0-§4 were LOCKED by Codex third-pass review (codex_msg_5753c73beafc_74). §5-§12 were then drafted against the locked contracts and went out for Codex's final-pass review (codex_msg_5753c73beafc_78). The final-pass surfaced 5 blocking and 2 editorial findings, all in §5-§12 content (not in §0-§4 decisions). This revision integrates them.
+
+- **D2 / §6.2 — registry race across pairs**: previously the spec only had `ensurePairInFlight` keyed by pairId, so two simultaneous `ensure_pair("work")` calls were safe but two simultaneous `ensure_pair("work")` + `ensure_pair("side")` could race on registry write (atomic rename prevents torn files but not lost updates). Added a daemon-wide `registryWriteMutex` that serializes ALL registry read-modify-write sequences regardless of pairId. The per-pair `ensurePairInFlight` map remains (it deduplicates same-pairId concurrent requests so subscribers share one promise); the new mutex sits on the registry path inside each ensurePair flow.
+- **D6 / §6.3 — destroy_pair semantics**: previously `destroy_pair` returned `PAIR_NOT_FOUND` for entries that exist in the registry but are not live, which made D2's "use `rm --forget` after PAIR_PORTS_BUSY" instruction impossible to execute. Now `destroy_pair { forget: true }` succeeds on registry-only entries (it removes the registry entry and reports `registryEntryRemoved: true`). Also added `force?: boolean` field to the protocol and the matching `PAIR_BUSY_NOT_FORCED` error code (previously §8.2 / M11 referenced `--force` but the protocol shape had no slot for it).
+- **§6.5 — cross-pair isolation transition rewritten**: previously chose option (a) "target former pair's dying app-server then fail through retries", which Codex correctly called out as "controlled disconnect, not transition". Rewrote to use the **isolated chats target default pair's app-server** mechanism (§6.6): when a non-default pair tears down, its paired chat is reassigned `homePairId = null` and a fresh ClaudeThread is bootstrapped against `default`'s app-server. If `default` is not live, fall back to the v2.2 reap-with-instruction pattern (`reapChatState` + "reconnect Claude" message from commit 54e806e).
+- **§6.6 — direct mode and Claude-only isolated paths**: added explicit handling for `abg codex` (direct mode, no `--via-proxy`) and Claude-only isolated sessions (claude_connect with no pairId and no live pair to claim). Both rely on `default` being live; daemon auto-ensures `default` on first need to preserve v2.2 ergonomics.
+- **§11 — P3 phasing**: previously P3 added `ensure_pair` protocol but CLI usage was deferred to P4, which would leave `default` un-ensured in P3 and break v2.2-style `abg codex --via-proxy`. Now P3 explicitly auto-ensures `default` on daemon boot (or on first claude_connect / first ensurePair, whichever comes first). P4 still owns the user-facing `--pair` flag but `default` is no longer a "lazy" pair in any sense — it acts like v2.2's singleton until users opt into multi-pair.
+- **§8.1 nit — pre-flight semantics**: removed the "piggyback on `pair_ensured`" alternative; pre-flight always uses a follow-up `list_pairs` to check `proxyTuiConnected` for the target pair. Keeps D6 response shape stable.
 
 ## 1. Motivation
 
@@ -165,10 +176,13 @@ The pair → port assignment lives in `<stateDir>/pairs/registry.json` — NOT i
 - Optional **machine-global override** via an env var read by the daemon at boot: `AGENTBRIDGE_PAIR_PORTS_FILE` pointing to a JSON like `{ "work": { "appPort": 5510, "proxyPort": 5511 } }`. If set and the file exists, those entries take precedence over stride allocation but are still merged into the registry on first ensure. This is the escape hatch for power users; the registry remains the live source-of-truth that the daemon reads/writes during normal operation.
 - **CLI never assumes ports from a stride formula.** `abg codex --pair NAME` always calls `ensurePair(NAME)` first and uses the daemon's reply for `--remote ws://...`.
 
-**Concurrency safety (Codex v0.3 finding):**
+**Concurrency safety (Codex v0.3 + v0.4 findings):**
 
-- Daemon maintains an in-memory `ensurePairInFlight: Map<pairId, Promise<EnsurePairResult>>`. A second `ensurePair(pairId)` arriving while the first is mid-flight subscribes to the same promise rather than racing into a duplicate allocation/spawn path.
-- Registry writes are **atomic**: write to `<stateDir>/pairs/registry.json.tmp.<random>`, then `rename()` over the target. A partial write or crash mid-write cannot corrupt the registry.
+Two layers of mutual exclusion protect different concerns:
+
+- **Per-pair dedup mutex** (`ensurePairInFlight: Map<pairId, Promise<EnsurePairResult>>`): a second `ensurePair("work")` arriving while the first is mid-flight subscribes to the same promise rather than racing into a duplicate allocation/spawn path. Both callers see the same resolved URLs.
+- **Daemon-wide registry mutex** (`registryWriteMutex: Promise<void>`): the per-pair mutex above does NOT protect against `ensurePair("work")` and `ensurePair("side")` running concurrently and both touching the registry — atomic rename prevents file corruption but not lost updates if both reads observe an old state before either writes. The registry-write critical section (read current registry → decide allocation → write new registry) executes inside a daemon-wide serialized chain. Implementation: each registry write is `registryWriteMutex = registryWriteMutex.then(doWrite)`, which chains writes single-file. The mutex is acquired by anything that mutates the registry (ensurePair allocation path, destroyPair --forget, future repair tools).
+- Registry writes are **atomic on disk**: write to `<stateDir>/pairs/registry.json.tmp.<random>`, then `rename()` over the target. A partial write or crash mid-write cannot corrupt the registry.
 - On startup, daemon reads the registry, validates each entry (port range, name regex), and discards any entry that fails validation with a logged warning.
 
 **Port-busy recovery (`PAIR_PORTS_BUSY`):**
@@ -299,9 +313,9 @@ D5 changes (filesystem layout, fake-daemon fixtures, kill walker) land in **P3**
   → { type: "pair_error", requestId, pairId, code: "INVALID_PAIR_NAME" | "PAIR_PORTS_BUSY" | "MAX_PAIRS" | "ALLOCATION_FAILED", message, details? }
 
 // New: destroy
-{ type: "destroy_pair", requestId, pairId: string, forget?: boolean }
-  → { type: "pair_destroyed", requestId, pairId, registryEntryRemoved: boolean }
-  → { type: "pair_error", requestId, pairId, code: "PAIR_NOT_FOUND" | "PAIR_BUSY_NOT_FORCED", message }
+{ type: "destroy_pair", requestId, pairId: string, forget?: boolean, force?: boolean }
+  → { type: "pair_destroyed", requestId, pairId, registryEntryRemoved: boolean, wasLive: boolean }
+  → { type: "pair_error", requestId, pairId, code: "PAIR_NOT_FOUND" | "PAIR_BUSY_NOT_FORCED" | "INVALID_PAIR_NAME", message }
 
 // New: introspection
 { type: "list_pairs", requestId }
@@ -542,24 +556,38 @@ const chats: Map<string, ChatState> = new Map();              // unchanged from 
 
 If step (a) — (h) throws, the promise rejects with a `pair_error`. The partial state (CodexAdapter spawned but not started, registry written but not used) is cleaned up in a `catch` before rejecting: kill child process if any, leave registry entry intact (so the next attempt sees the same ports).
 
-### 6.3 `destroyPair(pairId, { forget })`
+### 6.3 `destroyPair(pairId, { forget, force })`
+
+Per Codex v0.4 finding: must handle both live pairs and registry-only entries (the latter enables D2's `--forget` recovery after `PAIR_PORTS_BUSY`). The `force` flag bypasses the safety check that protects an actively-paired chat.
 
 ```
-1. validate pairId
-2. pair = pairs.get(pairId); if !pair return pair_error PAIR_NOT_FOUND
-3. cancel pair.tuiReapTimer / pair.pairReapTimer
-4. detachPairHandlers(pair) per D9
-5. for each chat where chat.homePairId === pairId:
-     - if chat.paired → transitionChatToIsolatedAcrossPairs(chat) — see 6.5
-     - else chat.homePairId = null (chat keeps its own ClaudeThread; no message)
-6. pair.codex.stop()         // closes WS, kills app-server child
-7. pairs.delete(pairId)
-8. if forget → remove registry entry (atomic write); else keep entry so ensurePair re-allocates same ports
-9. broadcastStatus()
-10. respond pair_destroyed
+1. validate pairId per D1; return pair_error INVALID_PAIR_NAME if bad
+2. pair = pairs.get(pairId); inRegistry = pairRegistry.has(pairId)
+3. if !pair && !inRegistry → return pair_error PAIR_NOT_FOUND
+4. if pair && pair.pairedChatId !== null && !force → return pair_error PAIR_BUSY_NOT_FORCED
+5. if pair (live teardown):
+     a. cancel pair.tuiReapTimer / pair.pairReapTimer
+     b. detachPairHandlers(pair) per D9
+     c. for each chat where chat.homePairId === pairId:
+          - if chat.paired → transitionPairedChatOnTeardown(chat) — see 6.5
+          - else chat.homePairId = null (re-target ClaudeThread to default if alive — see 6.6)
+     d. pair.codex.stop()       // closes WS, kills app-server child
+     e. pairs.delete(pairId)
+6. if forget (whether or not the pair was live):
+     - acquire registryWriteMutex
+     - remove pairId from registry; atomic temp+rename
+     - release mutex
+7. broadcastStatus()
+8. respond pair_destroyed { pairId, wasLive: !!pair, registryEntryRemoved: !!forget }
 ```
 
-`destroyPair` is the explicit teardown. The implicit teardown via TUI reap grace (D3) goes through the same step list except step (1)-(2) come from a timer callback instead of an inbound control message.
+`destroyPair` is the explicit teardown. The implicit teardown via TUI reap grace (D3) goes through the live-teardown path (step 5) without the `force` check (timer-driven, not user-driven) and without `forget` (registry entry survives so the same name+ports can be re-ensured).
+
+**Edge cases (Codex v0.4 specifically):**
+
+- `destroy_pair("work", { forget: true })` on a registry-only `work` (never live, or live + then reaped) succeeds with `wasLive: false, registryEntryRemoved: true`. This is the recovery path after `PAIR_PORTS_BUSY` told the user the registered ports are conflicting.
+- `destroy_pair("work")` on a paired-live `work` without `force` fails with `PAIR_BUSY_NOT_FORCED`. User gets a clear error pointing at the paired Claude.
+- `destroy_pair("work", { force: true })` on a paired-live `work` proceeds: the paired chat is reassigned through §6.5 (transition to default-backed isolated or reap), then the live teardown completes.
 
 ### 6.4 `attachClaude` v2.3
 
@@ -581,37 +609,84 @@ If step (a) — (h) throws, the promise rejects with a `pair_error`. The partial
 7. reply claude_connect_result { ok:true, homePairId, paired }
 ```
 
-### 6.5 Cross-pair isolation transition
+### 6.5 Transition paired chat on pair tear-down
 
-When a pair tears down (TUI gone or `destroyPair`), its paired chat needs to keep working. v2.2's `transitionToIsolated(state, reason)` is generalized:
+When a pair tears down (TUI gone, `destroyPair`, or app-server crash), its paired chat (if any) needs a new home. v2.2's `transitionToIsolated(state, reason)` generalizes to:
 
 ```typescript
-function transitionChatToIsolatedAcrossPairs(state: ChatState) {
-  const formerPair = pairs.get(state.homePairId!);  // may already be undefined post-tear-down
+function transitionPairedChatOnTeardown(state: ChatState, reason: string) {
+  // Reset paired-turn flags (v2.2 commit 54e806e Codex review #2):
   state.paired = false;
-  state.homePairId = null;                          // chat is now homeless / isolated
-  // remaining steps identical to v2.2 transitionToIsolated:
-  //  - reset replyRequired / replyReceivedDuringTurn / pairedTurnSawAgentMessage
-  //  - emit system_pair_torn_down
-  //  - construct fresh ClaudeThread targeting the chat's old app-server URL
-  //  - bootstrap with the v2.2 retry helper bootstrapIsolatedThread()
+  state.homePairId = null;
+  state.replyRequired = false;
+  state.replyReceivedDuringTurn = false;
+  state.pairedTurnSawAgentMessage = false;
+  emitToChat(state, systemMessage("system_pair_torn_down", reason));
+
+  // Choose a continuation backend: default pair if it's live, otherwise reap.
+  const def = pairs.get("default");
+  if (def?.isLive && def.readiness === "ready") {
+    // Path A: chat continues as an isolated chat against default's app-server.
+    // This is the same "isolated chat = uses default pair's app-server"
+    // mechanism §6.6 specifies for every other isolated chat.
+    state.thread = new ClaudeThread({
+      appServerUrl: def.codex.appServerUrl,
+      chatId: state.chatId,
+      logFile: stateDir.logFile,
+      cwd: process.cwd(),
+    });
+    state.ready = false;
+    wireClaudeThreadEvents(state);
+    bootstrapIsolatedThread(state);   // v2.2 commit 54e806e retry helper
+  } else {
+    // Path B: no fallback. Reap chat with explicit "reconnect" instruction
+    // (matches v2.2 commit 54e806e final-failure path, which is actionable).
+    emitToChat(state, systemMessage("system_isolated_no_fallback",
+      "❌ The pair has torn down and no default pair is available to continue. " +
+      "Closing this chat — please reconnect Claude (close the window and re-attach) " +
+      "to start a fresh attempt; if you destroyed the default pair, re-run " +
+      "`abg codex --via-proxy` first."));
+    reapChatState(state, "pair torn down with no default fallback");
+  }
 }
 ```
 
-The ClaudeThread for the new isolated chat targets which app-server? Two options:
+**Why this is not "isolation transition" in the v2.2 sense, and why that's fine** (Codex v0.4 finding addressed):
 
-- **(a)** Target the former pair's `appServerUrl` if that app-server is still up (e.g. only the TUI WS died, the codex process is still healthy). Reuse the existing thread connection. **Risk**: pair tear-down kills the app-server too (6.3 step 6), so by the time `transitionChatToIsolatedAcrossPairs` runs, the URL points to nothing.
-- **(b)** Target the `default` pair's app-server, ensuring `default` is live first. This guarantees the isolated chat has a working backend, but it means a `work`-paired Claude transitions onto the `default` Codex thread, which may be running unrelated turns for other chats.
+In v2.2, "transition to isolated" meant the paired Claude becomes an isolated Claude with its own ClaudeThread on the SAME codex app-server (there was only one). v2.3 has N app-servers, so when a non-default pair tears down, the chat literally has nowhere to go on that pair's app-server. Path A above reroutes the chat to `default`'s app-server, which is the canonical "isolated chats live here" backend per §6.6. The chat keeps its `chatId`, its message buffer, and its WS — it just gets a fresh Codex thread on a different app-server. This is consistent with v2.2 semantics: "isolated chat = own thread on the daemon's available app-server". v2.3 makes "the daemon's available app-server" specifically `default`.
 
-**Spec choice (a) with a caveat**: tear-down ordering is changed so `transitionChatToIsolatedAcrossPairs` runs BEFORE `pair.codex.stop()`. The chat's new ClaudeThread connects to the soon-to-die app-server during a small window where the app-server is still alive. The thread bootstrap establishes a new Codex thread (per v2.2 §5 "no replay"), and then `pair.codex.stop()` kills the app-server. Result: the chat's new isolated ClaudeThread loses its connection almost immediately and triggers the v2.2 retry helper (`bootstrapIsolatedThread`, max 2 attempts). The retries will fail (no app-server), and the chat ends in the v2.2 "reap chat after retries exhausted" path with the "reconnect Claude" instruction — which IS now actionable thanks to commit 54e806e.
+**Ordering note**: step 5 of §6.3 runs `transitionPairedChatOnTeardown` BEFORE `pair.codex.stop()`. The transition itself does not depend on the former pair's app-server (it targets default), so there is no race window where the chat connects to a dying server.
 
-This is acceptable because the alternative (option b, attaching to `default`) violates pair isolation (D8). If a user wants the chat to continue, they should re-attach Claude — the daemon will then iterate pairs, find `default` (or whichever is now live) and either claim its slot or attach isolated against its app-server.
+### 6.6 Isolated chats, direct mode, and the default-pair fallback
 
-### 6.6 Isolated chats and their app-server
+A chat with `homePairId = null` (was never paired, was reaped from a torn-down pair via §6.5, or whose `agentbridge claude` invocation didn't claim any pair) needs a Codex app-server to talk to. v2.2 had only one app-server; v2.3 has N. Spec choice: **isolated chats target the `default` pair's app-server**.
 
-A chat that is `homePairId = null` (was never paired, or was reaped) needs a Codex app-server to talk to. v2.2 had only one; v2.3 has N. Spec choice: **isolated chats target the `default` pair's app-server**. The `default` pair is always present in the registry (D1) and is always live during normal use (its app-server starts on first `abg codex --via-proxy` with no `--pair` flag).
+**Default auto-ensure** (per Codex v0.4 finding on §11 P3 phasing):
 
-If `default` is not live (e.g. user destroyed it explicitly), isolated chats are stranded — `bootstrapIsolatedThread` fails and the chat is reaped with the "reconnect Claude" instruction. This is consistent with v2.2 behavior where the singleton codex going down strands all chats.
+The `default` pair is treated specially throughout the daemon:
+
+- On daemon boot, if `default` exists in the registry but is not live, daemon does NOT auto-start it (lazy). It is brought live by the first event that needs it:
+  - First `claude_connect` with no `pairId` and no other live pair to FIFO-claim → triggers `ensure_pair("default")` internally.
+  - First `abg codex --via-proxy` with no `--pair` flag → CLI calls `ensure_pair("default")`.
+  - First `abg codex` direct mode (no `--via-proxy`) → daemon calls `ensure_pair("default")` to bring up the app-server the direct-mode TUI will target.
+- Once `default` is live, isolated chats and direct-mode TUIs use its `appServerUrl`.
+- If `default` is not live AND cannot be auto-ensured (e.g. its ports are held by another process and `PAIR_PORTS_BUSY` fires), isolated chats are reaped per §6.5 Path B and direct-mode `abg codex` exits with the same `PAIR_PORTS_BUSY` message scoped to `default`.
+
+**Direct mode** (`abg codex` without `--via-proxy`, the v1 backwards-compat path from commit `b687cc5`):
+
+- CLI calls `ensure_pair("default")` to make sure the app-server is up, then spawns codex with `--remote <default.appServerUrl>` directly (no proxy). No `--pair` flag is supported in direct mode because direct-mode TUIs do NOT participate in the pairing protocol — they are independent clients of the app-server, get their own threads, and never appear in any `proxyTuiSlot`.
+- Future: a direct-mode TUI on a non-default pair (`abg codex --pair work` without `--via-proxy`) is technically achievable (ensure pair, take its appServerUrl, spawn direct codex). v2.3 keeps this out of scope — direct mode stays default-only — to limit the test surface. Adding it later is a small follow-up PR.
+
+**Claude-only isolated session** (Claude attaches, no live pair to claim, no explicit pairId):
+
+- D4's FIFO step iterates pairs and finds no unpaired live pair (every pair is either un-ensured or already-paired).
+- attachClaude calls `ensure_pair("default")` internally (idempotent: no-op if already live).
+- ChatState gets `homePairId = null` (isolated) and its ClaudeThread targets `default.appServerUrl`. Same as v2.2's "isolated Claude without TUI" behavior.
+
+**Explicit non-default attach when default is not live**:
+
+- Claude with `AGENTBRIDGE_PAIR=work` attaches; `work` is unpaired and live → claim. `default` is not auto-ensured in this case (the chat doesn't need `default`).
+- If `work` later tears down → §6.5 Path B reap (no fallback) UNLESS another pair (or `default`) has come live by then.
 
 ## 7. ClaudeAdapter / routing changes
 
@@ -669,8 +744,8 @@ Unchanged. The offline buffer is per-chat (already), so cross-pair leakage is im
   1. CLI calls `ensure_pair(NAME)` over control WS.
   2. On `pair_error PAIR_PORTS_BUSY` → CLI exits with `error: ports for pair "NAME" (appPort=X, proxyPort=Y) are held by PID Z. Stop that process or use 'abg pairs rm NAME --forget' to reassign.`
   3. On `pair_error MAX_PAIRS` → CLI exits with `error: max pairs reached (N). Destroy an unused pair with 'abg pairs rm NAME'.`
-  4. On `pair_ensured` with `proxyTuiConnected: true` (returned via a follow-up `list_pairs` call if the spec wants strict separation, or piggybacked on `pair_ensured`) → CLI exits with the v2.2-style "another --via-proxy TUI is already connected" message, scoped to this pair.
-  5. On `pair_ensured` clean → CLI proceeds to spawn `codex` with `--remote <proxyUrl>` and `--remote-auth-token-env AGENTBRIDGE_PROXY_TOKEN`. Pair id is NOT passed to codex — it does not need to know.
+  4. On `pair_ensured` clean → CLI calls `list_pairs` to check `proxyTuiConnected` for the just-ensured pair. (Codex v0.4 nit: keeps the `pair_ensured` response shape stable and uses `list_pairs` as the canonical introspection path. The follow-up is one extra round-trip but eliminates a payload-shape variant.) If `proxyTuiConnected === true` → CLI exits with the v2.2-style "another --via-proxy TUI is already connected" message, scoped to this pair.
+  5. Otherwise → CLI proceeds to spawn `codex` with `--remote <proxyUrl>` and `--remote-auth-token-env AGENTBRIDGE_PROXY_TOKEN`. Pair id is NOT passed to codex — it does not need to know.
 
 ### 8.2 New commands
 
@@ -762,7 +837,7 @@ Five small PRs, each independently mergeable to `master` (or the v2.3 long-runni
 |---|---|---|---|
 | **P1** | Internal refactor: replace daemon-level singletons (`codex`, `proxyTuiSlot`, `TuiConnectionState`) with `pairs: Map<pairId, PairState>` keyed only by `"default"`. `ChatState` gains `homePairId` field, always set to `"default"`. CodexAdapter constructor moves to options object. No new control messages, no CLI flags, no filesystem layout change. | Externally none — `abg codex --via-proxy` works exactly as in v2.2. | All 17 daemon tests + 14 codex-adapter tests + e2e tests pass unchanged. |
 | **P2** | CodexAdapter lifecycle as a peer-managed component: daemon spawns / stops adapters via `ensurePair` / `destroyPair` internal calls (no control-protocol API yet). Pair-aware event handler attach/detach (D9 pattern). Still only `default` ever ensured. | Externally none. | Add 5-8 daemon tests covering `attachPairHandlers` symmetry + lifecycle. |
-| **P3** | `ensure_pair` / `destroy_pair` / `list_pairs` control protocol (D6). Registry + atomic writes (D2). State dir layout (D5) — files MOVE here, root-level pids/logs deprecated. `kill` walker (§8.4). `claude_connect_result` typed reply (D6). Fake-daemon fixtures and `state-dir.test` updated. | Behavioral: tooling that read root `codex-tui.pid` / `codex-wrapper.log` will break — only `kill.ts` and tests touch those, both updated in this PR. | Add 6-10 daemon tests for registry + protocol + cross-restart. |
+| **P3** | `ensure_pair` / `destroy_pair` / `list_pairs` control protocol (D6) with `requestId` + `force`/`forget`. Registry + atomic writes + global registry mutex (D2 / §6.2). State dir layout (D5) — files MOVE here, root-level pids/logs deprecated. `kill` walker (§8.4). `claude_connect_result` typed reply (D6). Fake-daemon fixtures and `state-dir.test` updated. **`default` auto-ensure**: daemon implicitly calls `ensure_pair("default")` on first claude_connect / first `abg codex --via-proxy` / first direct-mode `abg codex` (§6.6) so v2.2-style invocations keep working without a `--pair` flag. | Behavioral: tooling that read root `codex-tui.pid` / `codex-wrapper.log` will break — only `kill.ts` and tests touch those, both updated in this PR. v2.2-style `abg codex --via-proxy` still works (default auto-ensured). | Add 6-10 daemon tests for registry + protocol + cross-restart + default auto-ensure. |
 | **P4** | CLI `--pair` flag in `abg codex` and `agentbridge claude` (D4, §8.1, §8.3). `abg pairs ls/rm` commands (§8.2). Pre-flight ports-busy / max-pairs error surfacing. | Behavioral: users can now create / list / destroy pairs. `default` remains the only pair anyone has unless they pass `--pair`. | Add CLI tests for new flag parsing + subcommands. Probes M03, M07, M10, M11 land here. |
 | **P5** | FIFO pair claim + explicit `AGENTBRIDGE_PAIR` env path (D4 §6.4). Cross-pair isolation transition (§6.5). UX prefix for pair id (§7.3). Multi-pair probes M01, M02, M04, M05, M06, M08, M09, M12. Crash isolation smoke (M02 + M12). | Behavioral: multi-pair is now end-to-end functional. v2.3 use case ships. | Probes + daemon tests cover the new state machine paths. |
 
@@ -780,4 +855,4 @@ Same model as v2.2 (`docs/shared-thread-mode-spec.md` §12), with one caveat lea
 
 ---
 
-**Status**: Draft v0.3, locked. §0-§12 ready for implementation phases (§11) to begin with P1.
+**Status**: Draft v0.4. §0-§4 locked at v0.3; §5-§12 revised per Codex final-pass review (codex_msg_5753c73beafc_78). Ready for P1 implementation pending one short Codex re-pass on the v0.4 deltas.
