@@ -2284,6 +2284,196 @@ class ConfigService {
   }
 }
 
+// src/pair-registry.ts
+import { readFileSync as readFileSync3, writeFileSync as writeFileSync3, renameSync, mkdirSync as mkdirSync3, existsSync as existsSync4, unlinkSync as unlinkSync2 } from "fs";
+import { dirname } from "path";
+import { randomBytes } from "crypto";
+var DEFAULT_PAIR_PORTS = { appPort: 4500, proxyPort: 4501 };
+var STRIDE_BASE = 4510;
+var STRIDE_STEP_DEFAULT = 10;
+var STRIDE_MAX_DEFAULT = 20;
+var MAX_PAIRS_DEFAULT = 8;
+var PAIR_NAME_REGEX = /^[a-z0-9][a-z0-9_-]{0,31}$/;
+function isValidPairName(name) {
+  if (typeof name !== "string")
+    return false;
+  if (!PAIR_NAME_REGEX.test(name))
+    return false;
+  if (name === "." || name === "..")
+    return false;
+  return true;
+}
+
+class PairRegistry {
+  entries = new Map;
+  filePath;
+  log;
+  strideStep;
+  strideMax;
+  maxPairs;
+  constructor(opts) {
+    this.filePath = opts.filePath;
+    this.log = opts.log ?? (() => {});
+    this.strideStep = opts.strideStep ?? STRIDE_STEP_DEFAULT;
+    this.strideMax = opts.strideMax ?? STRIDE_MAX_DEFAULT;
+    this.maxPairs = opts.maxPairs ?? MAX_PAIRS_DEFAULT;
+  }
+  load() {
+    this.entries.clear();
+    if (!existsSync4(this.filePath)) {
+      this.log(`[pair-registry] no registry file at ${this.filePath} \u2014 starting empty`);
+      return;
+    }
+    let raw;
+    try {
+      raw = readFileSync3(this.filePath, "utf8");
+    } catch (err) {
+      this.log(`[pair-registry] failed to read ${this.filePath}: ${err?.message ?? err} \u2014 starting empty`);
+      return;
+    }
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (err) {
+      this.log(`[pair-registry] invalid JSON in ${this.filePath}: ${err?.message ?? err} \u2014 starting empty`);
+      return;
+    }
+    if (!parsed || typeof parsed !== "object" || parsed.version !== 1 || !Array.isArray(parsed.entries)) {
+      this.log(`[pair-registry] unexpected registry shape (missing version/entries) \u2014 starting empty`);
+      return;
+    }
+    for (const candidate of parsed.entries) {
+      if (this.isValidEntry(candidate)) {
+        this.entries.set(candidate.pairId, candidate);
+      } else {
+        this.log(`[pair-registry] dropping invalid entry: ${JSON.stringify(candidate)}`);
+      }
+    }
+    this.log(`[pair-registry] loaded ${this.entries.size} entries from ${this.filePath}`);
+  }
+  isValidEntry(e) {
+    return e !== null && typeof e === "object" && typeof e.pairId === "string" && isValidPairName(e.pairId) && typeof e.appPort === "number" && typeof e.proxyPort === "number" && Number.isInteger(e.appPort) && Number.isInteger(e.proxyPort) && e.appPort > 0 && e.proxyPort > 0 && e.appPort < 65536 && e.proxyPort < 65536 && typeof e.allocatedAt === "number";
+  }
+  save() {
+    const dir = dirname(this.filePath);
+    if (!existsSync4(dir))
+      mkdirSync3(dir, { recursive: true });
+    const tmp = `${this.filePath}.tmp.${randomBytes(6).toString("hex")}`;
+    const snapshot = {
+      version: 1,
+      entries: [...this.entries.values()]
+    };
+    try {
+      writeFileSync3(tmp, JSON.stringify(snapshot, null, 2), "utf8");
+      renameSync(tmp, this.filePath);
+    } catch (err) {
+      try {
+        if (existsSync4(tmp))
+          unlinkSync2(tmp);
+      } catch {}
+      throw new Error(`[pair-registry] save failed: ${err?.message ?? err}`);
+    }
+  }
+  get(pairId) {
+    return this.entries.get(pairId) ?? null;
+  }
+  list() {
+    return [...this.entries.values()];
+  }
+  has(pairId) {
+    return this.entries.has(pairId);
+  }
+  allocate(pairId) {
+    if (!isValidPairName(pairId)) {
+      return {
+        ok: false,
+        error: {
+          code: "INVALID_PAIR_NAME",
+          message: `pair name "${pairId}" fails validation (regex ${PAIR_NAME_REGEX.source})`
+        }
+      };
+    }
+    const existing = this.entries.get(pairId);
+    if (existing)
+      return { ok: true, entry: existing };
+    if (this.entries.size >= this.maxPairs) {
+      return {
+        ok: false,
+        error: {
+          code: "MAX_PAIRS",
+          message: `pair registry is at the ${this.maxPairs}-entry limit; destroy an unused pair (--forget) before allocating a new one`
+        }
+      };
+    }
+    let appPort;
+    let proxyPort;
+    if (pairId === "default") {
+      appPort = DEFAULT_PAIR_PORTS.appPort;
+      proxyPort = DEFAULT_PAIR_PORTS.proxyPort;
+      for (const other of this.entries.values()) {
+        if (other.appPort === appPort || other.proxyPort === proxyPort) {
+          return {
+            ok: false,
+            error: {
+              code: "ALLOCATION_FAILED",
+              message: `default pair's reserved ports (${appPort}, ${proxyPort}) collide with registry entry "${other.pairId}"`
+            }
+          };
+        }
+      }
+    } else {
+      const usedPorts = new Set;
+      for (const e of this.entries.values()) {
+        usedPorts.add(e.appPort);
+        usedPorts.add(e.proxyPort);
+      }
+      usedPorts.add(DEFAULT_PAIR_PORTS.appPort);
+      usedPorts.add(DEFAULT_PAIR_PORTS.proxyPort);
+      let found = false;
+      appPort = 0;
+      proxyPort = 0;
+      for (let i = 1;i <= this.strideMax; i++) {
+        const candidateApp = STRIDE_BASE + this.strideStep * (i - 1);
+        const candidateProxy = candidateApp + 1;
+        if (!usedPorts.has(candidateApp) && !usedPorts.has(candidateProxy)) {
+          appPort = candidateApp;
+          proxyPort = candidateProxy;
+          found = true;
+          break;
+        }
+      }
+      if (!found) {
+        return {
+          ok: false,
+          error: {
+            code: "ALLOCATION_FAILED",
+            message: `no free stride within ${this.strideMax} positions starting at ${STRIDE_BASE} (step ${this.strideStep})`
+          }
+        };
+      }
+    }
+    const entry = {
+      pairId,
+      appPort,
+      proxyPort,
+      allocatedAt: Date.now()
+    };
+    this.entries.set(pairId, entry);
+    this.log(`[pair-registry] allocated pair="${pairId}" appPort=${appPort} proxyPort=${proxyPort}`);
+    return { ok: true, entry };
+  }
+  remove(pairId) {
+    if (!this.entries.has(pairId))
+      return false;
+    this.entries.delete(pairId);
+    this.log(`[pair-registry] removed pair="${pairId}"`);
+    return true;
+  }
+  size() {
+    return this.entries.size;
+  }
+}
+
 // src/control-protocol.ts
 var CLOSE_CODE_REPLACED = 4001;
 
@@ -2342,6 +2532,39 @@ var defaultPairState = {
   isLive: false
 };
 var pairs = new Map([["default", defaultPairState]]);
+var pairRegistry = new PairRegistry({
+  filePath: `${stateDir.dir}/pairs/registry.json`,
+  log: (msg) => log(msg)
+});
+pairRegistry.load();
+var registryWriteMutex = Promise.resolve();
+async function runUnderRegistryMutex(fn) {
+  const prev = registryWriteMutex;
+  let release;
+  registryWriteMutex = new Promise((resolve) => {
+    release = resolve;
+  });
+  try {
+    await prev.catch(() => {});
+    return await fn();
+  } finally {
+    release(undefined);
+  }
+}
+runUnderRegistryMutex(async () => {
+  if (!pairRegistry.has("default")) {
+    const result = pairRegistry.allocate("default");
+    if (result.ok) {
+      try {
+        pairRegistry.save();
+      } catch (err) {
+        log(`[pair-registry] failed to persist default entry: ${err?.message ?? err}`);
+      }
+    } else {
+      log(`[pair-registry] failed to materialize default entry: ${result.error.code} \u2014 ${result.error.message}`);
+    }
+  }
+});
 function attachPairHandlers(pair) {
   if (pair.handlerRefs.length > 0) {
     log(`[pair=${pair.pairId}] attachPairHandlers called but ${pair.handlerRefs.length} handler(s) already attached \u2014 no-op`);
@@ -2676,7 +2899,186 @@ function handleControlMessage(ws, raw) {
     case "claude_to_codex":
       handleClaudeToCodex(ws, message);
       return;
+    case "ensure_pair":
+      handleEnsurePair(ws, message);
+      return;
+    case "destroy_pair":
+      handleDestroyPair(ws, message);
+      return;
+    case "list_pairs":
+      handleListPairs(ws, message);
+      return;
   }
+}
+async function handleEnsurePair(ws, message) {
+  const { requestId, pairId } = message;
+  if (!isValidPairName(pairId)) {
+    sendProtocolMessage(ws, {
+      type: "pair_error",
+      requestId,
+      pairId,
+      code: "INVALID_PAIR_NAME",
+      message: `pair name "${pairId}" fails validation`
+    });
+    return;
+  }
+  const allocResult = await runUnderRegistryMutex(async () => {
+    if (pairRegistry.has(pairId)) {
+      return { ok: true, entry: pairRegistry.get(pairId) };
+    }
+    const result = pairRegistry.allocate(pairId);
+    if (result.ok) {
+      try {
+        pairRegistry.save();
+      } catch (err) {
+        log(`[ensure_pair=${pairId}] registry save failed: ${err?.message ?? err}`);
+      }
+    }
+    return result;
+  });
+  if (!allocResult.ok) {
+    sendProtocolMessage(ws, {
+      type: "pair_error",
+      requestId,
+      pairId,
+      code: allocResult.error.code,
+      message: allocResult.error.message
+    });
+    return;
+  }
+  const { appPort, proxyPort } = allocResult.entry;
+  if (pairId !== "default") {
+    log(`[ensure_pair=${pairId}] registry entry allocated (appPort=${appPort}, proxyPort=${proxyPort}); activation deferred to P3c`);
+    sendProtocolMessage(ws, {
+      type: "pair_error",
+      requestId,
+      pairId,
+      code: "ALLOCATION_FAILED",
+      message: `pair "${pairId}" registry entry allocated (appPort=${appPort}, proxyPort=${proxyPort}) but non-default pair activation is not implemented in P3b \u2014 lands in P3c`
+    });
+    return;
+  }
+  try {
+    const pair = await ensurePair("default");
+    sendProtocolMessage(ws, {
+      type: "pair_ensured",
+      requestId,
+      pairId,
+      appServerUrl: pair.codex.appServerUrl,
+      proxyUrl: pair.codex.proxyUrl,
+      isLive: true
+    });
+  } catch (err) {
+    sendProtocolMessage(ws, {
+      type: "pair_error",
+      requestId,
+      pairId,
+      code: "ALLOCATION_FAILED",
+      message: `ensurePair("default") failed: ${err?.message ?? err}`
+    });
+  }
+}
+async function handleDestroyPair(ws, message) {
+  const { requestId, pairId, forget, force } = message;
+  if (!isValidPairName(pairId)) {
+    sendProtocolMessage(ws, {
+      type: "pair_error",
+      requestId,
+      pairId,
+      code: "INVALID_PAIR_NAME",
+      message: `pair name "${pairId}" fails validation`
+    });
+    return;
+  }
+  const pair = pairs.get(pairId);
+  const inRegistry = pairRegistry.has(pairId);
+  if (!pair && !inRegistry) {
+    sendProtocolMessage(ws, {
+      type: "pair_error",
+      requestId,
+      pairId,
+      code: "PAIR_NOT_FOUND",
+      message: `pair "${pairId}" not found (neither live nor registered)`
+    });
+    return;
+  }
+  if (pair?.proxyTuiSlot?.pairedChatId && !force) {
+    sendProtocolMessage(ws, {
+      type: "pair_error",
+      requestId,
+      pairId,
+      code: "PAIR_BUSY_NOT_FORCED",
+      message: `pair "${pairId}" has paired chat "${pair.proxyTuiSlot.pairedChatId}"; pass force:true to tear down anyway`
+    });
+    return;
+  }
+  let wasLive = false;
+  if (pair?.isLive) {
+    wasLive = true;
+    try {
+      await destroyPair(pairId);
+    } catch (err) {
+      log(`[destroy_pair=${pairId}] internal destroyPair threw: ${err?.message ?? err}`);
+    }
+  }
+  let registryEntryRemoved = false;
+  if (forget) {
+    await runUnderRegistryMutex(async () => {
+      if (pairRegistry.remove(pairId)) {
+        registryEntryRemoved = true;
+        try {
+          pairRegistry.save();
+        } catch (err) {
+          log(`[destroy_pair=${pairId}] registry save failed: ${err?.message ?? err}`);
+        }
+      }
+    });
+  }
+  sendProtocolMessage(ws, {
+    type: "pair_destroyed",
+    requestId,
+    pairId,
+    wasLive,
+    registryEntryRemoved
+  });
+}
+function handleListPairs(ws, message) {
+  const seen = new Set;
+  const result = [];
+  for (const pair of pairs.values()) {
+    seen.add(pair.pairId);
+    result.push({
+      pairId: pair.pairId,
+      isLive: pair.isLive,
+      appServerUrl: pair.codex.appServerUrl,
+      proxyUrl: pair.codex.proxyUrl,
+      tuiConnected: pair.tuiConnectionState.snapshot().tuiConnected,
+      proxyTuiConnected: pair.proxyTuiSlot !== null,
+      pairedChatId: pair.proxyTuiSlot?.pairedChatId ?? null,
+      threadId: pair.codex.activeThreadId,
+      attachedClaudes: [...chats.values()].filter((s) => s.homePairId === pair.pairId).map((s) => ({ chatId: s.chatId, paired: s.paired }))
+    });
+  }
+  for (const entry of pairRegistry.list()) {
+    if (seen.has(entry.pairId))
+      continue;
+    result.push({
+      pairId: entry.pairId,
+      isLive: false,
+      appServerUrl: `ws://127.0.0.1:${entry.appPort}`,
+      proxyUrl: `ws://127.0.0.1:${entry.proxyPort}`,
+      tuiConnected: false,
+      proxyTuiConnected: false,
+      pairedChatId: null,
+      threadId: null,
+      attachedClaudes: []
+    });
+  }
+  sendProtocolMessage(ws, {
+    type: "pair_list",
+    requestId: message.requestId,
+    pairs: result
+  });
 }
 async function attachClaude(ws, requestedChatId) {
   const chatId = requestedChatId ?? `auto_${ws.data.clientId}_${Date.now()}`;
@@ -3254,8 +3656,13 @@ var __testing = {
     attachPairHandlers,
     detachPairHandlers,
     ensurePair,
-    destroyPair
+    destroyPair,
+    handleEnsurePair,
+    handleDestroyPair,
+    handleListPairs
   },
+  pairRegistry,
+  runUnderRegistryMutex,
   config: {
     PAIR_REAP_MS,
     CLAUDE_REAP_AFTER_MS,

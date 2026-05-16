@@ -419,6 +419,179 @@ describe("daemon bug regressions (2026-05-16 STM v2.2 review)", () => {
     await expect(fns.ensurePair("work")).rejects.toThrow(/not yet supported in P2/);
   });
 
+  // ── STM v2.3 §D6 P3b — control-protocol handlers ────────────────────
+
+  function makeMockWs(): {
+    sent: any[];
+    ws: any;
+  } {
+    const sent: any[] = [];
+    return {
+      sent,
+      ws: {
+        send: (payload: string) => { sent.push(JSON.parse(payload)); return 0; },
+        data: { clientId: 1, attached: false, chatId: null },
+        readyState: 1,
+        close: () => {},
+      },
+    };
+  }
+
+  test("P3b ensure_pair: pair_error INVALID_PAIR_NAME for bad name", async () => {
+    const { ws, sent } = makeMockWs();
+    await fns.handleEnsurePair(ws, {
+      type: "ensure_pair",
+      requestId: "req-1",
+      pairId: "BAD CASE",
+    });
+    expect(sent.length).toBe(1);
+    expect(sent[0].type).toBe("pair_error");
+    expect(sent[0].code).toBe("INVALID_PAIR_NAME");
+    expect(sent[0].requestId).toBe("req-1");
+  });
+
+  test("P3b ensure_pair: pair_ensured for 'default' (idempotent across registry)", async () => {
+    const defaultPair = __testing.pairs.get("default")!;
+    const originalStart = defaultPair.codex.start.bind(defaultPair.codex);
+    (defaultPair.codex as any).start = async () => {};
+    try {
+      // Pre-condition: default registered, not live.
+      expect(__testing.pairRegistry.has("default")).toBe(true);
+      defaultPair.isLive = false;
+
+      const { ws, sent } = makeMockWs();
+      await fns.handleEnsurePair(ws, {
+        type: "ensure_pair",
+        requestId: "req-2",
+        pairId: "default",
+      });
+      expect(sent.length).toBe(1);
+      expect(sent[0].type).toBe("pair_ensured");
+      expect(sent[0].pairId).toBe("default");
+      expect(sent[0].isLive).toBe(true);
+      expect(typeof sent[0].appServerUrl).toBe("string");
+      expect(typeof sent[0].proxyUrl).toBe("string");
+      expect(defaultPair.isLive).toBe(true);
+    } finally {
+      (defaultPair.codex as any).start = originalStart;
+    }
+  });
+
+  test("P3b ensure_pair: non-default name allocates registry entry but returns ALLOCATION_FAILED (P3c-bound)", async () => {
+    // Make sure "scratch-pair" isn't already in registry.
+    if (__testing.pairRegistry.has("scratch-pair")) {
+      await __testing.runUnderRegistryMutex(async () => {
+        __testing.pairRegistry.remove("scratch-pair");
+        __testing.pairRegistry.save();
+      });
+    }
+
+    const { ws, sent } = makeMockWs();
+    await fns.handleEnsurePair(ws, {
+      type: "ensure_pair",
+      requestId: "req-3",
+      pairId: "scratch-pair",
+    });
+
+    expect(sent.length).toBe(1);
+    expect(sent[0].type).toBe("pair_error");
+    expect(sent[0].code).toBe("ALLOCATION_FAILED");
+    expect(sent[0].message).toContain("non-default pair activation is not implemented in P3b");
+
+    // The registry entry IS allocated and persisted.
+    const entry = __testing.pairRegistry.get("scratch-pair");
+    expect(entry).not.toBeNull();
+    expect(entry?.appPort).toBeGreaterThanOrEqual(4510);
+
+    // Cleanup so subsequent tests don't see stride exhaustion.
+    await __testing.runUnderRegistryMutex(async () => {
+      __testing.pairRegistry.remove("scratch-pair");
+      __testing.pairRegistry.save();
+    });
+  });
+
+  test("P3b destroy_pair: PAIR_NOT_FOUND when pair is neither live nor registered", async () => {
+    const { ws, sent } = makeMockWs();
+    await fns.handleDestroyPair(ws, {
+      type: "destroy_pair",
+      requestId: "req-4",
+      pairId: "never-existed",
+    });
+    expect(sent[0].type).toBe("pair_error");
+    expect(sent[0].code).toBe("PAIR_NOT_FOUND");
+  });
+
+  test("P3b destroy_pair: forget removes registry-only entry, returns wasLive=false", async () => {
+    await __testing.runUnderRegistryMutex(async () => {
+      const result = __testing.pairRegistry.allocate("scratch-2");
+      if (result.ok) __testing.pairRegistry.save();
+    });
+    expect(__testing.pairRegistry.has("scratch-2")).toBe(true);
+
+    const { ws, sent } = makeMockWs();
+    await fns.handleDestroyPair(ws, {
+      type: "destroy_pair",
+      requestId: "req-5",
+      pairId: "scratch-2",
+      forget: true,
+    });
+    expect(sent[0].type).toBe("pair_destroyed");
+    expect(sent[0].wasLive).toBe(false);
+    expect(sent[0].registryEntryRemoved).toBe(true);
+    expect(__testing.pairRegistry.has("scratch-2")).toBe(false);
+  });
+
+  test("P3b destroy_pair: PAIR_BUSY_NOT_FORCED when pair has paired chat and no force", async () => {
+    const defaultPair = __testing.pairs.get("default")!;
+    // Seed a fake paired-chat slot for the default pair.
+    __testing.setProxyTuiSlot({
+      token: "t",
+      pairedChatId: "some-chat",
+      readiness: "ready",
+      attachedAt: Date.now(),
+      pairReapTimer: null,
+    });
+    defaultPair.isLive = true;
+
+    const { ws, sent } = makeMockWs();
+    await fns.handleDestroyPair(ws, {
+      type: "destroy_pair",
+      requestId: "req-6",
+      pairId: "default",
+      forget: false,
+      force: false,
+    });
+    expect(sent[0].type).toBe("pair_error");
+    expect(sent[0].code).toBe("PAIR_BUSY_NOT_FORCED");
+  });
+
+  test("P3b list_pairs: returns live + registry-only entries", async () => {
+    // Allocate a registry-only "scratch-list" entry.
+    await __testing.runUnderRegistryMutex(async () => {
+      const result = __testing.pairRegistry.allocate("scratch-list");
+      if (result.ok) __testing.pairRegistry.save();
+    });
+
+    const { ws, sent } = makeMockWs();
+    fns.handleListPairs(ws, { type: "list_pairs", requestId: "req-7" });
+    expect(sent[0].type).toBe("pair_list");
+    const pairsList = sent[0].pairs as any[];
+
+    const defaultEntry = pairsList.find((p) => p.pairId === "default");
+    expect(defaultEntry).toBeDefined();
+
+    const scratchEntry = pairsList.find((p) => p.pairId === "scratch-list");
+    expect(scratchEntry).toBeDefined();
+    expect(scratchEntry.isLive).toBe(false);
+    expect(scratchEntry.appServerUrl).toMatch(/ws:\/\/127\.0\.0\.1:/);
+
+    // Cleanup.
+    await __testing.runUnderRegistryMutex(async () => {
+      __testing.pairRegistry.remove("scratch-list");
+      __testing.pairRegistry.save();
+    });
+  });
+
   test("Bug B: transitionToIsolated exercises the retry loop and emits a definitive 'failed' message when all attempts fail", async () => {
     __testing.setProxyTuiSlot(makeSlot({ readiness: "ready" }));
 

@@ -32,8 +32,9 @@ import { TuiConnectionState } from "./tui-connection-state";
 import { DaemonLifecycle } from "./daemon-lifecycle";
 import { StateDirResolver } from "./state-dir";
 import { ConfigService } from "./config-service";
+import { PairRegistry, isValidPairName } from "./pair-registry";
 import { CLOSE_CODE_REPLACED } from "./control-protocol";
-import type { ControlClientMessage, ControlServerMessage, DaemonStatus } from "./control-protocol";
+import type { ControlClientMessage, ControlServerMessage, DaemonStatus, PairStatus } from "./control-protocol";
 import type { BridgeMessage } from "./types";
 
 interface ControlSocketData {
@@ -224,6 +225,60 @@ const defaultPairState: PairState = {
   isLive: false, // bootCodex / ensurePair("default") flips this to true on success
 };
 const pairs = new Map<string, PairState>([["default", defaultPairState]]);
+
+// ── STM v2.3 §D2 P3 — pair registry + write mutex ──────────────────────
+
+/**
+ * Pair → port-assignment registry. Persisted at `<stateDir>/pairs/registry.json`.
+ * Loaded at module start; mutations during `ensure_pair` / `destroy_pair`
+ * acquire the daemon-wide `registryWriteMutex` and save atomically via
+ * the PairRegistry class.
+ */
+const pairRegistry = new PairRegistry({
+  filePath: `${stateDir.dir}/pairs/registry.json`,
+  log: (msg) => log(msg),
+});
+pairRegistry.load();
+
+/**
+ * Daemon-wide registry-write mutex. The per-pair `ensurePairInFlight` map
+ * (P3c+) deduplicates concurrent ensures for the SAME pair; this mutex
+ * protects ALL registry writes from racing each other. Implemented as a
+ * promise chain — each acquire awaits the previous release before
+ * proceeding, so two `ensure_pair("work")` + `ensure_pair("side")` calls
+ * cannot interleave their read-modify-write of the registry file.
+ */
+let registryWriteMutex: Promise<unknown> = Promise.resolve();
+
+async function runUnderRegistryMutex<T>(fn: () => Promise<T> | T): Promise<T> {
+  const prev = registryWriteMutex;
+  let release!: (value: unknown) => void;
+  registryWriteMutex = new Promise((resolve) => { release = resolve; });
+  try {
+    await prev.catch(() => {});
+    return await fn();
+  } finally {
+    release(undefined);
+  }
+}
+
+// Ensure the default pair has a registry entry at startup so list_pairs
+// and subsequent ensure_pair("default") calls find it without racing on
+// allocation. This is the only synchronous-at-boot registry mutation —
+// run it under the mutex anyway to keep the contract simple. The mutex
+// is uncontended at this point.
+void runUnderRegistryMutex(async () => {
+  if (!pairRegistry.has("default")) {
+    const result = pairRegistry.allocate("default");
+    if (result.ok) {
+      try { pairRegistry.save(); } catch (err: any) {
+        log(`[pair-registry] failed to persist default entry: ${err?.message ?? err}`);
+      }
+    } else {
+      log(`[pair-registry] failed to materialize default entry: ${result.error.code} — ${result.error.message}`);
+    }
+  }
+});
 
 // ── TUI / app-server event wiring ────────────────────────────────
 // Codex TUI activity is INTENTIONALLY not cross-broadcast to Claude sessions.
@@ -666,7 +721,230 @@ function handleControlMessage(ws: ServerWebSocket<ControlSocketData>, raw: strin
     case "claude_to_codex":
       handleClaudeToCodex(ws, message);
       return;
+    // STM v2.3 §D6 P3 — pair management API ──────────────────────
+    case "ensure_pair":
+      void handleEnsurePair(ws, message);
+      return;
+    case "destroy_pair":
+      void handleDestroyPair(ws, message);
+      return;
+    case "list_pairs":
+      handleListPairs(ws, message);
+      return;
   }
+}
+
+// ── STM v2.3 §D6 P3 — pair management control protocol handlers ────────
+//
+// In P3b: `ensure_pair("default")` runs the full P2 ensurePair flow + saves
+// the registry. `ensure_pair("<other>")` validates + allocates a registry
+// entry but does NOT spawn a CodexAdapter — the actual non-default
+// activation lands in P3c once helpers (`getPairedChatState`, `pairChat`,
+// `transitionToIsolated`) become pair-aware. Until then, attaching the
+// shared event handlers on a non-default pair would route work-pair events
+// through default's paired-chat tracking (Codex P2 review warning).
+// `destroy_pair` handles both live default + registry-only entries.
+// `list_pairs` reports every registry entry plus their live status.
+
+async function handleEnsurePair(
+  ws: ServerWebSocket<ControlSocketData>,
+  message: Extract<ControlClientMessage, { type: "ensure_pair" }>,
+): Promise<void> {
+  const { requestId, pairId } = message;
+  if (!isValidPairName(pairId)) {
+    sendProtocolMessage(ws, {
+      type: "pair_error",
+      requestId,
+      pairId,
+      code: "INVALID_PAIR_NAME",
+      message: `pair name "${pairId}" fails validation`,
+    });
+    return;
+  }
+
+  // Allocate (or get) registry entry under the daemon-wide mutex.
+  const allocResult = await runUnderRegistryMutex(async () => {
+    if (pairRegistry.has(pairId)) {
+      return { ok: true as const, entry: pairRegistry.get(pairId)! };
+    }
+    const result = pairRegistry.allocate(pairId);
+    if (result.ok) {
+      try { pairRegistry.save(); } catch (err: any) {
+        log(`[ensure_pair=${pairId}] registry save failed: ${err?.message ?? err}`);
+      }
+    }
+    return result;
+  });
+
+  if (!allocResult.ok) {
+    sendProtocolMessage(ws, {
+      type: "pair_error",
+      requestId,
+      pairId,
+      code: allocResult.error.code,
+      message: allocResult.error.message,
+    });
+    return;
+  }
+
+  const { appPort, proxyPort } = allocResult.entry;
+
+  if (pairId !== "default") {
+    // P3b: registry entry exists, but non-default activation lands in P3c.
+    // Surface this clearly via ALLOCATION_FAILED with a P3-specific message
+    // so users (and tests) know the entry IS in the registry — they can
+    // remove it via destroy_pair --forget if they want.
+    log(`[ensure_pair=${pairId}] registry entry allocated (appPort=${appPort}, proxyPort=${proxyPort}); activation deferred to P3c`);
+    sendProtocolMessage(ws, {
+      type: "pair_error",
+      requestId,
+      pairId,
+      code: "ALLOCATION_FAILED",
+      message: `pair "${pairId}" registry entry allocated (appPort=${appPort}, proxyPort=${proxyPort}) but non-default pair activation is not implemented in P3b — lands in P3c`,
+    });
+    return;
+  }
+
+  try {
+    const pair = await ensurePair("default");
+    sendProtocolMessage(ws, {
+      type: "pair_ensured",
+      requestId,
+      pairId,
+      appServerUrl: pair.codex.appServerUrl,
+      proxyUrl: pair.codex.proxyUrl,
+      isLive: true,
+    });
+  } catch (err: any) {
+    sendProtocolMessage(ws, {
+      type: "pair_error",
+      requestId,
+      pairId,
+      code: "ALLOCATION_FAILED",
+      message: `ensurePair("default") failed: ${err?.message ?? err}`,
+    });
+  }
+}
+
+async function handleDestroyPair(
+  ws: ServerWebSocket<ControlSocketData>,
+  message: Extract<ControlClientMessage, { type: "destroy_pair" }>,
+): Promise<void> {
+  const { requestId, pairId, forget, force } = message;
+  if (!isValidPairName(pairId)) {
+    sendProtocolMessage(ws, {
+      type: "pair_error",
+      requestId,
+      pairId,
+      code: "INVALID_PAIR_NAME",
+      message: `pair name "${pairId}" fails validation`,
+    });
+    return;
+  }
+
+  const pair = pairs.get(pairId);
+  const inRegistry = pairRegistry.has(pairId);
+  if (!pair && !inRegistry) {
+    sendProtocolMessage(ws, {
+      type: "pair_error",
+      requestId,
+      pairId,
+      code: "PAIR_NOT_FOUND",
+      message: `pair "${pairId}" not found (neither live nor registered)`,
+    });
+    return;
+  }
+
+  // PAIR_BUSY_NOT_FORCED: live pair with paired Claude and no --force.
+  if (pair?.proxyTuiSlot?.pairedChatId && !force) {
+    sendProtocolMessage(ws, {
+      type: "pair_error",
+      requestId,
+      pairId,
+      code: "PAIR_BUSY_NOT_FORCED",
+      message: `pair "${pairId}" has paired chat "${pair.proxyTuiSlot.pairedChatId}"; pass force:true to tear down anyway`,
+    });
+    return;
+  }
+
+  let wasLive = false;
+  if (pair?.isLive) {
+    wasLive = true;
+    try {
+      await destroyPair(pairId);
+    } catch (err: any) {
+      log(`[destroy_pair=${pairId}] internal destroyPair threw: ${err?.message ?? err}`);
+    }
+  }
+
+  let registryEntryRemoved = false;
+  if (forget) {
+    await runUnderRegistryMutex(async () => {
+      if (pairRegistry.remove(pairId)) {
+        registryEntryRemoved = true;
+        try { pairRegistry.save(); } catch (err: any) {
+          log(`[destroy_pair=${pairId}] registry save failed: ${err?.message ?? err}`);
+        }
+      }
+    });
+  }
+
+  sendProtocolMessage(ws, {
+    type: "pair_destroyed",
+    requestId,
+    pairId,
+    wasLive,
+    registryEntryRemoved,
+  });
+}
+
+function handleListPairs(
+  ws: ServerWebSocket<ControlSocketData>,
+  message: Extract<ControlClientMessage, { type: "list_pairs" }>,
+): void {
+  // Union of live pairs (pairs Map) + registry entries that aren't currently
+  // live. Live entries take precedence so their runtime state is reported.
+  const seen = new Set<string>();
+  const result: PairStatus[] = [];
+
+  for (const pair of pairs.values()) {
+    seen.add(pair.pairId);
+    result.push({
+      pairId: pair.pairId,
+      isLive: pair.isLive,
+      appServerUrl: pair.codex.appServerUrl,
+      proxyUrl: pair.codex.proxyUrl,
+      tuiConnected: pair.tuiConnectionState.snapshot().tuiConnected,
+      proxyTuiConnected: pair.proxyTuiSlot !== null,
+      pairedChatId: pair.proxyTuiSlot?.pairedChatId ?? null,
+      threadId: pair.codex.activeThreadId,
+      attachedClaudes: [...chats.values()]
+        .filter((s) => s.homePairId === pair.pairId)
+        .map((s) => ({ chatId: s.chatId, paired: s.paired })),
+    });
+  }
+
+  for (const entry of pairRegistry.list()) {
+    if (seen.has(entry.pairId)) continue;
+    // Registry-only entry: no live runtime state, but URLs are config.
+    result.push({
+      pairId: entry.pairId,
+      isLive: false,
+      appServerUrl: `ws://127.0.0.1:${entry.appPort}`,
+      proxyUrl: `ws://127.0.0.1:${entry.proxyPort}`,
+      tuiConnected: false,
+      proxyTuiConnected: false,
+      pairedChatId: null,
+      threadId: null,
+      attachedClaudes: [],
+    });
+  }
+
+  sendProtocolMessage(ws, {
+    type: "pair_list",
+    requestId: message.requestId,
+    pairs: result,
+  });
 }
 
 async function attachClaude(
@@ -1398,7 +1676,15 @@ export const __testing = {
     detachPairHandlers,
     ensurePair,
     destroyPair,
+    /** STM v2.3 §D6 P3b — control-protocol handlers, exposed for unit tests. */
+    handleEnsurePair,
+    handleDestroyPair,
+    handleListPairs,
   } as const,
+  /** STM v2.3 §D2 P3b — registry handle (read for assertions; mutate via handlers). */
+  pairRegistry,
+  /** STM v2.3 §D2 P3b — registry-write mutex bridge for assertions in tests. */
+  runUnderRegistryMutex,
   /** Constants captured at module load — useful for asserting timer behavior. */
   config: {
     PAIR_REAP_MS,
