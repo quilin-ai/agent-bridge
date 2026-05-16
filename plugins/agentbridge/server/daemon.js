@@ -2574,6 +2574,11 @@ function attachPairHandlers(pair) {
     pair.codex.on(eventName, handler);
     pair.handlerRefs.push({ eventName, handler });
   };
+  const getPaired = () => {
+    if (!pair.proxyTuiSlot?.pairedChatId)
+      return null;
+    return chats.get(pair.proxyTuiSlot.pairedChatId) ?? null;
+  };
   on("ready", (threadId) => {
     pair.tuiConnectionState.markBridgeReady();
     log(`[pair=${pair.pairId}] Codex TUI thread ready: ${threadId} (bridge fully operational)`);
@@ -2625,7 +2630,7 @@ function attachPairHandlers(pair) {
     scheduleIdleShutdown();
   });
   on("agentMessage", (msg) => {
-    const paired = getPairedChatState();
+    const paired = getPaired();
     if (!paired)
       return;
     log(`[${paired.chatId}] CodexAdapter \u2192 paired Claude (agentMessage, ${msg.content.length} chars)`);
@@ -2634,7 +2639,7 @@ function attachPairHandlers(pair) {
     emitToChat(paired, msg);
   });
   on("userMessage", (payload) => {
-    const paired = getPairedChatState();
+    const paired = getPaired();
     if (!paired)
       return;
     if (!payload.content)
@@ -2650,14 +2655,14 @@ ${payload.content}`,
     });
   });
   on("turnStarted", () => {
-    const paired = getPairedChatState();
+    const paired = getPaired();
     if (!paired)
       return;
     paired.pairedTurnSawAgentMessage = false;
     emitToChat(paired, systemMessage("system_codex_turn_started", "[system] Codex turn started"));
   });
   on("turnCompleted", () => {
-    const paired = getPairedChatState();
+    const paired = getPaired();
     if (!paired)
       return;
     if (!paired.pairedTurnSawAgentMessage && paired.replyRequired) {
@@ -2671,7 +2676,7 @@ ${payload.content}`,
     paired.replyReceivedDuringTurn = false;
   });
   on("errorItem", (payload) => {
-    const paired = getPairedChatState();
+    const paired = getPaired();
     if (!paired)
       return;
     paired.replyReceivedDuringTurn = true;
@@ -2685,7 +2690,7 @@ ${payload.content}`,
       return;
     log(`[pair=${pair.pairId}] Shared Codex session restore started \u2014 flipping paired readiness to not-ready`);
     pair.proxyTuiSlot.readiness = "not-ready";
-    const paired = getPairedChatState();
+    const paired = getPaired();
     if (paired)
       paired.ready = false;
   });
@@ -2698,14 +2703,14 @@ ${payload.content}`,
     }
     log(`[pair=${pair.pairId}] Shared Codex session restore succeeded \u2014 flipping readiness back to ready`);
     pair.proxyTuiSlot.readiness = "ready";
-    const paired = getPairedChatState();
+    const paired = getPaired();
     if (paired) {
       paired.ready = true;
       emitToChat(paired, systemMessage("system_pair_restored", "\u2705 Shared Codex TUI session restored. Replies can flow again."));
     }
   });
   on("threadClosed", () => {
-    const paired = getPairedChatState();
+    const paired = getPaired();
     log(`[pair=${pair.pairId}] Codex emitted thread/closed`);
     if (pair.proxyTuiSlot) {
       const wasPairedChat = pair.proxyTuiSlot.pairedChatId;
@@ -2818,6 +2823,7 @@ function reapChatState(state, reason) {
 }
 function transitionToIsolated(state, reason) {
   state.paired = false;
+  state.homePairId = "default";
   state.replyRequired = false;
   state.replyReceivedDuringTurn = false;
   state.pairedTurnSawAgentMessage = false;
@@ -2912,54 +2918,8 @@ function handleControlMessage(ws, raw) {
 }
 async function handleEnsurePair(ws, message) {
   const { requestId, pairId } = message;
-  if (!isValidPairName(pairId)) {
-    sendProtocolMessage(ws, {
-      type: "pair_error",
-      requestId,
-      pairId,
-      code: "INVALID_PAIR_NAME",
-      message: `pair name "${pairId}" fails validation`
-    });
-    return;
-  }
-  const allocResult = await runUnderRegistryMutex(async () => {
-    if (pairRegistry.has(pairId)) {
-      return { ok: true, entry: pairRegistry.get(pairId) };
-    }
-    const result = pairRegistry.allocate(pairId);
-    if (result.ok) {
-      try {
-        pairRegistry.save();
-      } catch (err) {
-        log(`[ensure_pair=${pairId}] registry save failed: ${err?.message ?? err}`);
-      }
-    }
-    return result;
-  });
-  if (!allocResult.ok) {
-    sendProtocolMessage(ws, {
-      type: "pair_error",
-      requestId,
-      pairId,
-      code: allocResult.error.code,
-      message: allocResult.error.message
-    });
-    return;
-  }
-  const { appPort, proxyPort } = allocResult.entry;
-  if (pairId !== "default") {
-    log(`[ensure_pair=${pairId}] registry entry allocated (appPort=${appPort}, proxyPort=${proxyPort}); activation deferred to P3c`);
-    sendProtocolMessage(ws, {
-      type: "pair_error",
-      requestId,
-      pairId,
-      code: "ALLOCATION_FAILED",
-      message: `pair "${pairId}" registry entry allocated (appPort=${appPort}, proxyPort=${proxyPort}) but non-default pair activation is not implemented in P3b \u2014 lands in P3c`
-    });
-    return;
-  }
   try {
-    const pair = await ensurePair("default");
+    const pair = await ensurePair(pairId);
     sendProtocolMessage(ws, {
       type: "pair_ensured",
       requestId,
@@ -2969,12 +2929,23 @@ async function handleEnsurePair(ws, message) {
       isLive: true
     });
   } catch (err) {
+    if (err instanceof PairError) {
+      sendProtocolMessage(ws, {
+        type: "pair_error",
+        requestId,
+        pairId,
+        code: err.code,
+        message: err.message
+      });
+      return;
+    }
+    log(`[ensure_pair=${pairId}] unexpected error: ${err?.stack ?? err?.message ?? err}`);
     sendProtocolMessage(ws, {
       type: "pair_error",
       requestId,
       pairId,
       code: "ALLOCATION_FAILED",
-      message: `ensurePair("default") failed: ${err?.message ?? err}`
+      message: `ensurePair("${pairId}") failed: ${err?.message ?? err}`
     });
   }
 }
@@ -3530,23 +3501,71 @@ function removeStatusFile() {
   daemonLifecycle.removeStatusFile();
 }
 async function ensurePair(pairId) {
-  if (pairId !== "default") {
-    throw new Error(`ensurePair: pairId="${pairId}" not yet supported in P2 (default only)`);
+  if (!isValidPairName(pairId)) {
+    throw new PairError("INVALID_PAIR_NAME", `pair name "${pairId}" fails validation`);
   }
-  const pair = pairs.get(pairId);
+  const existing = pairs.get(pairId);
+  if (existing?.isLive)
+    return existing;
+  const entry = await runUnderRegistryMutex(async () => {
+    if (pairRegistry.has(pairId))
+      return pairRegistry.get(pairId);
+    const result = pairRegistry.allocate(pairId);
+    if (!result.ok) {
+      throw new PairError(result.error.code, result.error.message);
+    }
+    try {
+      pairRegistry.save();
+    } catch (err) {
+      log(`[pair-registry] ensurePair("${pairId}"): persist failed: ${err?.message ?? err}`);
+    }
+    return result.entry;
+  });
+  let pair = pairs.get(pairId);
   if (!pair) {
-    throw new Error(`ensurePair: pair "${pairId}" missing from registry (P2 invariant violated)`);
+    const newCodex = new CodexAdapter({
+      pairId,
+      appPort: entry.appPort,
+      proxyPort: entry.proxyPort,
+      logFile: stateDir.logFile
+    });
+    const newTuiState = new TuiConnectionState({
+      disconnectGraceMs: TUI_DISCONNECT_GRACE_MS,
+      log,
+      onDisconnectPersisted: (connId) => {
+        broadcastToAllClaudes(systemMessage("system_tui_disconnected", `\u26A0\uFE0F Codex TUI disconnected (pair=${pairId}, conn #${connId}). Codex is still running in the background \u2014 reconnect the TUI to resume.`));
+      },
+      onReconnectAfterNotice: (connId) => {
+        broadcastToAllClaudes(systemMessage("system_tui_reconnected", `\u2705 Codex TUI reconnected (pair=${pairId}, conn #${connId}). Bridge restored.`));
+      }
+    });
+    pair = {
+      pairId,
+      codex: newCodex,
+      tuiConnectionState: newTuiState,
+      proxyTuiSlot: null,
+      handlerRefs: [],
+      isLive: false
+    };
+    pairs.set(pairId, pair);
+    log(`[pair=${pairId}] constructed new PairState (appPort=${entry.appPort}, proxyPort=${entry.proxyPort})`);
   }
-  if (pair.isLive)
-    return pair;
   if (pair.handlerRefs.length === 0) {
-    log(`[pair=${pair.pairId}] ensurePair: reattaching handlers before start`);
     attachPairHandlers(pair);
   }
   log(`[pair=${pair.pairId}] ensurePair: starting codex app-server (appPort=${pair.codex.appServerUrl}, proxyPort=${pair.codex.proxyUrl})`);
   await pair.codex.start();
   pair.isLive = true;
   return pair;
+}
+
+class PairError extends Error {
+  code;
+  constructor(code, message) {
+    super(message);
+    this.code = code;
+    this.name = "PairError";
+  }
 }
 async function destroyPair(pairId) {
   const pair = pairs.get(pairId);

@@ -308,6 +308,15 @@ function attachPairHandlers(pair: PairState): void {
     pair.codex.on(eventName, handler);
     pair.handlerRefs.push({ eventName, handler });
   };
+  // STM v2.3 §6.5 / §6.6 P3c — pair-scoped paired-chat lookup. Replaces the
+  // P2-era module-level `getPairedChatState()` which read the default pair's
+  // proxyTuiSlot via the P1 alias. Now every handler reads from its own
+  // pair's slot, so events on a non-default pair stay routed within that
+  // pair's chat scope.
+  const getPaired = (): ChatState | null => {
+    if (!pair.proxyTuiSlot?.pairedChatId) return null;
+    return chats.get(pair.proxyTuiSlot.pairedChatId) ?? null;
+  };
 
   on("ready", (threadId: string) => {
     pair.tuiConnectionState.markBridgeReady();
@@ -378,7 +387,7 @@ function attachPairHandlers(pair: PairState): void {
   // shared-thread events route to the paired chat only.
 
   on("agentMessage", (msg: BridgeMessage) => {
-    const paired = getPairedChatState();
+    const paired = getPaired();
     if (!paired) return;
     log(`[${paired.chatId}] CodexAdapter → paired Claude (agentMessage, ${msg.content.length} chars)`);
     paired.pairedTurnSawAgentMessage = true;
@@ -387,7 +396,7 @@ function attachPairHandlers(pair: PairState): void {
   });
 
   on("userMessage", (payload: { content: string; id?: string; turnId?: string }) => {
-    const paired = getPairedChatState();
+    const paired = getPaired();
     if (!paired) return;
     if (!payload.content) return;
     log(`[${paired.chatId}] CodexAdapter → paired Claude (userMessage from TUI, ${payload.content.length} chars)`);
@@ -401,7 +410,7 @@ function attachPairHandlers(pair: PairState): void {
   });
 
   on("turnStarted", () => {
-    const paired = getPairedChatState();
+    const paired = getPaired();
     if (!paired) return;
     // Spec v2.2 §4.3: emit as diagnostic, MUST NOT satisfy requireReply.
     // Reset per-turn agentMessage tracker so turn/completed can detect the
@@ -411,7 +420,7 @@ function attachPairHandlers(pair: PairState): void {
   });
 
   on("turnCompleted", () => {
-    const paired = getPairedChatState();
+    const paired = getPaired();
     if (!paired) return;
     // Bug fix (2026-05-16): only surface "no-output failure" when Claude was
     // actually waiting for a reply (replyRequired=true). User-typed TUI turns
@@ -430,7 +439,7 @@ function attachPairHandlers(pair: PairState): void {
   });
 
   on("errorItem", (payload: { code?: number; message?: string }) => {
-    const paired = getPairedChatState();
+    const paired = getPaired();
     if (!paired) return;
     paired.replyReceivedDuringTurn = true;
     emitToChat(paired, systemMessage("system_codex_error",
@@ -447,7 +456,7 @@ function attachPairHandlers(pair: PairState): void {
     if (!pair.proxyTuiSlot) return;
     log(`[pair=${pair.pairId}] Shared Codex session restore started — flipping paired readiness to not-ready`);
     pair.proxyTuiSlot.readiness = "not-ready";
-    const paired = getPairedChatState();
+    const paired = getPaired();
     if (paired) paired.ready = false;
   });
 
@@ -459,7 +468,7 @@ function attachPairHandlers(pair: PairState): void {
     }
     log(`[pair=${pair.pairId}] Shared Codex session restore succeeded — flipping readiness back to ready`);
     pair.proxyTuiSlot.readiness = "ready";
-    const paired = getPairedChatState();
+    const paired = getPaired();
     if (paired) {
       paired.ready = true;
       emitToChat(paired, systemMessage("system_pair_restored",
@@ -468,7 +477,7 @@ function attachPairHandlers(pair: PairState): void {
   });
 
   on("threadClosed", () => {
-    const paired = getPairedChatState();
+    const paired = getPaired();
     log(`[pair=${pair.pairId}] Codex emitted thread/closed`);
     if (pair.proxyTuiSlot) {
       const wasPairedChat = pair.proxyTuiSlot.pairedChatId;
@@ -627,6 +636,12 @@ function reapChatState(state: ChatState, reason: string): void {
 
 function transitionToIsolated(state: ChatState, reason: string): void {
   state.paired = false;
+  // STM v2.3 §6.5 P3c: pair teardown is a terminal boundary. Re-home the
+  // chat onto the default pair (Path A) — the ClaudeThread below targets
+  // `codex.appServerUrl` (the default pair's app-server). If default is
+  // not live the bootstrap retries exhaust and reapChatState produces the
+  // explicit "reconnect Claude" instruction (Path B equivalent).
+  state.homePairId = "default";
   // Bug fix (Codex review 2026-05-16): pair teardown is a terminal boundary
   // for the old shared turn. Reset paired-turn flags so they don't bleed
   // into the fresh isolated thread — a stale `replyRequired=true` would
@@ -751,62 +766,8 @@ async function handleEnsurePair(
   message: Extract<ControlClientMessage, { type: "ensure_pair" }>,
 ): Promise<void> {
   const { requestId, pairId } = message;
-  if (!isValidPairName(pairId)) {
-    sendProtocolMessage(ws, {
-      type: "pair_error",
-      requestId,
-      pairId,
-      code: "INVALID_PAIR_NAME",
-      message: `pair name "${pairId}" fails validation`,
-    });
-    return;
-  }
-
-  // Allocate (or get) registry entry under the daemon-wide mutex.
-  const allocResult = await runUnderRegistryMutex(async () => {
-    if (pairRegistry.has(pairId)) {
-      return { ok: true as const, entry: pairRegistry.get(pairId)! };
-    }
-    const result = pairRegistry.allocate(pairId);
-    if (result.ok) {
-      try { pairRegistry.save(); } catch (err: any) {
-        log(`[ensure_pair=${pairId}] registry save failed: ${err?.message ?? err}`);
-      }
-    }
-    return result;
-  });
-
-  if (!allocResult.ok) {
-    sendProtocolMessage(ws, {
-      type: "pair_error",
-      requestId,
-      pairId,
-      code: allocResult.error.code,
-      message: allocResult.error.message,
-    });
-    return;
-  }
-
-  const { appPort, proxyPort } = allocResult.entry;
-
-  if (pairId !== "default") {
-    // P3b: registry entry exists, but non-default activation lands in P3c.
-    // Surface this clearly via ALLOCATION_FAILED with a P3-specific message
-    // so users (and tests) know the entry IS in the registry — they can
-    // remove it via destroy_pair --forget if they want.
-    log(`[ensure_pair=${pairId}] registry entry allocated (appPort=${appPort}, proxyPort=${proxyPort}); activation deferred to P3c`);
-    sendProtocolMessage(ws, {
-      type: "pair_error",
-      requestId,
-      pairId,
-      code: "ALLOCATION_FAILED",
-      message: `pair "${pairId}" registry entry allocated (appPort=${appPort}, proxyPort=${proxyPort}) but non-default pair activation is not implemented in P3b — lands in P3c`,
-    });
-    return;
-  }
-
   try {
-    const pair = await ensurePair("default");
+    const pair = await ensurePair(pairId);
     sendProtocolMessage(ws, {
       type: "pair_ensured",
       requestId,
@@ -816,12 +777,23 @@ async function handleEnsurePair(
       isLive: true,
     });
   } catch (err: any) {
+    if (err instanceof PairError) {
+      sendProtocolMessage(ws, {
+        type: "pair_error",
+        requestId,
+        pairId,
+        code: err.code,
+        message: err.message,
+      });
+      return;
+    }
+    log(`[ensure_pair=${pairId}] unexpected error: ${err?.stack ?? err?.message ?? err}`);
     sendProtocolMessage(ws, {
       type: "pair_error",
       requestId,
       pairId,
       code: "ALLOCATION_FAILED",
-      message: `ensurePair("default") failed: ${err?.message ?? err}`,
+      message: `ensurePair("${pairId}") failed: ${err?.message ?? err}`,
     });
   }
 }
@@ -1488,45 +1460,99 @@ function writeStatusFile() {
 function removeStatusFile() { daemonLifecycle.removeStatusFile(); }
 
 /**
- * STM v2.3 §6.2 P2: bring a pair live — start its Codex app-server.
+ * STM v2.3 §6.2 P3c: bring a pair live — allocate registry entry if
+ * needed, construct a CodexAdapter + TuiConnectionState for non-default
+ * pairs, attach handlers, and start the Codex app-server.
  *
- * In P2 the only legal `pairId` is `"default"` and the PairState is
- * pre-constructed at module load (handlers attached). This function just
- * runs the codex.start() flow and flips `isLive`. Calling it on an
- * already-live pair is idempotent.
+ * Errors thrown here are instances of `PairError` so callers (notably
+ * `handleEnsurePair`) can map them to the right `pair_error` code in
+ * the control protocol.
  *
- * P3 generalizes this to:
- *   - validate pairId per D1
- *   - check `ensurePairInFlight` dedup mutex
- *   - look up / allocate ports via registry
- *   - construct CodexAdapter on demand for non-default pairs
- *   - attachPairHandlers for the new PairState
- *   - await codex.start() and flip isLive
- *   - return URLs to caller
+ * Concurrency: the registry read-modify-write (allocate + save) runs
+ * under `registryWriteMutex` to prevent different-pairId ensures from
+ * racing. PairState construction and codex.start() happen outside the
+ * mutex to avoid serializing all spawns through one chain.
  */
 async function ensurePair(pairId: string): Promise<PairState> {
-  if (pairId !== "default") {
-    throw new Error(`ensurePair: pairId="${pairId}" not yet supported in P2 (default only)`);
+  if (!isValidPairName(pairId)) {
+    throw new PairError("INVALID_PAIR_NAME", `pair name "${pairId}" fails validation`);
   }
-  const pair = pairs.get(pairId);
+
+  // Fast path: pair already constructed and live.
+  const existing = pairs.get(pairId);
+  if (existing?.isLive) return existing;
+
+  // Allocate (or look up) the registry entry for this pair.
+  const entry = await runUnderRegistryMutex(async () => {
+    if (pairRegistry.has(pairId)) return pairRegistry.get(pairId)!;
+    const result = pairRegistry.allocate(pairId);
+    if (!result.ok) {
+      throw new PairError(result.error.code, result.error.message);
+    }
+    try { pairRegistry.save(); } catch (err: any) {
+      log(`[pair-registry] ensurePair("${pairId}"): persist failed: ${err?.message ?? err}`);
+    }
+    return result.entry;
+  });
+
+  // Construct the PairState if we don't have one yet. The default pair is
+  // pre-constructed at module load (uses the P1 alias getter/setter for
+  // proxyTuiSlot); non-default pairs get a fresh PairState with a normal
+  // proxyTuiSlot field.
+  let pair = pairs.get(pairId);
   if (!pair) {
-    throw new Error(`ensurePair: pair "${pairId}" missing from registry (P2 invariant violated)`);
+    const newCodex = new CodexAdapter({
+      pairId,
+      appPort: entry.appPort,
+      proxyPort: entry.proxyPort,
+      logFile: stateDir.logFile,
+    });
+    const newTuiState = new TuiConnectionState({
+      disconnectGraceMs: TUI_DISCONNECT_GRACE_MS,
+      log,
+      onDisconnectPersisted: (connId) => {
+        broadcastToAllClaudes(systemMessage(
+          "system_tui_disconnected",
+          `⚠️ Codex TUI disconnected (pair=${pairId}, conn #${connId}). Codex is still running in the background — reconnect the TUI to resume.`,
+        ));
+      },
+      onReconnectAfterNotice: (connId) => {
+        broadcastToAllClaudes(systemMessage(
+          "system_tui_reconnected",
+          `✅ Codex TUI reconnected (pair=${pairId}, conn #${connId}). Bridge restored.`,
+        ));
+      },
+    });
+    pair = {
+      pairId,
+      codex: newCodex,
+      tuiConnectionState: newTuiState,
+      proxyTuiSlot: null,
+      handlerRefs: [],
+      isLive: false,
+    };
+    pairs.set(pairId, pair);
+    log(`[pair=${pairId}] constructed new PairState (appPort=${entry.appPort}, proxyPort=${entry.proxyPort})`);
   }
-  if (pair.isLive) return pair;
-  // Bug fix (Codex P2 review codex_msg_5753c73beafc_95): if this is a
-  // re-ensure after a prior destroyPair (or after an `exit` cleared
-  // isLive), handler refs were cleared too. Reattach before starting
-  // so the new codex.start() fires `ready` / `tuiConnected` / etc. into
-  // live event listeners. Without this, ensurePair-after-destroyPair
-  // produced a live-but-event-deaf pair.
+
+  // Bug fix (Codex P2 review codex_msg_5753c73beafc_95): reattach handlers
+  // if a prior destroyPair cleared them. attachPairHandlers is idempotent.
   if (pair.handlerRefs.length === 0) {
-    log(`[pair=${pair.pairId}] ensurePair: reattaching handlers before start`);
     attachPairHandlers(pair);
   }
+
   log(`[pair=${pair.pairId}] ensurePair: starting codex app-server (appPort=${pair.codex.appServerUrl}, proxyPort=${pair.codex.proxyUrl})`);
   await pair.codex.start();
   pair.isLive = true;
   return pair;
+}
+
+/** STM v2.3 §D6 P3c — error class carrying a pair-protocol error code. */
+class PairError extends Error {
+  constructor(public readonly code: import("./control-protocol").PairErrorCode, message: string) {
+    super(message);
+    this.name = "PairError";
+  }
 }
 
 /**

@@ -415,8 +415,10 @@ describe("daemon bug regressions (2026-05-16 STM v2.2 review)", () => {
     }
   });
 
-  test("P2 lifecycle: ensurePair rejects non-default pairId in P2", async () => {
-    await expect(fns.ensurePair("work")).rejects.toThrow(/not yet supported in P2/);
+  test("P3c lifecycle: ensurePair rejects INVALID_PAIR_NAME", async () => {
+    // P3c generalized ensurePair to accept any valid pairId. Invalid
+    // names (per D1) still throw a PairError.
+    await expect(fns.ensurePair("BAD CASE")).rejects.toThrow(/fails validation/);
   });
 
   // ── STM v2.3 §D6 P3b — control-protocol handlers ────────────────────
@@ -477,7 +479,7 @@ describe("daemon bug regressions (2026-05-16 STM v2.2 review)", () => {
     }
   });
 
-  test("P3b ensure_pair: non-default name allocates registry entry but returns ALLOCATION_FAILED (P3c-bound)", async () => {
+  test("P3c ensure_pair: non-default name allocates a fresh PairState and goes live (with stubbed codex.start)", async () => {
     // Make sure "scratch-pair" isn't already in registry.
     if (__testing.pairRegistry.has("scratch-pair")) {
       await __testing.runUnderRegistryMutex(async () => {
@@ -486,28 +488,48 @@ describe("daemon bug regressions (2026-05-16 STM v2.2 review)", () => {
       });
     }
 
-    const { ws, sent } = makeMockWs();
-    await fns.handleEnsurePair(ws, {
-      type: "ensure_pair",
-      requestId: "req-3",
-      pairId: "scratch-pair",
-    });
+    // Stub CodexAdapter.prototype.start so the test doesn't actually
+    // spawn a real `codex app-server` process.
+    const { CodexAdapter } = await import("../codex-adapter");
+    const originalStart = (CodexAdapter.prototype as any).start;
+    (CodexAdapter.prototype as any).start = async function () {};
 
-    expect(sent.length).toBe(1);
-    expect(sent[0].type).toBe("pair_error");
-    expect(sent[0].code).toBe("ALLOCATION_FAILED");
-    expect(sent[0].message).toContain("non-default pair activation is not implemented in P3b");
+    try {
+      const { ws, sent } = makeMockWs();
+      await fns.handleEnsurePair(ws, {
+        type: "ensure_pair",
+        requestId: "req-3",
+        pairId: "scratch-pair",
+      });
 
-    // The registry entry IS allocated and persisted.
-    const entry = __testing.pairRegistry.get("scratch-pair");
-    expect(entry).not.toBeNull();
-    expect(entry?.appPort).toBeGreaterThanOrEqual(4510);
+      expect(sent.length).toBe(1);
+      expect(sent[0].type).toBe("pair_ensured");
+      expect(sent[0].pairId).toBe("scratch-pair");
+      expect(sent[0].isLive).toBe(true);
 
-    // Cleanup so subsequent tests don't see stride exhaustion.
-    await __testing.runUnderRegistryMutex(async () => {
-      __testing.pairRegistry.remove("scratch-pair");
-      __testing.pairRegistry.save();
-    });
+      // PairState now exists in the pairs Map.
+      const pair = __testing.pairs.get("scratch-pair");
+      expect(pair).toBeDefined();
+      expect(pair?.isLive).toBe(true);
+      expect(pair?.handlerRefs.length).toBeGreaterThan(0);
+
+      // Registry entry persisted.
+      const entry = __testing.pairRegistry.get("scratch-pair");
+      expect(entry).not.toBeNull();
+      expect(entry?.appPort).toBeGreaterThanOrEqual(4510);
+    } finally {
+      (CodexAdapter.prototype as any).start = originalStart;
+      // Tear down the test pair we created.
+      const pair = __testing.pairs.get("scratch-pair");
+      if (pair) {
+        try { fns.detachPairHandlers(pair); } catch {}
+        __testing.pairs.delete("scratch-pair");
+      }
+      await __testing.runUnderRegistryMutex(async () => {
+        __testing.pairRegistry.remove("scratch-pair");
+        __testing.pairRegistry.save();
+      });
+    }
   });
 
   test("P3b destroy_pair: PAIR_NOT_FOUND when pair is neither live nor registered", async () => {
