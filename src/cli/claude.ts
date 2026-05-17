@@ -19,13 +19,23 @@ export async function runClaude(args: string[]) {
   const rest: string[] = [];
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
-    if (a === "--pair" && i + 1 < args.length) {
+    if (a === "--pair") {
+      // MEDIUM (Codex P4 review): --pair without a value used to fall
+      // through into native claude args. Now a clear error.
+      if (i + 1 >= args.length) {
+        console.error(`Error: --pair requires a value (e.g. \`--pair work\`).`);
+        process.exit(1);
+      }
       pairId = args[i + 1];
       i++;
       continue;
     }
     if (a.startsWith("--pair=")) {
       pairId = a.slice("--pair=".length);
+      if (!pairId) {
+        console.error(`Error: --pair= requires a value (e.g. \`--pair=work\`).`);
+        process.exit(1);
+      }
       continue;
     }
     rest.push(a);

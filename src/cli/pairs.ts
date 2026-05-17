@@ -107,6 +107,7 @@ export async function runPairs(args: string[]): Promise<void> {
 async function runPairsLs(): Promise<void> {
   let response: { pairs: PairListEntry[] };
   try {
+    const lsReqId = `cli-pairs-ls-${Date.now()}`;
     response = await controlWsRequest<
       { type: "list_pairs"; requestId: string },
       { type: "pair_list"; requestId: string; pairs: PairListEntry[] }
@@ -114,10 +115,10 @@ async function runPairsLs(): Promise<void> {
       CONTROL_PORT_DEFAULT,
       {
         type: "list_pairs",
-        requestId: `cli-pairs-ls-${Date.now()}`,
+        requestId: lsReqId,
       },
       (msg): msg is { type: "pair_list"; requestId: string; pairs: PairListEntry[] } => {
-        return msg && msg.type === "pair_list";
+        return msg && msg.type === "pair_list" && msg.requestId === lsReqId;
       },
     );
   } catch (err: any) {
@@ -181,6 +182,7 @@ async function runPairsRm(args: string[]): Promise<void> {
 
   let response: { type: "pair_destroyed" | "pair_error"; [k: string]: any };
   try {
+    const rmReqId = `cli-pairs-rm-${Date.now()}`;
     response = await controlWsRequest<
       { type: "destroy_pair"; requestId: string; pairId: string; forget: boolean; force: boolean },
       { type: "pair_destroyed" | "pair_error"; requestId: string; [k: string]: any }
@@ -188,13 +190,13 @@ async function runPairsRm(args: string[]): Promise<void> {
       CONTROL_PORT_DEFAULT,
       {
         type: "destroy_pair",
-        requestId: `cli-pairs-rm-${Date.now()}`,
+        requestId: rmReqId,
         pairId,
         forget,
         force,
       },
       (msg): msg is { type: "pair_destroyed" | "pair_error"; requestId: string; [k: string]: any } => {
-        return msg && (msg.type === "pair_destroyed" || msg.type === "pair_error");
+        return msg && (msg.type === "pair_destroyed" || msg.type === "pair_error") && msg.requestId === rmReqId;
       },
     );
   } catch (err: any) {

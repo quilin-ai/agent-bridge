@@ -139,12 +139,31 @@ async function connectToDaemon(isReconnect = false) {
   try {
     await daemonLifecycle.ensureRunning();
     await daemonClient.connect();
-    daemonClient.attachClaude();
+    // STM v2.3 §D6 P4-cleanup HIGH#2: await the typed claude_connect_result
+    // and surface PAIR_NOT_FOUND / PAIR_BUSY / INVALID_PAIR_NAME as a
+    // disabled state instead of silently claiming "bridge ready".
+    const attachResult = await daemonClient.attachClaude();
+    if (!attachResult.ok) {
+      const pairCtx = PAIR_ID ? ` (requested pair: "${PAIR_ID}")` : "";
+      log(`Daemon rejected claude_connect: ${attachResult.error} — ${attachResult.message}${pairCtx}`);
+      daemonDisabled = true;
+      daemonDisabledReason = "daemon_rejected_attach";
+      await claude.pushNotification(systemMessage(
+        "system_bridge_disabled",
+        `❌ AgentBridge could not attach this Claude session: ${attachResult.error}. ${attachResult.message}${pairCtx}`,
+      ));
+      return;
+    }
     daemonDisabledReason = null;
     if (!isReconnect) {
+      const pairCtx = attachResult.paired && attachResult.homePairId
+        ? ` (paired with pair "${attachResult.homePairId}")`
+        : attachResult.homePairId && attachResult.homePairId !== "default"
+          ? ` (home pair: "${attachResult.homePairId}")`
+          : "";
       void claude.pushNotification(systemMessage(
         "system_bridge_ready",
-        "✅ AgentBridge bridge is ready. Daemon connected. Start Codex in another terminal with: agentbridge codex",
+        `✅ AgentBridge bridge is ready. Daemon connected${pairCtx}. Start Codex in another terminal with: agentbridge codex`,
       ));
     }
   } catch (err: any) {

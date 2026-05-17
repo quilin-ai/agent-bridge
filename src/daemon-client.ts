@@ -23,6 +23,22 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
       timer: ReturnType<typeof setTimeout>;
     }
   >();
+  /**
+   * STM v2.3 §D4 / §D6 P4-cleanup: pending attachClaude promises waiting
+   * on `claude_connect_result`. Separate from `pendingReplies` because
+   * the response shape is discriminated (ok=true vs ok=false) and
+   * different from `claude_to_codex_result`.
+   */
+  private pendingAttachReplies = new Map<
+    string,
+    {
+      resolve: (value:
+        | { ok: true; homePairId: string | null; paired: boolean }
+        | { ok: false; error: string; message: string }
+      ) => void;
+      timer: ReturnType<typeof setTimeout>;
+    }
+  >();
   private chatId: string | undefined;
   /**
    * STM v2.3 §D4 P4b: optional explicit pair binding. Read from
@@ -93,10 +109,36 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
     });
   }
 
-  attachClaude() {
-    // STM v2.3 §D4 P4b: forward pairId if AGENTBRIDGE_PAIR was set. The
-    // daemon validates and responds with a typed claude_connect_result.
-    this.send({ type: "claude_connect", chatId: this.chatId, pairId: this.pairId });
+  /**
+   * STM v2.3 §D4 / §D6 P4-cleanup: send `claude_connect` and await the
+   * typed `claude_connect_result` (Codex P4 review codex_msg_5753c73beafc_123
+   * HIGH#2). Returns the daemon's verdict so bridge.ts can enter a
+   * disabled state on PAIR_NOT_FOUND / PAIR_BUSY / INVALID_PAIR_NAME
+   * instead of silently claiming "bridge ready" after a fire-and-forget
+   * attach. Falls through to {ok:true} after a short timeout against
+   * an older daemon that doesn't emit the typed result (so v2.2 bridges
+   * keep working).
+   */
+  async attachClaude(timeoutMs = 5000): Promise<
+    | { ok: true; homePairId: string | null; paired: boolean }
+    | { ok: false; error: string; message: string }
+  > {
+    const requestId = `attach_${Date.now()}_${this.nextRequestId++}`;
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        this.pendingAttachReplies.delete(requestId);
+        // Old daemon (or test fixture) didn't reply with a typed
+        // claude_connect_result — assume success for backwards-compat.
+        resolve({ ok: true, homePairId: null, paired: false });
+      }, timeoutMs);
+      this.pendingAttachReplies.set(requestId, { resolve, timer });
+      this.send({
+        type: "claude_connect",
+        requestId,
+        chatId: this.chatId,
+        pairId: this.pairId,
+      });
+    });
   }
 
   async disconnect() {
@@ -158,6 +200,30 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
           clearTimeout(pending.timer);
           this.pendingReplies.delete(message.requestId);
           pending.resolve({ success: message.success, error: message.error });
+          return;
+        }
+        case "claude_connect_result": {
+          // STM v2.3 §D6 P4-cleanup: resolve the matching pending attach
+          // promise. requestId may be absent for old-style callers (no
+          // pending entry → drop).
+          if (!message.requestId) return;
+          const pending = this.pendingAttachReplies.get(message.requestId);
+          if (!pending) return;
+          clearTimeout(pending.timer);
+          this.pendingAttachReplies.delete(message.requestId);
+          if (message.ok) {
+            pending.resolve({
+              ok: true,
+              homePairId: message.homePairId,
+              paired: message.paired,
+            });
+          } else {
+            pending.resolve({
+              ok: false,
+              error: message.error,
+              message: message.message,
+            });
+          }
           return;
         }
         case "status":

@@ -216,13 +216,24 @@ function extractCliFlags(args: string[]): {
     // Default is "default" (v2.2-compat). Multiple TUIs on different
     // pairs can coexist; each spawns its own Codex app-server on a
     // separate port via daemon's ensure_pair flow.
-    if (a === "--pair" && i + 1 < args.length) {
+    if (a === "--pair") {
+      // MEDIUM (Codex P4 review): --pair without a value used to fall
+      // through into native codex args (silent breakage). Now a clear
+      // error.
+      if (i + 1 >= args.length) {
+        console.error(`Error: --pair requires a value (e.g. \`--pair work\`).`);
+        process.exit(1);
+      }
       pairId = args[i + 1];
       i++;
       continue;
     }
     if (a.startsWith("--pair=")) {
       pairId = a.slice("--pair=".length);
+      if (!pairId) {
+        console.error(`Error: --pair= requires a value (e.g. \`--pair=work\`).`);
+        process.exit(1);
+      }
       continue;
     }
     rest.push(a);
@@ -348,7 +359,16 @@ export async function runCodex(rawArgs: string[]) {
       process.exit(1);
     }
     console.error(`[agentbridge] Failed to ensure pair "${pairId}": ${err.message ?? err}`);
-    console.error(`  Falling back to status.json URLs.`);
+    // HIGH#1 (Codex P4 review codex_msg_5753c73beafc_123): only fall
+    // back to status.json/config for the default pair. For named pairs
+    // any fallback would mean launching `--pair work` against default's
+    // ports, silently collapsing pair isolation. Hard-fail instead.
+    if (pairId !== "default") {
+      console.error(`  Named pair "${pairId}" requires the daemon's ensure_pair to succeed — refusing to fall back to default ports (would break pair isolation).`);
+      console.error(`  Either start the daemon (\`abg codex\` once succeeds), update the daemon to a build that speaks ensure_pair, or use \`--pair default\` for v2.2-compat behavior.`);
+      process.exit(1);
+    }
+    console.error(`  Default pair: falling back to status.json URLs for v2.2 compatibility.`);
   }
 
   if (mode === "direct") {

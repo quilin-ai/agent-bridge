@@ -14021,6 +14021,7 @@ class DaemonClient extends EventEmitter2 {
   wsId = 0;
   nextRequestId = 1;
   pendingReplies = new Map;
+  pendingAttachReplies = new Map;
   chatId;
   pairId;
   constructor(url, opts) {
@@ -14074,8 +14075,21 @@ class DaemonClient extends EventEmitter2 {
       };
     });
   }
-  attachClaude() {
-    this.send({ type: "claude_connect", chatId: this.chatId, pairId: this.pairId });
+  async attachClaude(timeoutMs = 5000) {
+    const requestId = `attach_${Date.now()}_${this.nextRequestId++}`;
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        this.pendingAttachReplies.delete(requestId);
+        resolve({ ok: true, homePairId: null, paired: false });
+      }, timeoutMs);
+      this.pendingAttachReplies.set(requestId, { resolve, timer });
+      this.send({
+        type: "claude_connect",
+        requestId,
+        chatId: this.chatId,
+        pairId: this.pairId
+      });
+    });
   }
   async disconnect() {
     if (!this.ws)
@@ -14129,6 +14143,29 @@ class DaemonClient extends EventEmitter2 {
           clearTimeout(pending.timer);
           this.pendingReplies.delete(message.requestId);
           pending.resolve({ success: message.success, error: message.error });
+          return;
+        }
+        case "claude_connect_result": {
+          if (!message.requestId)
+            return;
+          const pending = this.pendingAttachReplies.get(message.requestId);
+          if (!pending)
+            return;
+          clearTimeout(pending.timer);
+          this.pendingAttachReplies.delete(message.requestId);
+          if (message.ok) {
+            pending.resolve({
+              ok: true,
+              homePairId: message.homePairId,
+              paired: message.paired
+            });
+          } else {
+            pending.resolve({
+              ok: false,
+              error: message.error,
+              message: message.message
+            });
+          }
           return;
         }
         case "status":
@@ -14533,6 +14570,8 @@ function disabledReplyError(reason) {
       return "AgentBridge rejected this session \u2014 another Claude Code session is already connected. Close the other session first, or run `agentbridge kill` to reset.";
     case "killed":
       return "AgentBridge is disabled by `agentbridge kill`. Restart Claude Code (`agentbridge claude`), switch to a new conversation, or run `/resume` to reconnect.";
+    case "daemon_rejected_attach":
+      return "AgentBridge could not attach this Claude session \u2014 the daemon rejected the pair binding. See the most recent system message for the specific error (PAIR_NOT_FOUND / PAIR_BUSY / INVALID_PAIR_NAME). Restart Claude Code after fixing the underlying issue.";
   }
 }
 
@@ -14627,10 +14666,19 @@ async function connectToDaemon(isReconnect = false) {
   try {
     await daemonLifecycle.ensureRunning();
     await daemonClient.connect();
-    daemonClient.attachClaude();
+    const attachResult = await daemonClient.attachClaude();
+    if (!attachResult.ok) {
+      const pairCtx = PAIR_ID ? ` (requested pair: "${PAIR_ID}")` : "";
+      log(`Daemon rejected claude_connect: ${attachResult.error} \u2014 ${attachResult.message}${pairCtx}`);
+      daemonDisabled = true;
+      daemonDisabledReason = "daemon_rejected_attach";
+      await claude.pushNotification(systemMessage("system_bridge_disabled", `\u274C AgentBridge could not attach this Claude session: ${attachResult.error}. ${attachResult.message}${pairCtx}`));
+      return;
+    }
     daemonDisabledReason = null;
     if (!isReconnect) {
-      claude.pushNotification(systemMessage("system_bridge_ready", "\u2705 AgentBridge bridge is ready. Daemon connected. Start Codex in another terminal with: agentbridge codex"));
+      const pairCtx = attachResult.paired && attachResult.homePairId ? ` (paired with pair "${attachResult.homePairId}")` : attachResult.homePairId && attachResult.homePairId !== "default" ? ` (home pair: "${attachResult.homePairId}")` : "";
+      claude.pushNotification(systemMessage("system_bridge_ready", `\u2705 AgentBridge bridge is ready. Daemon connected${pairCtx}. Start Codex in another terminal with: agentbridge codex`));
     }
   } catch (err) {
     log(`Failed to connect to daemon: ${err.message}`);
