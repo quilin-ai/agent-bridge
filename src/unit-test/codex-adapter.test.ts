@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { execSync } from "node:child_process";
 import { createServer, Socket, type Server } from "node:net";
-import { CodexAdapter } from "../codex-adapter";
+import { CodexAdapter, buildCodexAppServerArgs } from "../codex-adapter";
 
 function createAdapter() {
   return new CodexAdapter({ appPort: 4510, proxyPort: 4511 }) as any;
@@ -1776,5 +1776,44 @@ describe("CodexAdapter echo dedup (spec v2.2 §4.5)", () => {
     expect(events.length).toBe(1);
     // Expired entry should have been cleaned up by isEchoOfInjection
     expect(adapter.injectedTurnIds.has("turn_old")).toBe(false);
+  });
+});
+
+// ── Sprint #3 (2026-05-17 codex_msg_..._177): sandbox flag propagation ──
+//
+// Codex sandbox is decided server-side (the app-server spawned by daemon),
+// not by the TUI in --remote mode. Before this, `abg codex --sandbox
+// workspace-write` set the flag on the TUI process which had no effect on
+// the daemon-owned app-server, leaving Codex effectively read-only and
+// breaking `apply_patch`. Helper now propagates sandbox into the app-server
+// spawn argv.
+
+describe("buildCodexAppServerArgs (sandbox propagation)", () => {
+  test("returns base args when no sandbox", () => {
+    expect(buildCodexAppServerArgs("ws://127.0.0.1:4500")).toEqual(
+      ["app-server", "--listen", "ws://127.0.0.1:4500"],
+    );
+    expect(buildCodexAppServerArgs("ws://127.0.0.1:4500", undefined)).toEqual(
+      ["app-server", "--listen", "ws://127.0.0.1:4500"],
+    );
+  });
+
+  test("appends --sandbox MODE when sandbox provided", () => {
+    expect(buildCodexAppServerArgs("ws://127.0.0.1:4500", "workspace-write")).toEqual(
+      ["app-server", "--listen", "ws://127.0.0.1:4500", "--sandbox", "workspace-write"],
+    );
+    expect(buildCodexAppServerArgs("ws://127.0.0.1:4510", "read-only")).toEqual(
+      ["app-server", "--listen", "ws://127.0.0.1:4510", "--sandbox", "read-only"],
+    );
+    // Pass-through any string — codex itself validates the value, the
+    // helper does not gate on a hardcoded list (which would go stale if
+    // codex adds modes).
+    expect(buildCodexAppServerArgs("ws://127.0.0.1:4500", "danger-full-access")).toContain("danger-full-access");
+  });
+
+  test("empty string is treated as 'no sandbox' (no flag appended)", () => {
+    expect(buildCodexAppServerArgs("ws://127.0.0.1:4500", "")).toEqual(
+      ["app-server", "--listen", "ws://127.0.0.1:4500"],
+    );
   });
 });

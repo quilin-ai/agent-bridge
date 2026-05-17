@@ -197,11 +197,13 @@ type CodexConnectionMode = "direct" | "proxy";
 function extractCliFlags(args: string[]): {
   mode: CodexConnectionMode;
   pairId: string;
+  sandbox?: string;
   rest: string[];
 } {
   const rest: string[] = [];
   let mode: CodexConnectionMode = "direct";
   let pairId = "default";
+  let sandbox: string | undefined;
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if (a === "--via-proxy") {
@@ -236,13 +238,43 @@ function extractCliFlags(args: string[]): {
       }
       continue;
     }
+    // Sandbox flag — propagates to the daemon-spawned codex app-server
+    // (not just the TUI). Without this, even `abg codex --via-proxy
+    // --sandbox workspace-write` left the app-server at the default
+    // read-only mode, breaking `apply_patch` end-to-end. Per Codex sprint
+    // ranking 2026-05-17 (msg codex_msg_..._177) #3 ROI item.
+    if (a === "--sandbox") {
+      if (i + 1 >= args.length) {
+        console.error(`Error: --sandbox requires a value (e.g. \`--sandbox workspace-write\`).`);
+        process.exit(1);
+      }
+      sandbox = args[i + 1];
+      i++;
+      continue;
+    }
+    if (a.startsWith("--sandbox=")) {
+      sandbox = a.slice("--sandbox=".length);
+      if (!sandbox) {
+        console.error(`Error: --sandbox= requires a value (e.g. \`--sandbox=workspace-write\`).`);
+        process.exit(1);
+      }
+      continue;
+    }
     rest.push(a);
   }
-  return { mode, pairId, rest };
+  return { mode, pairId, sandbox, rest };
 }
 
 export async function runCodex(rawArgs: string[]) {
-  const { mode, pairId, rest: args } = extractCliFlags(rawArgs);
+  const { mode, pairId, sandbox, rest: args } = extractCliFlags(rawArgs);
+
+  // Pass sandbox to daemon (read at codex app-server spawn time). Set BEFORE
+  // ensureRunning() so the env is in place if the daemon spawn happens now.
+  // Note: if the daemon is already running with a different value, this
+  // export is a no-op for that daemon — kill + restart to switch sandboxes.
+  if (sandbox) {
+    process.env.AGENTBRIDGE_CODEX_SANDBOX = sandbox;
+  }
 
   // STM v2.3 §D1 P4: CLI-side validation of --pair NAME. Reject locally
   // with a clear message before any daemon round-trip — the daemon's

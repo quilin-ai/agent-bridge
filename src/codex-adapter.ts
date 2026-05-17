@@ -75,6 +75,17 @@ interface PendingRequest {
   threadId?: string;
 }
 
+/**
+ * Build argv for spawning the codex app-server child process.
+ * Extracted so unit tests can assert sandbox propagation without
+ * touching `spawn`. Used by CodexAdapter.start.
+ */
+export function buildCodexAppServerArgs(appServerUrl: string, sandbox?: string): string[] {
+  const args = ["app-server", "--listen", appServerUrl];
+  if (sandbox) args.push("--sandbox", sandbox);
+  return args;
+}
+
 export class CodexAdapter extends EventEmitter {
   private static readonly RESPONSE_TRACKING_TTL_MS = 30000;
 
@@ -196,8 +207,10 @@ export class CodexAdapter extends EventEmitter {
   async start() {
     this.intentionalDisconnect = false;
     await this.checkPorts();
-    this.log(`Spawning codex app-server on ${this.appServerUrl}`);
-    this.proc = spawn("codex", ["app-server", "--listen", this.appServerUrl], {
+    const sandbox = process.env.AGENTBRIDGE_CODEX_SANDBOX;
+    const args = buildCodexAppServerArgs(this.appServerUrl, sandbox);
+    this.log(`Spawning codex app-server on ${this.appServerUrl}${sandbox ? ` (sandbox=${sandbox})` : ""}`);
+    this.proc = spawn("codex", args, {
       stdio: ["pipe", "pipe", "pipe"],
     });
 

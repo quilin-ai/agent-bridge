@@ -178,6 +178,13 @@ function isAppServerResponseMessage(value) {
 }
 
 // src/codex-adapter.ts
+function buildCodexAppServerArgs(appServerUrl, sandbox) {
+  const args = ["app-server", "--listen", appServerUrl];
+  if (sandbox)
+    args.push("--sandbox", sandbox);
+  return args;
+}
+
 class CodexAdapter extends EventEmitter {
   static RESPONSE_TRACKING_TTL_MS = 30000;
   proc = null;
@@ -246,8 +253,10 @@ class CodexAdapter extends EventEmitter {
   async start() {
     this.intentionalDisconnect = false;
     await this.checkPorts();
-    this.log(`Spawning codex app-server on ${this.appServerUrl}`);
-    this.proc = spawn("codex", ["app-server", "--listen", this.appServerUrl], {
+    const sandbox = process.env.AGENTBRIDGE_CODEX_SANDBOX;
+    const args = buildCodexAppServerArgs(this.appServerUrl, sandbox);
+    this.log(`Spawning codex app-server on ${this.appServerUrl}${sandbox ? ` (sandbox=${sandbox})` : ""}`);
+    this.proc = spawn("codex", args, {
       stdio: ["pipe", "pipe", "pipe"]
     });
     this.proc.on("error", (err) => this.emit("error", err));
