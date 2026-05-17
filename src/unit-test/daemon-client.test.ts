@@ -394,6 +394,31 @@ describe("DaemonClient", () => {
     expect(elapsed).toBeLessThan(2000);
   });
 
+  test("P5e DAEMON_SHUTTING_DOWN: pending attachClaude resolves with ok=false when daemon disconnects", async () => {
+    // Don't reply to claude_connect — leave it pending. Then close the
+    // server side. attachClaude should resolve with ok=false carrying
+    // the DAEMON_SHUTTING_DOWN sentinel rather than timing out to ok.
+    onServerMessage = () => { /* swallow */ };
+    await client.connect();
+
+    const attachPromise = client.attachClaude(10_000); // generous timeout
+
+    // Give the request a tick to land on the server.
+    await new Promise((r) => setTimeout(r, 50));
+
+    // Daemon side closes — simulates SIGTERM mid-handshake.
+    for (const ws of serverSockets) {
+      ws.close();
+    }
+
+    const result = await attachPromise;
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error).toBe("DAEMON_SHUTTING_DOWN");
+      expect(result.message).toContain("interrupted");
+    }
+  });
+
   test("P4 attachClaude: ignores claude_connect_result with mismatched requestId", async () => {
     // Daemon sends a response with WRONG requestId (e.g. crossed wires).
     // attachClaude should treat this as no response and timeout-to-ok.
