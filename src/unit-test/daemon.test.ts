@@ -1218,3 +1218,81 @@ describe("daemon log() EPIPE handling (Bug regression E 2026-05-17)", () => {
     }
   });
 });
+
+// ── Issue #82 (2026-05-17): ClaudeThread WS close lifecycle handling ──
+//
+// Before fix: state.thread.on("close") only flipped state.ready=false.
+// On app-server crash the chat stayed in `chats` forever; subsequent
+// reply attempts hit "thread still provisioning" with no recovery path.
+//
+// After fix: close triggers system_thread_failed + reapChatState, which
+// closes the bridge WS with 1011 and removes the chat. Bridge auto-
+// reconnect runs the new-chat path with fresh bootstrap. Guarded by
+// `shuttingDown` (don't reap during daemon SIGTERM) and a stale-state
+// check (don't recursively reap when reapChatState itself triggered the
+// close event).
+
+describe("Issue #82 — ClaudeThread WS close lifecycle (2026-05-17)", () => {
+  test("unexpected close reaps the chat and emits system_thread_failed", () => {
+    const chat = fns.createChatState("chat-issue-82-reap");
+    chat.ready = true;
+    chats.set(chat.chatId, chat);
+    (fns as any).wireClaudeThreadEvents(chat);
+
+    // Sanity: chat is in registry before close.
+    expect(chats.has(chat.chatId)).toBe(true);
+
+    // Simulate app-server crash via ClaudeThread emitting "close".
+    chat.thread.emit("close");
+
+    // Chat was reaped → removed from registry.
+    expect(chats.has(chat.chatId)).toBe(false);
+    // ready was flipped (handler runs the assignment before the guard
+    // check, so even guarded paths still mark stale).
+    expect(chat.ready).toBe(false);
+    // system_thread_failed was buffered onto the chat (no live WS in
+    // this unit test, so emitToChat buffers).
+    const fail = chat.bufferedMessages.find((m) => m.id.startsWith("system_thread_failed_"));
+    expect(fail).toBeDefined();
+    expect(fail?.content ?? "").toMatch(/Lost connection to Codex app-server/);
+  });
+
+  test("close during shuttingDown does NOT reap (avoid teardown cascade noise)", () => {
+    const chat = fns.createChatState("chat-issue-82-shutdown");
+    chats.set(chat.chatId, chat);
+    (fns as any).wireClaudeThreadEvents(chat);
+
+    (fns as any).setShuttingDownForTest(true);
+    try {
+      chat.thread.emit("close");
+      // Chat NOT reaped — still in registry. shuttingDown short-circuits
+      // before reapChatState runs.
+      expect(chats.has(chat.chatId)).toBe(true);
+      // No system_thread_failed buffered (the emit happens after the
+      // shuttingDown guard).
+      const fail = chat.bufferedMessages.find((m) => m.id.startsWith("system_thread_failed_"));
+      expect(fail).toBeUndefined();
+    } finally {
+      (fns as any).setShuttingDownForTest(false);
+      __testing.chats.delete(chat.chatId);
+    }
+  });
+
+  test("close after reapChatState already removed chat does NOT recurse", () => {
+    const chat = fns.createChatState("chat-issue-82-recurse");
+    chats.set(chat.chatId, chat);
+    (fns as any).wireClaudeThreadEvents(chat);
+
+    // Pre-remove from chats — simulates the path where reapChatState
+    // already ran (e.g. it called state.thread.close() which is about to
+    // emit close on the now-stale handler).
+    chats.delete(chat.chatId);
+
+    const beforeBuffered = chat.bufferedMessages.length;
+
+    // Emitting close on the stale handler: guard catches `chats.get
+    // !== state` and returns. No recursive reap, no extra system message.
+    expect(() => chat.thread.emit("close")).not.toThrow();
+    expect(chat.bufferedMessages.length).toBe(beforeBuffered);
+  });
+});

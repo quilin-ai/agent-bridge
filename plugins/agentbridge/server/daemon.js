@@ -3383,6 +3383,12 @@ function wireClaudeThreadEvents(state) {
   state.thread.on("close", () => {
     log(`[${chatId}] ClaudeThread WS closed`);
     state.ready = false;
+    if (shuttingDown)
+      return;
+    if (chats.get(chatId) !== state)
+      return;
+    emitToChat(state, systemMessage("system_thread_failed", "\u274C Lost connection to Codex app-server. Reconnect to retry \u2014 bridge will provision a fresh thread."));
+    reapChatState(state, "ClaudeThread WS closed unexpectedly (app-server crash or upstream failure)");
   });
   state.thread.on("error", (err) => {
     log(`[${chatId}] ClaudeThread error: ${err?.message ?? err}`);
@@ -3956,7 +3962,11 @@ var __testing = {
     handleDestroyPair,
     handleListPairs,
     attachClaude,
-    log
+    log,
+    wireClaudeThreadEvents,
+    setShuttingDownForTest(value) {
+      shuttingDown = value;
+    }
   },
   pairRegistry,
   runUnderRegistryMutex,

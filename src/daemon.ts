@@ -1280,6 +1280,34 @@ function wireClaudeThreadEvents(state: ChatState): void {
   state.thread.on("close", () => {
     log(`[${chatId}] ClaudeThread WS closed`);
     state.ready = false;
+
+    // Issue #82 (2026-05-17): app-server crash / unexpected upstream WS
+    // close. Before this guard the chat stayed in `chats` with
+    // ready=false forever — reply attempts hit "thread still provisioning"
+    // and the user had no recovery path short of restarting Claude Code.
+    // Reap drives the bridge through the same recovery loop as the
+    // bootstrap-failure case (commit 18f60d8): close 1011 → bridge auto-
+    // reconnect → fresh bootstrap. If the app-server is back the new
+    // bootstrap succeeds; if not, the bootstrap-failure reap kicks in
+    // and bridge enters disabled state cleanly.
+    //
+    // Two guards prevent unwanted re-reaping:
+    //  1. shuttingDown — during daemon SIGTERM all ClaudeThread WSs
+    //     close in cascade; reaping during shutdown is pointless (state
+    //     will be discarded) and writes noise to logs.
+    //  2. chats.get(chatId) !== state — if reapChatState already removed
+    //     this chat (so the close event we're seeing was caused by the
+    //     intentional state.thread.close() inside reapChatState), the
+    //     guard fails and we skip to avoid recursive re-entry. Also
+    //     covers the case where a new ChatState replaced this one (e.g.
+    //     bridge reconnected and got a fresh ChatState for the same
+    //     chatId before this stale handler fired).
+    if (shuttingDown) return;
+    if (chats.get(chatId) !== state) return;
+
+    emitToChat(state, systemMessage("system_thread_failed",
+      "❌ Lost connection to Codex app-server. Reconnect to retry — bridge will provision a fresh thread."));
+    reapChatState(state, "ClaudeThread WS closed unexpectedly (app-server crash or upstream failure)");
   });
 
   state.thread.on("error", (err: any) => {
@@ -2063,6 +2091,12 @@ export const __testing = {
     /** Bug regression E (2026-05-17): exposed so EPIPE/stderr-broken test
      * can drive log() directly and verify the sticky-flag short-circuit. */
     log,
+    /** Issue #82 (2026-05-17): exposed so tests can wire ClaudeThread
+     * event handlers onto stubbed ChatStates and emit close/error. */
+    wireClaudeThreadEvents,
+    /** Issue #82 (2026-05-17): exposed so tests can flip `shuttingDown`
+     * to assert close-handler guard behavior during shutdown. */
+    setShuttingDownForTest(value: boolean) { shuttingDown = value; },
   } as const,
   /** STM v2.3 §D2 P3b — registry handle (read for assertions; mutate via handlers). */
   pairRegistry,
