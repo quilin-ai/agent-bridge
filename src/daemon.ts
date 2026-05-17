@@ -521,7 +521,14 @@ function attachPairHandlers(pair: PairState): void {
 
   on("exit", (code: number | null) => {
     log(`[pair=${pair.pairId}] Codex app-server process exited (code ${code})`);
-    codexBootstrapped = false;
+    // Issue #84 (2026-05-17): `codexBootstrapped` is a default-pair
+    // bootstrap status flag (consumed by /healthz's `bridgeReady` field
+    // and certain ready-gating logic). Pre-fix this was set false on
+    // ANY pair's exit, leaking non-default crashes into top-level
+    // bridge-readiness reporting. Scope to the default pair only.
+    if (pair.pairId === "default") {
+      codexBootstrapped = false;
+    }
     // Bug fix (Codex P2 review codex_msg_5753c73beafc_95): clear `isLive`
     // so a subsequent `ensurePair(pair.pairId)` re-spawns the app-server
     // rather than no-op'ing on stale liveness state. Without this, ME6

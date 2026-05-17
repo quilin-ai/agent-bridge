@@ -2379,10 +2379,10 @@ import { readFileSync as readFileSync3, writeFileSync as writeFileSync3, renameS
 import { dirname as dirname2 } from "path";
 import { randomBytes } from "crypto";
 var DEFAULT_PAIR_PORTS = { appPort: 4500, proxyPort: 4501 };
-var STRIDE_BASE = parseInt(process.env.AGENTBRIDGE_PAIR_STRIDE_BASE ?? "4510", 10);
-var STRIDE_STEP_DEFAULT = parseInt(process.env.AGENTBRIDGE_PAIR_STRIDE_STEP ?? "10", 10);
-var STRIDE_MAX_DEFAULT = parseInt(process.env.AGENTBRIDGE_PAIR_STRIDE_MAX ?? "20", 10);
-var MAX_PAIRS_DEFAULT = parseInt(process.env.AGENTBRIDGE_PAIR_MAX_PAIRS ?? "8", 10);
+var STRIDE_BASE = 4510;
+var STRIDE_STEP_DEFAULT = 10;
+var STRIDE_MAX_DEFAULT = 20;
+var MAX_PAIRS_DEFAULT = 8;
 var PAIR_NAME_REGEX = /^[a-z0-9][a-z0-9_-]{0,31}$/;
 function isValidPairName(name) {
   if (typeof name !== "string")
@@ -2824,7 +2824,9 @@ ${payload.content}`,
   });
   on("exit", (code) => {
     log(`[pair=${pair.pairId}] Codex app-server process exited (code ${code})`);
-    codexBootstrapped = false;
+    if (pair.pairId === "default") {
+      codexBootstrapped = false;
+    }
     pair.isLive = false;
     pair.tuiConnectionState.handleCodexExit();
     const affectedChats = [];
