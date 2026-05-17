@@ -696,6 +696,27 @@ describe("E2E: CLI surface", () => {
       expect(errOutput).toMatch(/--pair value .*invalid|Allowed: lowercase/);
     });
   }, 15000);
+
+  // Codex batch review must-fix (msg ..._184): --sandbox is captured at
+  // daemon spawn time. If the daemon is already running when the user
+  // passes --sandbox, the flag is silently dropped without this warning.
+  test("agentbridge codex --sandbox warns when daemon is already running", async () => {
+    await withHarness(async (harness) => {
+      // Spin up daemon first via a no-sandbox codex invocation.
+      const first = await harness.runCli(["codex", "--model", "o3"]);
+      expect(first.code).toBe(0);
+      await harness.waitForHealth();
+
+      // Second invocation passes --sandbox — daemon is already running,
+      // so the env-var path is a no-op. CLI must surface a warning.
+      const second = await harness.runCli(["codex", "--sandbox", "workspace-write", "--model", "o3"]);
+      // Command should still succeed (warning, not error).
+      expect(second.code).toBe(0);
+      const errOutput = `${second.stdout}${second.stderr}`;
+      expect(errOutput).toMatch(/--sandbox.*ignored.*daemon is already running/);
+      expect(errOutput).toMatch(/abg kill && abg codex --sandbox=workspace-write/);
+    });
+  }, 30000);
 });
 
 async function withHarness(

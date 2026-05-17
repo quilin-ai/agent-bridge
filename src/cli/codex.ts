@@ -270,10 +270,24 @@ export async function runCodex(rawArgs: string[]) {
 
   // Pass sandbox to daemon (read at codex app-server spawn time). Set BEFORE
   // ensureRunning() so the env is in place if the daemon spawn happens now.
-  // Note: if the daemon is already running with a different value, this
-  // export is a no-op for that daemon — kill + restart to switch sandboxes.
+  // Limitation surfaced (Codex batch review 2026-05-17 msg ..._184): if a
+  // daemon is already running, it has already captured its env at spawn
+  // time — this export is a no-op for that daemon. Warn the user instead
+  // of silently dropping the flag.
   if (sandbox) {
-    process.env.AGENTBRIDGE_CODEX_SANDBOX = sandbox;
+    const probeLifecycle = new DaemonLifecycle({
+      stateDir: new StateDirResolver(),
+      controlPort: parseInt(process.env.AGENTBRIDGE_CONTROL_PORT ?? "4502", 10),
+      log: () => { /* silent probe — we only care about the boolean result */ },
+    });
+    const daemonAlreadyUp = await probeLifecycle.isHealthy();
+    if (daemonAlreadyUp) {
+      console.warn(`[agentbridge] Warning: --sandbox=${sandbox} ignored — daemon is already running.`);
+      console.warn(`[agentbridge]   The codex app-server sandbox was fixed at daemon spawn time.`);
+      console.warn(`[agentbridge]   To switch sandboxes: \`abg kill && abg codex --sandbox=${sandbox}\``);
+    } else {
+      process.env.AGENTBRIDGE_CODEX_SANDBOX = sandbox;
+    }
   }
 
   // STM v2.3 §D1 P4: CLI-side validation of --pair NAME. Reject locally

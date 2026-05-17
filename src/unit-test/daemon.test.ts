@@ -1295,4 +1295,48 @@ describe("Issue #82 — ClaudeThread WS close lifecycle (2026-05-17)", () => {
     expect(() => chat.thread.emit("close")).not.toThrow();
     expect(chat.bufferedMessages.length).toBe(beforeBuffered);
   });
+
+  // Codex batch review must-fix (msg codex_msg_..._184): the
+  // `state.thread !== threadAtRegistration` guard exists because
+  // bootstrapIsolatedThread retry and transitionToIsolated both close
+  // the OLD ClaudeThread and assign `state.thread = new ClaudeThread(...)`.
+  // The OLD thread's pending "close" event fires after replacement; without
+  // the captured-reference guard, that close would falsely reap the live
+  // chat (chats still contains the same ChatState, just with a different
+  // .thread).
+  test("close on the OLD thread after replacement does NOT reap the live chat", async () => {
+    const { ClaudeThread } = await import("../claude-thread");
+    const chat = fns.createChatState("chat-issue-82-stale-thread");
+    chats.set(chat.chatId, chat);
+    (fns as any).wireClaudeThreadEvents(chat);
+
+    const oldThread = chat.thread;
+
+    // Simulate transitionToIsolated / bootstrapIsolatedThread retry:
+    // close the old thread and immediately replace `state.thread` with a
+    // freshly constructed ClaudeThread (handlers re-wired in production
+    // code; here we don't re-wire since we only want to assert the OLD
+    // handler doesn't fire reap).
+    chat.thread = new ClaudeThread({
+      appServerUrl: "ws://127.0.0.1:24500",
+      chatId: chat.chatId,
+      logFile: "/tmp/agentbridge-test-stale-thread.log",
+      cwd: "/tmp",
+    });
+
+    const beforeChatsCount = chats.size;
+    const beforeBuffered = chat.bufferedMessages.length;
+
+    // Old thread's close event fires LATE (after replacement). Guard
+    // catches `state.thread !== threadAtRegistration` → return.
+    expect(() => oldThread.emit("close")).not.toThrow();
+
+    // Chat is still in chats Map. NOT reaped.
+    expect(chats.has(chat.chatId)).toBe(true);
+    expect(chats.size).toBe(beforeChatsCount);
+    // No system_thread_failed buffered.
+    expect(chat.bufferedMessages.length).toBe(beforeBuffered);
+    // The new thread is still the live one.
+    expect(chat.thread).not.toBe(oldThread);
+  });
 });

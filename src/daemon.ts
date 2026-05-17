@@ -1277,6 +1277,14 @@ function wireClaudeThreadEvents(state: ChatState): void {
     startAttentionWindow(state);
   });
 
+  // Capture the thread reference at registration time. bootstrapIsolatedThread
+  // retry and transitionToIsolated both intentionally `state.thread.close()`
+  // then assign `state.thread = new ClaudeThread(...)`. The CLOSE event
+  // fires on the OLD thread reference but `state.thread` now points to
+  // the NEW one. Without this capture, the close handler can't tell
+  // "this was an intentional swap" apart from "the active thread crashed".
+  // (Codex cross-review batch #1-#5, 2026-05-17.)
+  const threadAtRegistration = state.thread;
   state.thread.on("close", () => {
     log(`[${chatId}] ClaudeThread WS closed`);
     state.ready = false;
@@ -1291,11 +1299,16 @@ function wireClaudeThreadEvents(state: ChatState): void {
     // bootstrap succeeds; if not, the bootstrap-failure reap kicks in
     // and bridge enters disabled state cleanly.
     //
-    // Two guards prevent unwanted re-reaping:
+    // Three guards prevent unwanted re-reaping:
     //  1. shuttingDown — during daemon SIGTERM all ClaudeThread WSs
     //     close in cascade; reaping during shutdown is pointless (state
     //     will be discarded) and writes noise to logs.
-    //  2. chats.get(chatId) !== state — if reapChatState already removed
+    //  2. state.thread !== threadAtRegistration — if the thread was
+    //     intentionally swapped (bootstrapIsolatedThread retry,
+    //     transitionToIsolated), the close fires on the OLD reference
+    //     but state.thread now points to the NEW one. Skip — the new
+    //     thread is the live one, not the one that closed.
+    //  3. chats.get(chatId) !== state — if reapChatState already removed
     //     this chat (so the close event we're seeing was caused by the
     //     intentional state.thread.close() inside reapChatState), the
     //     guard fails and we skip to avoid recursive re-entry. Also
@@ -1303,6 +1316,7 @@ function wireClaudeThreadEvents(state: ChatState): void {
     //     bridge reconnected and got a fresh ChatState for the same
     //     chatId before this stale handler fired).
     if (shuttingDown) return;
+    if (state.thread !== threadAtRegistration) return;
     if (chats.get(chatId) !== state) return;
 
     emitToChat(state, systemMessage("system_thread_failed",

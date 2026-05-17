@@ -3380,10 +3380,13 @@ function wireClaudeThreadEvents(state) {
     emitToChat(state, systemMessage("system_turn_completed", "\u2705 Codex finished the current turn. You can reply now if needed."));
     startAttentionWindow(state);
   });
+  const threadAtRegistration = state.thread;
   state.thread.on("close", () => {
     log(`[${chatId}] ClaudeThread WS closed`);
     state.ready = false;
     if (shuttingDown)
+      return;
+    if (state.thread !== threadAtRegistration)
       return;
     if (chats.get(chatId) !== state)
       return;
