@@ -1762,18 +1762,30 @@ async function ensurePairCore(pairId: string): Promise<PairState> {
       /address already in use/i.test(errMsg) ||
       /port.*in use/i.test(errMsg);
     if (looksLikePortBusy) {
-      // Try to extract which port conflicted from the message so the CLI
-      // can surface a specific PID/port pointer. Pattern: `:NNNN` or `port NNNN`.
+      // STM v2.3 P5c: parse the canonical CodexAdapter.checkPorts error
+      // first since it carries both port AND PID:
+      //   "Port 4500 is already in use by non-Codex process(es): PID(s) 12345, 67890."
+      // Fall back to generic `:NNNN` port-only patterns if the error came
+      // from somewhere else (e.g. Bun.serve raw EADDRINUSE).
       let conflictPort: number | undefined;
-      const portMatch = errMsg.match(/(?::|port[\s=]+|address[\s=]+[\w:.]+:)(\d{2,5})/i);
-      if (portMatch) {
-        const candidate = parseInt(portMatch[1], 10);
-        if (Number.isFinite(candidate)) conflictPort = candidate;
+      let conflictPid: number | undefined;
+      const checkPortsMatch = errMsg.match(/Port (\d{2,5}) is already in use[^:]*:\s*PID\(s\)\s*([\d,\s]+)/i);
+      if (checkPortsMatch) {
+        const portCandidate = parseInt(checkPortsMatch[1], 10);
+        if (Number.isFinite(portCandidate)) conflictPort = portCandidate;
+        const pidCandidate = parseInt(checkPortsMatch[2].split(",")[0]?.trim() ?? "", 10);
+        if (Number.isFinite(pidCandidate)) conflictPid = pidCandidate;
+      } else {
+        const portMatch = errMsg.match(/(?::|port[\s=]+|address[\s=]+[\w:.]+:)(\d{2,5})/i);
+        if (portMatch) {
+          const candidate = parseInt(portMatch[1], 10);
+          if (Number.isFinite(candidate)) conflictPort = candidate;
+        }
       }
       throw new PairError(
         "PAIR_PORTS_BUSY",
         `pair "${pair.pairId}" ports (appPort=${pair.codex.appServerUrl}, proxyPort=${pair.codex.proxyUrl}) are held by another process: ${errMsg}`,
-        { conflictPort },
+        { conflictPort, conflictPid },
       );
     }
     throw err;

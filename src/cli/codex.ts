@@ -339,8 +339,14 @@ export async function runCodex(rawArgs: string[]) {
       console.error(`[agentbridge] Error: ports for pair "${pairId}" are held by another process.`);
       console.error(`  ${err.message ?? ""}`);
       const conflictPort = err.details?.conflictPort;
+      const conflictPid = err.details?.conflictPid;
       if (conflictPort) {
         console.error(`  Conflicting port: ${conflictPort}`);
+      }
+      if (conflictPid) {
+        console.error(`  Conflicting PID: ${conflictPid} (inspect with \`ps -p ${conflictPid} -o args=\`)`);
+      }
+      if (conflictPort || conflictPid) {
         console.error(`  Stop that process or use \`abg pairs rm ${pairId} --forget\` to release the registry entry and try again.`);
       } else {
         console.error(`  Stop the conflicting process or use \`abg pairs rm ${pairId} --forget\` to release the registry entry.`);

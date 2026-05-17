@@ -3701,13 +3701,24 @@ async function ensurePairCore(pairId) {
     const looksLikePortBusy = errCode === "EADDRINUSE" || /EADDRINUSE/i.test(errMsg) || /address already in use/i.test(errMsg) || /port.*in use/i.test(errMsg);
     if (looksLikePortBusy) {
       let conflictPort;
-      const portMatch = errMsg.match(/(?::|port[\s=]+|address[\s=]+[\w:.]+:)(\d{2,5})/i);
-      if (portMatch) {
-        const candidate = parseInt(portMatch[1], 10);
-        if (Number.isFinite(candidate))
-          conflictPort = candidate;
+      let conflictPid;
+      const checkPortsMatch = errMsg.match(/Port (\d{2,5}) is already in use[^:]*:\s*PID\(s\)\s*([\d,\s]+)/i);
+      if (checkPortsMatch) {
+        const portCandidate = parseInt(checkPortsMatch[1], 10);
+        if (Number.isFinite(portCandidate))
+          conflictPort = portCandidate;
+        const pidCandidate = parseInt(checkPortsMatch[2].split(",")[0]?.trim() ?? "", 10);
+        if (Number.isFinite(pidCandidate))
+          conflictPid = pidCandidate;
+      } else {
+        const portMatch = errMsg.match(/(?::|port[\s=]+|address[\s=]+[\w:.]+:)(\d{2,5})/i);
+        if (portMatch) {
+          const candidate = parseInt(portMatch[1], 10);
+          if (Number.isFinite(candidate))
+            conflictPort = candidate;
+        }
       }
-      throw new PairError("PAIR_PORTS_BUSY", `pair "${pair.pairId}" ports (appPort=${pair.codex.appServerUrl}, proxyPort=${pair.codex.proxyUrl}) are held by another process: ${errMsg}`, { conflictPort });
+      throw new PairError("PAIR_PORTS_BUSY", `pair "${pair.pairId}" ports (appPort=${pair.codex.appServerUrl}, proxyPort=${pair.codex.proxyUrl}) are held by another process: ${errMsg}`, { conflictPort, conflictPid });
     }
     throw err;
   }

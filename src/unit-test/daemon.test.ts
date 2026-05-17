@@ -872,6 +872,44 @@ describe("daemon bug regressions (2026-05-16 STM v2.2 review)", () => {
     }
   });
 
+  test("P5c PAIR_PORTS_BUSY: parses port + PID from CodexAdapter.checkPorts error message", async () => {
+    const { CodexAdapter } = await import("../codex-adapter");
+    const originalStart = (CodexAdapter.prototype as any).start;
+    (CodexAdapter.prototype as any).start = async function () {
+      // Canonical checkPorts error format (matches src/codex-adapter.ts:1832).
+      throw new Error("Port 4520 is already in use by non-Codex process(es): PID(s) 12345. Please stop the process or set a different port.");
+    };
+    if (__testing.pairRegistry.has("pid-pair")) {
+      await __testing.runUnderRegistryMutex(async () => {
+        __testing.pairRegistry.remove("pid-pair");
+        __testing.pairRegistry.save();
+      });
+    }
+    try {
+      const { ws, sent } = makeMockWs();
+      await fns.handleEnsurePair(ws, {
+        type: "ensure_pair",
+        requestId: "req-pid",
+        pairId: "pid-pair",
+      });
+      expect(sent[0].type).toBe("pair_error");
+      expect(sent[0].code).toBe("PAIR_PORTS_BUSY");
+      expect(sent[0].details?.conflictPort).toBe(4520);
+      expect(sent[0].details?.conflictPid).toBe(12345);
+    } finally {
+      (CodexAdapter.prototype as any).start = originalStart;
+      const pair = __testing.pairs.get("pid-pair");
+      if (pair) {
+        try { fns.detachPairHandlers(pair); } catch {}
+        __testing.pairs.delete("pid-pair");
+      }
+      await __testing.runUnderRegistryMutex(async () => {
+        __testing.pairRegistry.remove("pid-pair");
+        __testing.pairRegistry.save();
+      });
+    }
+  });
+
   test("P3-cleanup MEDIUM: codex.start EADDRINUSE maps to PAIR_PORTS_BUSY with details", async () => {
     const { CodexAdapter } = await import("../codex-adapter");
     const originalStart = (CodexAdapter.prototype as any).start;
