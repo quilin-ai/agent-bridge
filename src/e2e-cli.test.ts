@@ -236,7 +236,11 @@ class CliE2EHarness {
     );
   }
 
-  readShimCalls(command: "claude" | "codex"): Array<{ args: string[]; cwd: string }> {
+  readShimCalls(command: "claude" | "codex"): Array<{
+    args: string[];
+    cwd: string;
+    env?: Record<string, string | null>;
+  }> {
     const logPath = join(this.shimLogDir, `${command}.jsonl`);
     return readJsonLines(logPath);
   }
@@ -415,7 +419,7 @@ describe("E2E: CLI surface", () => {
     });
   });
 
-  test("agentbridge codex ensures daemon is running and injects remote args", async () => {
+  test("agentbridge codex ensures daemon is running and injects direct remote args", async () => {
     await withHarness(async (harness) => {
       const result = await harness.runCli(["codex", "--model", "o3"]);
 
@@ -425,6 +429,7 @@ describe("E2E: CLI surface", () => {
       expect(harness.readLaunches()).toHaveLength(1);
       expect(harness.readPid()).not.toBeNull();
       expect(harness.readStatus()?.proxyUrl).toBe(`ws://127.0.0.1:${harness.proxyPort}`);
+      expect(harness.readStatus()?.appServerUrl).toBe(`ws://127.0.0.1:${harness.appPort}`);
       expect(harness.readTuiPid()).toBeNull();
 
       const invocations = harness
@@ -435,10 +440,36 @@ describe("E2E: CLI surface", () => {
         "--enable",
         "tui_app_server",
         "--remote",
-        `ws://127.0.0.1:${harness.proxyPort}`,
+        `ws://127.0.0.1:${harness.appPort}`,
         "--model",
         "o3",
       ]);
+    });
+  }, 20000);
+
+  test("agentbridge codex --via-proxy uses bearer auth token instead of query URL", async () => {
+    await withHarness(async (harness) => {
+      const result = await harness.runCli(["codex", "--via-proxy", "--model", "o3"]);
+
+      expect(result.code).toBe(0);
+      await harness.waitForHealth();
+
+      const invocations = harness
+        .readShimCalls("codex")
+        .filter((entry) => entry.args[0] !== "--version");
+      expect(invocations).toHaveLength(1);
+      expect(invocations[0]?.args).toEqual([
+        "--enable",
+        "tui_app_server",
+        "--remote",
+        `ws://127.0.0.1:${harness.proxyPort}`,
+        "--remote-auth-token-env",
+        "AGENTBRIDGE_PROXY_TOKEN",
+        "--model",
+        "o3",
+      ]);
+      expect(invocations[0]?.args.join(" ")).not.toContain("abg_token=");
+      expect(invocations[0]?.env?.AGENTBRIDGE_PROXY_TOKEN).toMatch(/^[0-9a-f]{16}$/);
     });
   }, 20000);
 
@@ -447,6 +478,10 @@ describe("E2E: CLI surface", () => {
       const remoteConflict = await harness.runCli(["codex", "--remote", "ws://127.0.0.1:7777"]);
       expect(remoteConflict.code).toBe(1);
       expect(remoteConflict.stderr).toContain("\"--remote\" is automatically set by agentbridge codex");
+
+      const remoteAuthConflict = await harness.runCli(["codex", "--remote-auth-token-env", "TOKEN"]);
+      expect(remoteAuthConflict.code).toBe(1);
+      expect(remoteAuthConflict.stderr).toContain("\"--remote-auth-token-env\" is automatically set by agentbridge codex");
 
       const enableConflict = await harness.runCli(["codex", "--enable", "tui_app_server"]);
       expect(enableConflict.code).toBe(1);
@@ -457,7 +492,7 @@ describe("E2E: CLI surface", () => {
     });
   });
 
-  test("agentbridge codex reuses healthy daemon and prefers status.json proxyUrl", async () => {
+  test("agentbridge codex reuses healthy daemon and prefers status.json appServerUrl", async () => {
     await withHarness({ configProxyPort: 49991 }, async (harness) => {
       const daemonProc = await harness.startManagedFakeDaemon();
       const pidBefore = harness.readPid();
@@ -478,7 +513,7 @@ describe("E2E: CLI surface", () => {
         "--enable",
         "tui_app_server",
         "--remote",
-        `ws://127.0.0.1:${harness.proxyPort}`,
+        `ws://127.0.0.1:${harness.appPort}`,
         "--profile",
         "default",
       ]);
@@ -505,7 +540,7 @@ describe("E2E: CLI surface", () => {
       for (const invocation of invocations) {
         expect(invocation.args[0]).toBe("--enable");
         expect(invocation.args[2]).toBe("--remote");
-        expect(invocation.args[3]).toBe(`ws://127.0.0.1:${harness.proxyPort}`);
+        expect(invocation.args[3]).toBe(`ws://127.0.0.1:${harness.appPort}`);
       }
     });
   }, 30000);
@@ -595,7 +630,91 @@ describe("E2E: CLI surface", () => {
       const codexRun = harness
         .readShimCalls("codex")
         .find((entry) => entry.args[0] === "--enable");
-      expect(codexRun?.args[3]).toBe(`ws://127.0.0.1:${harness.proxyPort}`);
+      expect(codexRun?.args[3]).toBe(`ws://127.0.0.1:${harness.appPort}`);
+    });
+  }, 30000);
+
+  // ── Sprint #5 (2026-05-17 codex_msg_..._177): CLI e2e for --pair / pairs ──
+  //
+  // Unit tests already cover pair-registry logic, control-protocol shapes,
+  // and CLI flag parsing in isolation. These e2e tests verify that the
+  // user-facing entry points (`abg pairs ls`, `abg pairs rm`, `abg codex
+  // --pair NAME`) actually round-trip with a daemon and surface the right
+  // exit codes + error messages. Fake daemon (above) handles the pair WS
+  // protocol with a minimal in-memory pairs Map.
+
+  test("agentbridge pairs ls lists the default pair after daemon spins up", async () => {
+    await withHarness(async (harness) => {
+      // Spin up daemon via `codex` (creates it as a side-effect of ensureRunning).
+      const codexResult = await harness.runCli(["codex", "--model", "o3"]);
+      expect(codexResult.code).toBe(0);
+      await harness.waitForHealth();
+
+      const lsResult = await harness.runCli(["pairs", "ls"]);
+      expect(lsResult.code).toBe(0);
+      // Default pair should be in the listing. Output uses table format
+      // — assert on the pairId text without depending on column layout.
+      expect(lsResult.stdout).toContain("default");
+    });
+  }, 30000);
+
+  test("agentbridge pairs rm rejects 'default' (PAIR_PROTECTED) with non-zero exit", async () => {
+    await withHarness(async (harness) => {
+      const codexResult = await harness.runCli(["codex", "--model", "o3"]);
+      expect(codexResult.code).toBe(0);
+      await harness.waitForHealth();
+
+      const rmResult = await harness.runCli(["pairs", "rm", "default", "--force"]);
+      expect(rmResult.code).not.toBe(0);
+      // CLI surfaces the daemon's pair_error to the user — assert the
+      // error code or human message is shown.
+      const errOutput = `${rmResult.stdout}${rmResult.stderr}`;
+      expect(errOutput).toMatch(/PAIR_PROTECTED|cannot be destroyed/);
+    });
+  }, 30000);
+
+  test("agentbridge pairs rm rejects unknown pair (PAIR_NOT_FOUND)", async () => {
+    await withHarness(async (harness) => {
+      const codexResult = await harness.runCli(["codex", "--model", "o3"]);
+      expect(codexResult.code).toBe(0);
+      await harness.waitForHealth();
+
+      const rmResult = await harness.runCli(["pairs", "rm", "nonexistent-pair", "--force"]);
+      expect(rmResult.code).not.toBe(0);
+      const errOutput = `${rmResult.stdout}${rmResult.stderr}`;
+      expect(errOutput).toMatch(/PAIR_NOT_FOUND|not found/);
+    });
+  }, 30000);
+
+  test("agentbridge codex --pair rejects invalid pair name locally (no daemon round-trip)", async () => {
+    await withHarness(async (harness) => {
+      // No daemon needed — local validation should kick in immediately.
+      // Invalid name violates D1: uppercase letters not allowed.
+      const result = await harness.runCli(["codex", "--pair", "BadName", "--via-proxy"]);
+      expect(result.code).not.toBe(0);
+      const errOutput = `${result.stdout}${result.stderr}`;
+      expect(errOutput).toMatch(/--pair value .*invalid|Allowed: lowercase/);
+    });
+  }, 15000);
+
+  // Codex batch review must-fix (msg ..._184): --sandbox is captured at
+  // daemon spawn time. If the daemon is already running when the user
+  // passes --sandbox, the flag is silently dropped without this warning.
+  test("agentbridge codex --sandbox warns when daemon is already running", async () => {
+    await withHarness(async (harness) => {
+      // Spin up daemon first via a no-sandbox codex invocation.
+      const first = await harness.runCli(["codex", "--model", "o3"]);
+      expect(first.code).toBe(0);
+      await harness.waitForHealth();
+
+      // Second invocation passes --sandbox — daemon is already running,
+      // so the env-var path is a no-op. CLI must surface a warning.
+      const second = await harness.runCli(["codex", "--sandbox", "workspace-write", "--model", "o3"]);
+      // Command should still succeed (warning, not error).
+      expect(second.code).toBe(0);
+      const errOutput = `${second.stdout}${second.stderr}`;
+      expect(errOutput).toMatch(/--sandbox.*ignored.*daemon is already running/);
+      expect(errOutput).toMatch(/abg kill && abg codex --sandbox=workspace-write/);
     });
   }, 30000);
 });
@@ -789,7 +908,13 @@ mkdirSync(dirname(logPath), { recursive: true });
 const args = process.argv.slice(2);
 appendFileSync(
   logPath,
-  JSON.stringify({ args, cwd: process.cwd() }) + "\\n",
+  JSON.stringify({
+    args,
+    cwd: process.cwd(),
+    env: {
+      AGENTBRIDGE_PROXY_TOKEN: process.env.AGENTBRIDGE_PROXY_TOKEN ?? null,
+    },
+  }) + "\\n",
   "utf-8",
 );
 
@@ -849,6 +974,11 @@ if (delayMs > 0) {
 
 writeFileSync(pidFile, \`\${process.pid}\\n\`, "utf-8");
 
+// STM v2.3 pair state — in-memory only. Default pre-populated with the
+// harness-allocated ports. ensure_pair adds entries; destroy_pair removes.
+const pairs = new Map();
+pairs.set("default", { appPort, proxyPort, isLive: true });
+
 function currentStatus() {
   return {
     bridgeReady: false,
@@ -905,8 +1035,94 @@ const server = Bun.serve({
 
       if (message.type === "claude_connect" || message.type === "status") {
         ws.send(JSON.stringify({ type: "status", status: currentStatus() }));
+        return;
+      }
+
+      // STM v2.3 pair protocol — minimal fake-daemon implementation so
+      // CLI e2e tests can exercise the \`abg pairs ls/rm\` and
+      // \`abg codex --pair\` round-trips. Real daemon logic (registry
+      // persistence, port allocation strategy, etc.) is covered by unit
+      // tests; here we just need to respond with the protocol-correct
+      // shapes the CLI expects.
+      if (message.type === "list_pairs") {
+        const entries = Array.from(pairs.entries()).map(([pairId, p]) => ({
+          pairId,
+          isLive: p.isLive,
+          appServerUrl: \`ws://127.0.0.1:\${p.appPort}\`,
+          proxyUrl: \`ws://127.0.0.1:\${p.proxyPort}\`,
+          tuiConnected: false,
+          proxyTuiConnected: false,
+          pairedChatId: null,
+          threadId: null,
+          attachedClaudes: [],
+        }));
+        ws.send(JSON.stringify({ type: "pair_list", requestId: message.requestId, pairs: entries }));
+        return;
+      }
+
+      if (message.type === "ensure_pair") {
+        let entry = pairs.get(message.pairId);
+        if (!entry) {
+          // Allocate in 50000+ band so we never collide with real codex
+          // or the harness-reserved ports.
+          const newAppPort = 50000 + pairs.size * 2;
+          const newProxyPort = newAppPort + 1;
+          entry = { appPort: newAppPort, proxyPort: newProxyPort, isLive: true };
+          pairs.set(message.pairId, entry);
+        }
+        ws.send(JSON.stringify({
+          type: "pair_ensured",
+          requestId: message.requestId,
+          pairId: message.pairId,
+          appServerUrl: \`ws://127.0.0.1:\${entry.appPort}\`,
+          proxyUrl: \`ws://127.0.0.1:\${entry.proxyPort}\`,
+        }));
+        return;
+      }
+
+      if (message.type === "destroy_pair") {
+        if (message.pairId === "default") {
+          ws.send(JSON.stringify({
+            type: "pair_error",
+            requestId: message.requestId,
+            pairId: message.pairId,
+            code: "PAIR_PROTECTED",
+            message: "default pair cannot be destroyed",
+          }));
+          return;
+        }
+        if (!pairs.has(message.pairId)) {
+          ws.send(JSON.stringify({
+            type: "pair_error",
+            requestId: message.requestId,
+            pairId: message.pairId,
+            code: "PAIR_NOT_FOUND",
+            message: \`pair "\${message.pairId}" not found\`,
+          }));
+          return;
+        }
+        pairs.delete(message.pairId);
+        ws.send(JSON.stringify({
+          type: "pair_destroyed",
+          requestId: message.requestId,
+          pairId: message.pairId,
+          forgotten: Boolean(message.forget),
+        }));
+        return;
       }
     },
+  },
+});
+
+const appServer = Bun.serve({
+  port: appPort,
+  hostname: "127.0.0.1",
+  fetch(req) {
+    const url = new URL(req.url);
+    if (url.pathname === "/healthz" || url.pathname === "/readyz") {
+      return Response.json({ ok: true, appServerUrl });
+    }
+    return new Response("fake codex app-server");
   },
 });
 
@@ -925,6 +1141,7 @@ const proxyServer = Bun.serve({
 function shutdown() {
   cleanupFiles();
   server.stop();
+  appServer.stop();
   proxyServer.stop();
   process.exit(0);
 }

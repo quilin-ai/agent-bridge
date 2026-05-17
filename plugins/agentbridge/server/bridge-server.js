@@ -13714,6 +13714,21 @@ class StateDirResolver {
   get killedFile() {
     return join(this.stateDir, "killed");
   }
+  pairDir(pairId) {
+    return join(this.stateDir, "pairs", pairId);
+  }
+  pairCodexPidFile(pairId) {
+    return join(this.pairDir(pairId), "codex.pid");
+  }
+  pairCodexWrapperLogFile(pairId) {
+    return join(this.pairDir(pairId), "codex-wrapper.log");
+  }
+  ensurePairDir(pairId) {
+    const dir = this.pairDir(pairId);
+    if (!existsSync(dir)) {
+      mkdirSync(dir, { recursive: true });
+    }
+  }
 }
 
 // src/claude-adapter.ts
@@ -13758,6 +13773,7 @@ class ClaudeAdapter extends EventEmitter {
   sessionId;
   notificationIdPrefix;
   instanceId;
+  chatId;
   replySender = null;
   logFile;
   configuredMode;
@@ -13769,7 +13785,8 @@ class ClaudeAdapter extends EventEmitter {
     super();
     this.logFile = logFile;
     this.instanceId = randomUUID().slice(0, 8);
-    this.sessionId = `codex_${Date.now()}`;
+    this.sessionId = `codex_${Date.now()}_${this.instanceId}`;
+    this.chatId = this.sessionId;
     this.notificationIdPrefix = randomUUID().replace(/-/g, "").slice(0, 12);
     this.log(`ClaudeAdapter created (instance=${this.instanceId})`);
     const envMode = process.env.AGENTBRIDGE_MODE;
@@ -14004,9 +14021,20 @@ class DaemonClient extends EventEmitter2 {
   wsId = 0;
   nextRequestId = 1;
   pendingReplies = new Map;
-  constructor(url) {
+  pendingAttachReplies = new Map;
+  chatId;
+  pairId;
+  constructor(url, opts) {
     super();
     this.url = url;
+    this.chatId = opts?.chatId;
+    this.pairId = opts?.pairId;
+  }
+  setChatId(chatId) {
+    this.chatId = chatId;
+  }
+  setPairId(pairId) {
+    this.pairId = pairId;
   }
   async connect() {
     if (this.ws?.readyState === WebSocket.OPEN) {
@@ -14047,14 +14075,27 @@ class DaemonClient extends EventEmitter2 {
       };
     });
   }
-  attachClaude() {
-    this.send({ type: "claude_connect" });
+  async attachClaude(timeoutMs = 5000) {
+    const requestId = `attach_${Date.now()}_${this.nextRequestId++}`;
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        this.pendingAttachReplies.delete(requestId);
+        resolve({ ok: true, homePairId: null, paired: false });
+      }, timeoutMs);
+      this.pendingAttachReplies.set(requestId, { resolve, timer });
+      this.send({
+        type: "claude_connect",
+        requestId,
+        chatId: this.chatId,
+        pairId: this.pairId
+      });
+    });
   }
   async disconnect() {
     if (!this.ws)
       return;
     try {
-      this.send({ type: "claude_disconnect" });
+      this.send({ type: "claude_disconnect", chatId: this.chatId });
     } catch {}
     try {
       this.ws.close();
@@ -14076,6 +14117,7 @@ class DaemonClient extends EventEmitter2 {
       this.send({
         type: "claude_to_codex",
         requestId,
+        chatId: this.chatId,
         message,
         ...requireReply ? { requireReply: true } : {}
       });
@@ -14103,6 +14145,29 @@ class DaemonClient extends EventEmitter2 {
           pending.resolve({ success: message.success, error: message.error });
           return;
         }
+        case "claude_connect_result": {
+          if (!message.requestId)
+            return;
+          const pending = this.pendingAttachReplies.get(message.requestId);
+          if (!pending)
+            return;
+          clearTimeout(pending.timer);
+          this.pendingAttachReplies.delete(message.requestId);
+          if (message.ok) {
+            pending.resolve({
+              ok: true,
+              homePairId: message.homePairId,
+              paired: message.paired
+            });
+          } else {
+            pending.resolve({
+              ok: false,
+              error: message.error,
+              message: message.message
+            });
+          }
+          return;
+        }
         case "status":
           this.emit("status", message.status);
           return;
@@ -14128,6 +14193,15 @@ class DaemonClient extends EventEmitter2 {
       clearTimeout(pending.timer);
       pending.resolve({ success: false, error: error2 });
       this.pendingReplies.delete(requestId);
+    }
+    for (const [requestId, pending] of this.pendingAttachReplies.entries()) {
+      clearTimeout(pending.timer);
+      pending.resolve({
+        ok: false,
+        error: "DAEMON_SHUTTING_DOWN",
+        message: `claude_connect interrupted: ${error2}`
+      });
+      this.pendingAttachReplies.delete(requestId);
     }
   }
   send(message) {
@@ -14505,6 +14579,8 @@ function disabledReplyError(reason) {
       return "AgentBridge rejected this session \u2014 another Claude Code session is already connected. Close the other session first, or run `agentbridge kill` to reset.";
     case "killed":
       return "AgentBridge is disabled by `agentbridge kill`. Restart Claude Code (`agentbridge claude`), switch to a new conversation, or run `/resume` to reconnect.";
+    case "daemon_rejected_attach":
+      return "AgentBridge could not attach this Claude session \u2014 the daemon rejected the pair binding. See the most recent system message for the specific error (PAIR_NOT_FOUND / PAIR_BUSY / INVALID_PAIR_NAME). Restart Claude Code after fixing the underlying issue.";
   }
 }
 
@@ -14517,7 +14593,8 @@ var CONTROL_PORT = parseInt(process.env.AGENTBRIDGE_CONTROL_PORT ?? "4502", 10);
 var daemonLifecycle = new DaemonLifecycle({ stateDir, controlPort: CONTROL_PORT, log });
 var CONTROL_WS_URL = daemonLifecycle.controlWsUrl;
 var claude = new ClaudeAdapter(stateDir.logFile);
-var daemonClient = new DaemonClient(CONTROL_WS_URL);
+var PAIR_ID = process.env.AGENTBRIDGE_PAIR;
+var daemonClient = new DaemonClient(CONTROL_WS_URL, { chatId: claude.chatId, pairId: PAIR_ID });
 var shuttingDown = false;
 var daemonDisabled = false;
 var daemonDisabledReason = null;
@@ -14598,10 +14675,19 @@ async function connectToDaemon(isReconnect = false) {
   try {
     await daemonLifecycle.ensureRunning();
     await daemonClient.connect();
-    daemonClient.attachClaude();
+    const attachResult = await daemonClient.attachClaude();
+    if (!attachResult.ok) {
+      const pairCtx = PAIR_ID ? ` (requested pair: "${PAIR_ID}")` : "";
+      log(`Daemon rejected claude_connect: ${attachResult.error} \u2014 ${attachResult.message}${pairCtx}`);
+      daemonDisabled = true;
+      daemonDisabledReason = "daemon_rejected_attach";
+      await claude.pushNotification(systemMessage("system_bridge_disabled", `\u274C AgentBridge could not attach this Claude session: ${attachResult.error}. ${attachResult.message}${pairCtx}`));
+      return;
+    }
     daemonDisabledReason = null;
     if (!isReconnect) {
-      claude.pushNotification(systemMessage("system_bridge_ready", "\u2705 AgentBridge bridge is ready. Daemon connected. Start Codex in another terminal with: agentbridge codex"));
+      const pairCtx = attachResult.paired && attachResult.homePairId ? ` (paired with pair "${attachResult.homePairId}")` : attachResult.homePairId && attachResult.homePairId !== "default" ? ` (home pair: "${attachResult.homePairId}")` : "";
+      claude.pushNotification(systemMessage("system_bridge_ready", `\u2705 AgentBridge bridge is ready. Daemon connected${pairCtx}. Start Codex in another terminal with: agentbridge codex`));
     }
   } catch (err) {
     log(`Failed to connect to daemon: ${err.message}`);
@@ -14700,7 +14786,16 @@ async function pollDisabledRecovery() {
     log("Disabled-state recovery conditions met \u2014 attempting direct daemon reconnect");
     try {
       await daemonClient.connect();
-      daemonClient.attachClaude();
+      const attachResult = await daemonClient.attachClaude();
+      if (!attachResult.ok) {
+        const pairCtx = PAIR_ID ? ` (requested pair: "${PAIR_ID}")` : "";
+        log(`Recovery attach rejected: ${attachResult.error} \u2014 ${attachResult.message}${pairCtx}`);
+        daemonDisabled = true;
+        daemonDisabledReason = "daemon_rejected_attach";
+        stopDisabledRecoveryPoller();
+        await claude.pushNotification(systemMessage("system_bridge_disabled", `\u274C AgentBridge recovery failed: ${attachResult.error}. ${attachResult.message}${pairCtx}`));
+        return;
+      }
       daemonDisabled = false;
       daemonDisabledReason = null;
       stopDisabledRecoveryPoller();

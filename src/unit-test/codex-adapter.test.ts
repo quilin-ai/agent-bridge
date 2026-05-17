@@ -1,10 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import { execSync } from "node:child_process";
 import { createServer, Socket, type Server } from "node:net";
-import { CodexAdapter } from "../codex-adapter";
+import { CodexAdapter, buildCodexAppServerArgs } from "../codex-adapter";
 
 function createAdapter() {
-  return new CodexAdapter(4510, 4511) as any;
+  return new CodexAdapter({ appPort: 4510, proxyPort: 4511 }) as any;
 }
 
 describe("CodexAdapter app-server response handling", () => {
@@ -1606,5 +1606,214 @@ describe("CodexAdapter thread/closed diagnostic sniffer", () => {
 
     const diag = logs.filter((l) => l.startsWith("DIAGNOSTIC:"));
     expect(diag.length).toBe(0);
+  });
+});
+
+// ── Spec v2.2 §4.1 — paired-chat state ──────────────────────────
+
+describe("CodexAdapter paired-chat state (spec v2.2 §4.1)", () => {
+  test("setPairedChat / isPaired / currentPairedChatId roundtrip", () => {
+    const adapter = createAdapter();
+    expect(adapter.isPaired("chat_abc")).toBe(false);
+    expect(adapter.currentPairedChatId).toBe(null);
+
+    adapter.setPairedChat("chat_abc");
+    expect(adapter.isPaired("chat_abc")).toBe(true);
+    expect(adapter.isPaired("chat_xyz")).toBe(false);
+    expect(adapter.currentPairedChatId).toBe("chat_abc");
+
+    adapter.setPairedChat(null);
+    expect(adapter.isPaired("chat_abc")).toBe(false);
+    expect(adapter.currentPairedChatId).toBe(null);
+  });
+});
+
+// ── Spec v2.2 §4.3 — outbound event emissions ───────────────────
+
+describe("CodexAdapter outbound events for shared transport (spec v2.2 §4.3)", () => {
+  test("emits userMessage when item/completed has type userMessage and content", () => {
+    const adapter = createAdapter();
+    const events: Array<{ event: string; payload: any }> = [];
+    adapter.on("userMessage", (p: any) => events.push({ event: "userMessage", payload: p }));
+    adapter.on("agentMessage", (p: any) => events.push({ event: "agentMessage", payload: p }));
+
+    adapter.handleServerNotification({
+      method: "item/completed",
+      params: {
+        item: { id: "u1", type: "userMessage", content: [{ type: "text", text: "hello from tui" }] },
+        turnId: "t1",
+      },
+    });
+
+    expect(events.length).toBe(1);
+    expect(events[0].event).toBe("userMessage");
+    expect(events[0].payload.content).toBe("hello from tui");
+    expect(events[0].payload.source).toBe("codex");
+    expect(events[0].payload.turnId).toBe("t1");
+  });
+
+  test("emits errorItem on top-level error notification", () => {
+    const adapter = createAdapter();
+    const events: Array<{ code?: number; message?: string; data?: unknown }> = [];
+    adapter.on("errorItem", (p: any) => events.push(p));
+
+    adapter.handleServerNotification({
+      method: "error",
+      params: { error: { code: -32601, message: "Method not found" } },
+    });
+
+    expect(events).toEqual([{ code: -32601, message: "Method not found", data: undefined }]);
+  });
+
+  test("emits threadClosed on top-level thread/closed notification", () => {
+    const adapter = createAdapter();
+    const events: Array<{ threadId?: string }> = [];
+    adapter.on("threadClosed", (p: any) => events.push(p));
+
+    adapter.handleServerNotification({
+      method: "thread/closed",
+      params: { threadId: "th-99" },
+    });
+
+    expect(events).toEqual([{ threadId: "th-99" }]);
+  });
+
+  test("does NOT forward toolCall / shellCommand / approval items (whitelist exclusion §4.4)", () => {
+    const adapter = createAdapter();
+    const events: string[] = [];
+    adapter.on("agentMessage", () => events.push("agentMessage"));
+    adapter.on("userMessage", () => events.push("userMessage"));
+
+    for (const itemType of ["toolCall", "shellCommand", "fileChange", "reasoning"]) {
+      adapter.handleServerNotification({
+        method: "item/completed",
+        params: { item: { id: `i_${itemType}`, type: itemType, content: [{ type: "text", text: "x" }] } },
+      });
+    }
+
+    expect(events).toEqual([]);
+  });
+});
+
+// ── Spec v2.2 §4.5 — echo dedup ─────────────────────────────────
+
+describe("CodexAdapter echo dedup (spec v2.2 §4.5)", () => {
+  test("turnId match suppresses userMessage echo of injected text", () => {
+    const adapter = createAdapter();
+    const events: any[] = [];
+    adapter.on("userMessage", (p: any) => events.push(p));
+
+    // Simulate that an injection's turn/start response gave us this turnId.
+    adapter.recordInjectedTurnId("turn_inj_1", undefined);
+
+    adapter.handleServerNotification({
+      method: "item/completed",
+      params: {
+        item: { id: "u1", type: "userMessage", content: [{ type: "text", text: "echo me" }] },
+        turnId: "turn_inj_1",
+      },
+    });
+
+    expect(events).toEqual([]);
+  });
+
+  test("content-hash match suppresses echo when turnId not yet known (race window)", () => {
+    const adapter = createAdapter();
+    const events: any[] = [];
+    adapter.on("userMessage", (p: any) => events.push(p));
+
+    // Simulate that injectMessage was called (which would populate this map)
+    // but the turn/start response has not yet landed.
+    const hash = adapter.hashInjectionContent("race-window text");
+    adapter.pendingInjectionHashes.set(hash, Date.now() + 5_000);
+
+    // Notification arrives WITHOUT turnId (rare but possible in races).
+    adapter.handleServerNotification({
+      method: "item/completed",
+      params: {
+        item: { id: "u2", type: "userMessage", content: [{ type: "text", text: "race-window text" }] },
+      },
+    });
+
+    expect(events).toEqual([]);
+    // Hash is one-shot consumed.
+    expect(adapter.pendingInjectionHashes.has(hash)).toBe(false);
+  });
+
+  test("legitimate user-typed message with no prior injection IS forwarded", () => {
+    const adapter = createAdapter();
+    const events: any[] = [];
+    adapter.on("userMessage", (p: any) => events.push(p));
+
+    adapter.handleServerNotification({
+      method: "item/completed",
+      params: {
+        item: { id: "u3", type: "userMessage", content: [{ type: "text", text: "fresh user input" }] },
+        turnId: "turn_99",
+      },
+    });
+
+    expect(events.length).toBe(1);
+    expect(events[0].content).toBe("fresh user input");
+  });
+
+  test("expired turnId entry does not suppress (TTL respected)", () => {
+    const adapter = createAdapter();
+    const events: any[] = [];
+    adapter.on("userMessage", (p: any) => events.push(p));
+
+    // Manually set expired entry
+    adapter.injectedTurnIds.set("turn_old", Date.now() - 1000);
+
+    adapter.handleServerNotification({
+      method: "item/completed",
+      params: {
+        item: { id: "u4", type: "userMessage", content: [{ type: "text", text: "after ttl" }] },
+        turnId: "turn_old",
+      },
+    });
+
+    expect(events.length).toBe(1);
+    // Expired entry should have been cleaned up by isEchoOfInjection
+    expect(adapter.injectedTurnIds.has("turn_old")).toBe(false);
+  });
+});
+
+// ── Sprint #3 (2026-05-17 codex_msg_..._177): sandbox flag propagation ──
+//
+// Codex sandbox is decided server-side (the app-server spawned by daemon),
+// not by the TUI in --remote mode. Before this, `abg codex --sandbox
+// workspace-write` set the flag on the TUI process which had no effect on
+// the daemon-owned app-server, leaving Codex effectively read-only and
+// breaking `apply_patch`. Helper now propagates sandbox into the app-server
+// spawn argv.
+
+describe("buildCodexAppServerArgs (sandbox propagation)", () => {
+  test("returns base args when no sandbox", () => {
+    expect(buildCodexAppServerArgs("ws://127.0.0.1:4500")).toEqual(
+      ["app-server", "--listen", "ws://127.0.0.1:4500"],
+    );
+    expect(buildCodexAppServerArgs("ws://127.0.0.1:4500", undefined)).toEqual(
+      ["app-server", "--listen", "ws://127.0.0.1:4500"],
+    );
+  });
+
+  test("appends --sandbox MODE when sandbox provided", () => {
+    expect(buildCodexAppServerArgs("ws://127.0.0.1:4500", "workspace-write")).toEqual(
+      ["app-server", "--listen", "ws://127.0.0.1:4500", "--sandbox", "workspace-write"],
+    );
+    expect(buildCodexAppServerArgs("ws://127.0.0.1:4510", "read-only")).toEqual(
+      ["app-server", "--listen", "ws://127.0.0.1:4510", "--sandbox", "read-only"],
+    );
+    // Pass-through any string — codex itself validates the value, the
+    // helper does not gate on a hardcoded list (which would go stale if
+    // codex adds modes).
+    expect(buildCodexAppServerArgs("ws://127.0.0.1:4500", "danger-full-access")).toContain("danger-full-access");
+  });
+
+  test("empty string is treated as 'no sandbox' (no flag appended)", () => {
+    expect(buildCodexAppServerArgs("ws://127.0.0.1:4500", "")).toEqual(
+      ["app-server", "--listen", "ws://127.0.0.1:4500"],
+    );
   });
 });

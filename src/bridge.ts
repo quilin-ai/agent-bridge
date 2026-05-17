@@ -19,7 +19,11 @@ const daemonLifecycle = new DaemonLifecycle({ stateDir, controlPort: CONTROL_POR
 const CONTROL_WS_URL = daemonLifecycle.controlWsUrl;
 
 const claude = new ClaudeAdapter(stateDir.logFile);
-const daemonClient = new DaemonClient(CONTROL_WS_URL);
+// STM v2.3 §D4 P4b: AGENTBRIDGE_PAIR env (set by `agentbridge claude --pair NAME`)
+// pre-binds this Claude to a specific pair. Empty / unset → daemon's
+// FIFO claim logic decides (P3-cleanup attachClaude flow).
+const PAIR_ID = process.env.AGENTBRIDGE_PAIR;
+const daemonClient = new DaemonClient(CONTROL_WS_URL, { chatId: claude.chatId, pairId: PAIR_ID });
 
 let shuttingDown = false;
 let daemonDisabled = false;
@@ -135,12 +139,31 @@ async function connectToDaemon(isReconnect = false) {
   try {
     await daemonLifecycle.ensureRunning();
     await daemonClient.connect();
-    daemonClient.attachClaude();
+    // STM v2.3 §D6 P4-cleanup HIGH#2: await the typed claude_connect_result
+    // and surface PAIR_NOT_FOUND / PAIR_BUSY / INVALID_PAIR_NAME as a
+    // disabled state instead of silently claiming "bridge ready".
+    const attachResult = await daemonClient.attachClaude();
+    if (!attachResult.ok) {
+      const pairCtx = PAIR_ID ? ` (requested pair: "${PAIR_ID}")` : "";
+      log(`Daemon rejected claude_connect: ${attachResult.error} — ${attachResult.message}${pairCtx}`);
+      daemonDisabled = true;
+      daemonDisabledReason = "daemon_rejected_attach";
+      await claude.pushNotification(systemMessage(
+        "system_bridge_disabled",
+        `❌ AgentBridge could not attach this Claude session: ${attachResult.error}. ${attachResult.message}${pairCtx}`,
+      ));
+      return;
+    }
     daemonDisabledReason = null;
     if (!isReconnect) {
+      const pairCtx = attachResult.paired && attachResult.homePairId
+        ? ` (paired with pair "${attachResult.homePairId}")`
+        : attachResult.homePairId && attachResult.homePairId !== "default"
+          ? ` (home pair: "${attachResult.homePairId}")`
+          : "";
       void claude.pushNotification(systemMessage(
         "system_bridge_ready",
-        "✅ AgentBridge bridge is ready. Daemon connected. Start Codex in another terminal with: agentbridge codex",
+        `✅ AgentBridge bridge is ready. Daemon connected${pairCtx}. Start Codex in another terminal with: agentbridge codex`,
       ));
     }
   } catch (err: any) {
@@ -270,7 +293,24 @@ async function pollDisabledRecovery() {
     log("Disabled-state recovery conditions met — attempting direct daemon reconnect");
     try {
       await daemonClient.connect();
-      daemonClient.attachClaude();
+      // STM v2.3 §D6 P4-cleanup (Codex P4 final re-pass codex_msg_5753c73beafc_128):
+      // recovery path was also fire-and-forget — could silently claim
+      // "recovered" while the daemon rejected the pair binding. Now
+      // await the typed attach result and respect ok=false the same way
+      // connectToDaemon does.
+      const attachResult = await daemonClient.attachClaude();
+      if (!attachResult.ok) {
+        const pairCtx = PAIR_ID ? ` (requested pair: "${PAIR_ID}")` : "";
+        log(`Recovery attach rejected: ${attachResult.error} — ${attachResult.message}${pairCtx}`);
+        daemonDisabled = true;
+        daemonDisabledReason = "daemon_rejected_attach";
+        stopDisabledRecoveryPoller();
+        await claude.pushNotification(systemMessage(
+          "system_bridge_disabled",
+          `❌ AgentBridge recovery failed: ${attachResult.error}. ${attachResult.message}${pairCtx}`,
+        ));
+        return;
+      }
       daemonDisabled = false;
       daemonDisabledReason = null;
       stopDisabledRecoveryPoller();

@@ -10,6 +10,45 @@ export async function runClaude(args: string[]) {
   // Check for owned flag conflicts
   checkOwnedFlagConflicts(args, "agentbridge claude", OWNED_FLAGS);
 
+  // STM v2.3 §8.3 P4b — parse --pair NAME (or --pair=NAME) out of args
+  // and forward it to the spawned Claude via AGENTBRIDGE_PAIR env. The
+  // bridge.ts plugin reads that env at MCP connection time and includes
+  // pairId in the claude_connect control message. Daemon's attachClaude
+  // (P3-cleanup) consumes it for explicit-pair binding.
+  let pairId: string | undefined;
+  const rest: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--pair") {
+      // MEDIUM (Codex P4 review): --pair without a value used to fall
+      // through into native claude args. Now a clear error.
+      if (i + 1 >= args.length) {
+        console.error(`Error: --pair requires a value (e.g. \`--pair work\`).`);
+        process.exit(1);
+      }
+      pairId = args[i + 1];
+      i++;
+      continue;
+    }
+    if (a.startsWith("--pair=")) {
+      pairId = a.slice("--pair=".length);
+      if (!pairId) {
+        console.error(`Error: --pair= requires a value (e.g. \`--pair=work\`).`);
+        process.exit(1);
+      }
+      continue;
+    }
+    rest.push(a);
+  }
+  if (pairId !== undefined) {
+    const { isValidPairName } = await import("../pair-registry");
+    if (!isValidPairName(pairId)) {
+      console.error(`Error: --pair value "${pairId}" is invalid.`);
+      console.error("Allowed: lowercase letters, digits, underscore, hyphen. First char alphanumeric. Length 1-32 chars.");
+      process.exit(1);
+    }
+  }
+
   const stateDir = new StateDirResolver();
   const controlPort = parseInt(process.env.AGENTBRIDGE_CONTROL_PORT ?? "4502", 10);
   const lifecycle = new DaemonLifecycle({
@@ -31,12 +70,18 @@ export async function runClaude(args: string[]) {
   // Once published to the official marketplace, switch to --channels.
   const fullArgs = [
     "--dangerously-load-development-channels", channelEntry,
-    ...args,
+    ...rest,
   ];
+
+  const childEnv: NodeJS.ProcessEnv = { ...process.env };
+  if (pairId !== undefined) {
+    childEnv.AGENTBRIDGE_PAIR = pairId;
+    console.error(`[agentbridge] Launching Claude pre-bound to pair "${pairId}"`);
+  }
 
   const child = spawn("claude", fullArgs, {
     stdio: "inherit",
-    env: process.env,
+    env: childEnv,
   });
 
   child.on("exit", (code) => {
