@@ -41,6 +41,11 @@ async function main() {
       const { runKill } = await import("./cli/kill");
       await runKill();
       break;
+    case "pairs":
+      // STM v2.3 §8.2 P4c — pair management subcommands.
+      const { runPairs } = await import("./cli/pairs");
+      await runPairs(restArgs);
+      break;
     case "--help":
     case "-h":
     case undefined:
@@ -69,7 +74,11 @@ Commands:
   init              Install plugin, check dependencies, generate project config
   dev               Register local marketplace + install plugin (for local dev)
   claude [args...]  Start Claude Code with push channel enabled
+                    Use --pair NAME to pre-bind to a specific pair (STM v2.3)
   codex [args...]   Start Codex TUI connected to AgentBridge daemon
+                    Use --pair NAME to target a specific pair (STM v2.3)
+  pairs <subcmd>    Manage shared-thread pairs (STM v2.3)
+                    Subcommands: ls / rm NAME [--forget] [--force]
   kill              Force kill all AgentBridge processes
 
 Options:
