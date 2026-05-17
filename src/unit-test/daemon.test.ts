@@ -1169,3 +1169,52 @@ describe("daemon bug regressions (2026-05-16 STM v2.2 review)", () => {
     expect(chat.pairedTurnSawAgentMessage).toBe(true);
   });
 });
+
+// ── Bug regression E (2026-05-17 EPIPE infinite loop) ─────────────────
+
+describe("daemon log() EPIPE handling (Bug regression E 2026-05-17)", () => {
+  // Historical incident: daemon was launched as `bun daemon.js | head -40 &`
+  // — head closed its stdin after 40 lines, breaking the daemon's stdout/
+  // stderr pipe. Any subsequent log() call hit `process.stderr.write()`
+  // which threw EPIPE; the uncaughtException handler caught it and called
+  // log() again, which threw EPIPE again. Loop wrote 8.5 GB of log to disk
+  // before user noticed.
+  //
+  // Fix: sticky `stderrBroken` flag + try/catch around stderr.write. Once
+  // EPIPE seen, stop attempting stderr forever; file logger keeps recording.
+
+  test("log() does not throw when stderr.write throws EPIPE; subsequent calls skip stderr", () => {
+    const originalWrite = process.stderr.write.bind(process.stderr);
+    let stderrCallCount = 0;
+    process.stderr.write = ((..._args: any[]) => {
+      stderrCallCount++;
+      const err: any = new Error("write EPIPE");
+      err.code = "EPIPE";
+      throw err;
+    }) as any;
+
+    try {
+      // First call: stderr.write throws EPIPE, log() catches it, sets
+      // sticky flag, file write still happens (no observable error).
+      expect(() => (fns as any).log("first call after pipe broke")).not.toThrow();
+      expect(stderrCallCount).toBe(1);
+
+      // 10 more calls: stderrBroken=true → log() skips stderr entirely.
+      // Count must NOT grow. This is the loop-prevention contract.
+      for (let i = 0; i < 10; i++) {
+        expect(() => (fns as any).log(`subsequent ${i}`)).not.toThrow();
+      }
+      expect(stderrCallCount).toBe(1);
+
+      // Simulate the historical loop trigger: an uncaughtException handler
+      // that calls log() with the err message. Before fix this re-entered
+      // stderr.write → re-threw → uncaughtException → log() → ∞. With fix,
+      // the handler runs and returns cleanly.
+      const fakeErr = new Error("simulated uncaught");
+      expect(() => (fns as any).log(`UNCAUGHT EXCEPTION: ${fakeErr.stack}`)).not.toThrow();
+      expect(stderrCallCount).toBe(1);
+    } finally {
+      process.stderr.write = originalWrite as any;
+    }
+  });
+});

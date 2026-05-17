@@ -2562,6 +2562,12 @@ var CLOSE_CODE_REPLACED = 4001;
 var stateDir = new StateDirResolver;
 stateDir.ensure();
 var daemonLogger = getAsyncFileLogger(stateDir.logFile);
+var stderrBroken = false;
+process.stderr.on("error", (err) => {
+  if (err?.code === "EPIPE" || err?.code === "ERR_STREAM_DESTROYED") {
+    stderrBroken = true;
+  }
+});
 var configService = new ConfigService;
 var config = configService.loadOrDefault();
 var CODEX_APP_PORT = parseInt(process.env.CODEX_WS_PORT ?? String(config.codex.appPort), 10);
@@ -3892,7 +3898,15 @@ process.on("unhandledRejection", (reason) => {
 function log(msg) {
   const line = `[${new Date().toISOString()}] [AgentBridgeDaemon] ${msg}
 `;
-  process.stderr.write(line);
+  if (!stderrBroken) {
+    try {
+      process.stderr.write(line);
+    } catch (err) {
+      if (err?.code === "EPIPE" || err?.code === "ERR_STREAM_DESTROYED") {
+        stderrBroken = true;
+      }
+    }
+  }
   daemonLogger.write(line);
 }
 function startDaemon() {
@@ -3932,7 +3946,8 @@ var __testing = {
     handleEnsurePair,
     handleDestroyPair,
     handleListPairs,
-    attachClaude
+    attachClaude,
+    log
   },
   pairRegistry,
   runUnderRegistryMutex,

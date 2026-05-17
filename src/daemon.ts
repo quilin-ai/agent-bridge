@@ -114,6 +114,21 @@ stateDir.ensure();
 // triggered ReferenceError "Cannot access 'daemonLogger' before
 // initialization" at boot via JS temporal dead zone.
 const daemonLogger = getAsyncFileLogger(stateDir.logFile);
+
+// Bug regression E (2026-05-17) — sticky flag: once stderr breaks (broken
+// pipe, closed by parent, etc.) stop trying to write to it. Without this,
+// EPIPE from stderr.write in log() throws → uncaughtException handler
+// calls log() → log() tries stderr.write → throws EPIPE again → infinite
+// loop. Historical incident: 8.5 GB log file from `bun daemon.js | head`.
+// MUST declare here (above pairRegistry.load() and other module-init code
+// that can call log()) — same TDZ constraint as daemonLogger above.
+let stderrBroken = false;
+process.stderr.on("error", (err: any) => {
+  if (err?.code === "EPIPE" || err?.code === "ERR_STREAM_DESTROYED") {
+    stderrBroken = true;
+  }
+});
+
 const configService = new ConfigService();
 const config = configService.loadOrDefault();
 
@@ -1961,7 +1976,16 @@ process.on("unhandledRejection", (reason: any) => {
 
 function log(msg: string) {
   const line = `[${new Date().toISOString()}] [AgentBridgeDaemon] ${msg}\n`;
-  process.stderr.write(line);
+  if (!stderrBroken) {
+    try {
+      process.stderr.write(line);
+    } catch (err: any) {
+      if (err?.code === "EPIPE" || err?.code === "ERR_STREAM_DESTROYED") {
+        stderrBroken = true;
+      }
+      // Any other stderr write error: silently drop. File log still records.
+    }
+  }
   daemonLogger.write(line);
 }
 
@@ -2036,6 +2060,9 @@ export const __testing = {
     handleListPairs,
     /** STM v2.3 §D4 / §D6 P3-cleanup — attach flow exposed so tests can verify claude_connect_result. */
     attachClaude,
+    /** Bug regression E (2026-05-17): exposed so EPIPE/stderr-broken test
+     * can drive log() directly and verify the sticky-flag short-circuit. */
+    log,
   } as const,
   /** STM v2.3 §D2 P3b — registry handle (read for assertions; mutate via handlers). */
   pairRegistry,
