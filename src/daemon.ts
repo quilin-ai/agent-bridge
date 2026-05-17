@@ -17,8 +17,8 @@
  * surfaces (TUI = human ↔ Codex, Claude = MCP ↔ Codex) isolated.
  */
 
-import { appendFileSync } from "node:fs";
 import type { ServerWebSocket } from "bun";
+import { getAsyncFileLogger, closeAllAsyncFileLoggers } from "./log-writer";
 import { CodexAdapter } from "./codex-adapter";
 import { ClaudeThread } from "./claude-thread";
 import {
@@ -108,6 +108,12 @@ interface ProxyTuiSlot {
 
 const stateDir = new StateDirResolver();
 stateDir.ensure();
+// Performance fix (2026-05-17 P0): async file logger declared up here so
+// any module-top-level code (e.g. `pairRegistry.load()`) that calls
+// `log()` finds the logger already initialized. Earlier placement
+// triggered ReferenceError "Cannot access 'daemonLogger' before
+// initialization" at boot via JS temporal dead zone.
+const daemonLogger = getAsyncFileLogger(stateDir.logFile);
 const configService = new ConfigService();
 const config = configService.loadOrDefault();
 
@@ -1928,7 +1934,10 @@ function shutdown(reason: string) {
   codex.stop();
   removePidFile();
   removeStatusFile();
-  process.exit(0);
+  // Performance fix (2026-05-17 P0): flush async file loggers before
+  // process.exit so the last few buffered log lines reach disk. The
+  // exit call is sequenced after the flush completes.
+  void closeAllAsyncFileLoggers().then(() => process.exit(0)).catch(() => process.exit(0));
 }
 
 process.on("SIGINT", () => shutdown("SIGINT"));
@@ -1944,9 +1953,7 @@ process.on("unhandledRejection", (reason: any) => {
 function log(msg: string) {
   const line = `[${new Date().toISOString()}] [AgentBridgeDaemon] ${msg}\n`;
   process.stderr.write(line);
-  try {
-    appendFileSync(stateDir.logFile, line);
-  } catch {}
+  daemonLogger.write(line);
 }
 
 function startDaemon() {

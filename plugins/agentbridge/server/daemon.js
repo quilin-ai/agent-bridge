@@ -1,18 +1,72 @@
 #!/usr/bin/env bun
 // @bun
 
-// src/daemon.ts
-import { appendFileSync as appendFileSync3 } from "fs";
+// src/log-writer.ts
+import { createWriteStream, mkdirSync, existsSync } from "fs";
+import { dirname } from "path";
+var writers = new Map;
+function getStream(filePath) {
+  const existing = writers.get(filePath);
+  if (existing && !existing.destroyed)
+    return existing;
+  const dir = dirname(filePath);
+  if (!existsSync(dir)) {
+    try {
+      mkdirSync(dir, { recursive: true });
+    } catch {}
+  }
+  const stream = createWriteStream(filePath, { flags: "a" });
+  stream.on("error", (err) => {
+    process.stderr.write(`[log-writer] write error on ${filePath}: ${err.message}
+`);
+  });
+  writers.set(filePath, stream);
+  return stream;
+}
+function getAsyncFileLogger(filePath) {
+  return {
+    write(line) {
+      const stream = getStream(filePath);
+      try {
+        stream.write(line);
+      } catch (err) {
+        process.stderr.write(`[log-writer] sync write failed on ${filePath}: ${err?.message ?? err}
+`);
+      }
+    },
+    close() {
+      return new Promise((resolve) => {
+        const stream = writers.get(filePath);
+        if (!stream || stream.destroyed) {
+          resolve();
+          return;
+        }
+        writers.delete(filePath);
+        stream.end(() => resolve());
+      });
+    }
+  };
+}
+async function closeAllAsyncFileLoggers() {
+  const all = [...writers.entries()];
+  writers.clear();
+  await Promise.all(all.map(([_path, stream]) => new Promise((resolve) => {
+    if (stream.destroyed) {
+      resolve();
+      return;
+    }
+    stream.end(() => resolve());
+  })));
+}
 
 // src/codex-adapter.ts
 import { spawn, execSync } from "child_process";
 import { createInterface } from "readline";
 import { EventEmitter } from "events";
-import { appendFileSync } from "fs";
 import { createHash } from "crypto";
 
 // src/state-dir.ts
-import { mkdirSync, existsSync } from "fs";
+import { mkdirSync as mkdirSync2, existsSync as existsSync2 } from "fs";
 import { join } from "path";
 import { homedir, platform } from "os";
 
@@ -30,8 +84,8 @@ class StateDirResolver {
     }
   }
   ensure() {
-    if (!existsSync(this.stateDir)) {
-      mkdirSync(this.stateDir, { recursive: true });
+    if (!existsSync2(this.stateDir)) {
+      mkdirSync2(this.stateDir, { recursive: true });
     }
   }
   get dir() {
@@ -72,8 +126,8 @@ class StateDirResolver {
   }
   ensurePairDir(pairId) {
     const dir = this.pairDir(pairId);
-    if (!existsSync(dir)) {
-      mkdirSync(dir, { recursive: true });
+    if (!existsSync2(dir)) {
+      mkdirSync2(dir, { recursive: true });
     }
   }
 }
@@ -846,7 +900,7 @@ class CodexAdapter extends EventEmitter {
           try {
             this.appServerWs.send(forwardedResponse);
             this.serverRequestToProxy.delete(normalizedId);
-            this.log(`TUI \u2192 app-server: ${pending.method} response (proxy id=${normalizedId} \u2192 server id=${pending.serverId})`);
+            this.proxyLog(`TUI \u2192 app-server: ${pending.method} response (proxy id=${normalizedId} \u2192 server id=${pending.serverId})`);
           } catch (e) {
             this.bufferPendingServerResponse(normalizedId, pending, forwardedResponse, `send failed: ${e.message}`);
           }
@@ -888,7 +942,7 @@ class CodexAdapter extends EventEmitter {
     try {
       const parsed = JSON.parse(data);
       const method = parsed.method ?? `response:${parsed.id}`;
-      this.log(`TUI \u2192 app-server: ${method}`);
+      this.proxyLog(`TUI \u2192 app-server: ${method}`);
       if (parsed.id !== undefined && parsed.method) {
         const proxyId = this.nextProxyId++;
         this.upstreamToClient.set(proxyId, { connId, clientId: parsed.id });
@@ -899,7 +953,7 @@ class CodexAdapter extends EventEmitter {
         this.trackPendingRequest(parsed, connId);
       }
     } catch {
-      this.log(`TUI \u2192 app-server: (unparseable)`);
+      this.proxyLog(`TUI \u2192 app-server: (unparseable)`);
     }
     if (this.appServerWs?.readyState === WebSocket.OPEN) {
       this.appServerWs.send(forwarded);
@@ -1015,7 +1069,7 @@ class CodexAdapter extends EventEmitter {
         return null;
       }
       parsed.id = mapping.clientId;
-      this.log(`app-server \u2192 TUI: response (proxy id=${numericId} \u2192 client id=${String(mapping.clientId)}, conn #${mapping.connId})`);
+      this.proxyLog(`app-server \u2192 TUI: response (proxy id=${numericId} \u2192 client id=${String(mapping.clientId)}, conn #${mapping.connId})`);
       const forwarded = this.patchResponse(parsed, JSON.stringify(parsed));
       this.interceptServerMessage(parsed, mapping.connId);
       return forwarded;
@@ -1035,9 +1089,9 @@ class CodexAdapter extends EventEmitter {
         this.pendingInjectionByReqId.delete(numericId);
         if (typeof turnId === "string" && turnId.length > 0) {
           this.recordInjectedTurnId(turnId, contentHash);
-          this.log(`Bridge-originated request completed (id ${responseId}, turnId=${turnId} dedup)`);
+          this.proxyLog(`Bridge-originated request completed (id ${responseId}, turnId=${turnId} dedup)`);
         } else {
-          this.log(`Bridge-originated request completed (id ${responseId}, no turnId \u2014 falling back to content-hash dedup)`);
+          this.proxyLog(`Bridge-originated request completed (id ${responseId}, no turnId \u2014 falling back to content-hash dedup)`);
         }
       }
       return null;
@@ -1417,19 +1471,27 @@ class CodexAdapter extends EventEmitter {
       }
     }
   }
+  _logger = null;
+  get logger() {
+    if (!this._logger)
+      this._logger = getAsyncFileLogger(this.logFile);
+    return this._logger;
+  }
   log(msg) {
     const line = `[${new Date().toISOString()}] [CodexAdapter] ${msg}
 `;
     process.stderr.write(line);
-    try {
-      appendFileSync(this.logFile, line);
-    } catch {}
+    this.logger.write(line);
   }
+  proxyLog(msg) {
+    if (CodexAdapter.DEBUG_PROXY)
+      this.log(msg);
+  }
+  static DEBUG_PROXY = process.env.AGENTBRIDGE_DEBUG_PROXY === "1";
 }
 
 // src/claude-thread.ts
 import { EventEmitter as EventEmitter2 } from "events";
-import { appendFileSync as appendFileSync2 } from "fs";
 var RPC_TIMEOUT_MS = 30000;
 
 class ClaudeThread extends EventEmitter2 {
@@ -1732,13 +1794,17 @@ class ClaudeThread extends EventEmitter2 {
       this.log(`failed to send server-request response: ${err?.message ?? err}`);
     }
   }
+  _logger = null;
+  get logger() {
+    if (!this._logger)
+      this._logger = getAsyncFileLogger(this.logFile);
+    return this._logger;
+  }
   log(s) {
     const line = `[${new Date().toISOString()}] [ClaudeThread:${this.chatId}] ${s}
 `;
     process.stderr.write(line);
-    try {
-      appendFileSync2(this.logFile, line);
-    } catch {}
+    this.logger.write(line);
   }
 }
 
@@ -1945,7 +2011,7 @@ class TuiConnectionState {
 
 // src/daemon-lifecycle.ts
 import { spawn as spawn2, execFileSync } from "child_process";
-import { existsSync as existsSync2, readFileSync, unlinkSync, writeFileSync, openSync, closeSync, constants } from "fs";
+import { existsSync as existsSync3, readFileSync, unlinkSync, writeFileSync, openSync, closeSync, constants } from "fs";
 import { fileURLToPath } from "url";
 var DAEMON_ENTRY = process.env.AGENTBRIDGE_DAEMON_ENTRY ?? "./daemon.ts";
 var DAEMON_PATH = fileURLToPath(new URL(DAEMON_ENTRY, import.meta.url));
@@ -2083,7 +2149,7 @@ class DaemonLifecycle {
     } catch {}
   }
   wasKilled() {
-    return existsSync2(this.stateDir.killedFile);
+    return existsSync3(this.stateDir.killedFile);
   }
   launch() {
     this.stateDir.ensure();
@@ -2205,7 +2271,7 @@ function isProcessAlive(pid) {
 }
 
 // src/config-service.ts
-import { readFileSync as readFileSync2, writeFileSync as writeFileSync2, mkdirSync as mkdirSync2, existsSync as existsSync3 } from "fs";
+import { readFileSync as readFileSync2, writeFileSync as writeFileSync2, mkdirSync as mkdirSync3, existsSync as existsSync4 } from "fs";
 import { join as join2 } from "path";
 var DEFAULT_CONFIG = {
   version: "1.0",
@@ -2262,7 +2328,7 @@ class ConfigService {
     this.configPath = join2(this.configDir, CONFIG_FILE);
   }
   hasConfig() {
-    return existsSync3(this.configPath);
+    return existsSync4(this.configPath);
   }
   load() {
     try {
@@ -2283,7 +2349,7 @@ class ConfigService {
   initDefaults() {
     this.ensureConfigDir();
     const created = [];
-    if (!existsSync3(this.configPath)) {
+    if (!existsSync4(this.configPath)) {
       this.save(DEFAULT_CONFIG);
       created.push(this.configPath);
     }
@@ -2293,15 +2359,15 @@ class ConfigService {
     return this.configPath;
   }
   ensureConfigDir() {
-    if (!existsSync3(this.configDir)) {
-      mkdirSync2(this.configDir, { recursive: true });
+    if (!existsSync4(this.configDir)) {
+      mkdirSync3(this.configDir, { recursive: true });
     }
   }
 }
 
 // src/pair-registry.ts
-import { readFileSync as readFileSync3, writeFileSync as writeFileSync3, renameSync, mkdirSync as mkdirSync3, existsSync as existsSync4, unlinkSync as unlinkSync2 } from "fs";
-import { dirname } from "path";
+import { readFileSync as readFileSync3, writeFileSync as writeFileSync3, renameSync, mkdirSync as mkdirSync4, existsSync as existsSync5, unlinkSync as unlinkSync2 } from "fs";
+import { dirname as dirname2 } from "path";
 import { randomBytes } from "crypto";
 var DEFAULT_PAIR_PORTS = { appPort: 4500, proxyPort: 4501 };
 var STRIDE_BASE = 4510;
@@ -2335,7 +2401,7 @@ class PairRegistry {
   }
   load() {
     this.entries.clear();
-    if (!existsSync4(this.filePath)) {
+    if (!existsSync5(this.filePath)) {
       this.log(`[pair-registry] no registry file at ${this.filePath} \u2014 starting empty`);
       return;
     }
@@ -2370,9 +2436,9 @@ class PairRegistry {
     return e !== null && typeof e === "object" && typeof e.pairId === "string" && isValidPairName(e.pairId) && typeof e.appPort === "number" && typeof e.proxyPort === "number" && Number.isInteger(e.appPort) && Number.isInteger(e.proxyPort) && e.appPort > 0 && e.proxyPort > 0 && e.appPort < 65536 && e.proxyPort < 65536 && typeof e.allocatedAt === "number";
   }
   save() {
-    const dir = dirname(this.filePath);
-    if (!existsSync4(dir))
-      mkdirSync3(dir, { recursive: true });
+    const dir = dirname2(this.filePath);
+    if (!existsSync5(dir))
+      mkdirSync4(dir, { recursive: true });
     const tmp = `${this.filePath}.tmp.${randomBytes(6).toString("hex")}`;
     const snapshot = {
       version: 1,
@@ -2383,7 +2449,7 @@ class PairRegistry {
       renameSync(tmp, this.filePath);
     } catch (err) {
       try {
-        if (existsSync4(tmp))
+        if (existsSync5(tmp))
           unlinkSync2(tmp);
       } catch {}
       throw new Error(`[pair-registry] save failed: ${err?.message ?? err}`);
@@ -2495,6 +2561,7 @@ var CLOSE_CODE_REPLACED = 4001;
 // src/daemon.ts
 var stateDir = new StateDirResolver;
 stateDir.ensure();
+var daemonLogger = getAsyncFileLogger(stateDir.logFile);
 var configService = new ConfigService;
 var config = configService.loadOrDefault();
 var CODEX_APP_PORT = parseInt(process.env.CODEX_WS_PORT ?? String(config.codex.appPort), 10);
@@ -3807,7 +3874,7 @@ function shutdown(reason) {
   codex.stop();
   removePidFile();
   removeStatusFile();
-  process.exit(0);
+  closeAllAsyncFileLoggers().then(() => process.exit(0)).catch(() => process.exit(0));
 }
 process.on("SIGINT", () => shutdown("SIGINT"));
 process.on("SIGTERM", () => shutdown("SIGTERM"));
@@ -3825,9 +3892,7 @@ function log(msg) {
   const line = `[${new Date().toISOString()}] [AgentBridgeDaemon] ${msg}
 `;
   process.stderr.write(line);
-  try {
-    appendFileSync3(stateDir.logFile, line);
-  } catch {}
+  daemonLogger.write(line);
 }
 function startDaemon() {
   if (daemonLifecycle.wasKilled()) {

@@ -16,9 +16,9 @@
  */
 
 import { EventEmitter } from "node:events";
-import { appendFileSync } from "node:fs";
 import type { AppServerItem } from "./app-server-protocol";
 import type { BridgeMessage } from "./types";
+import { getAsyncFileLogger, type AsyncFileLogger } from "./log-writer";
 
 export interface ClaudeThreadOptions {
   appServerUrl: string;
@@ -386,9 +386,17 @@ export class ClaudeThread extends EventEmitter {
     }
   }
 
+  // Performance fix (2026-05-17 P0): switch to async file logger to
+  // remove blocking disk IO from the per-message ClaudeThread hot path.
+  private _logger: AsyncFileLogger | null = null;
+  private get logger(): AsyncFileLogger {
+    if (!this._logger) this._logger = getAsyncFileLogger(this.logFile);
+    return this._logger;
+  }
+
   private log(s: string) {
     const line = `[${new Date().toISOString()}] [ClaudeThread:${this.chatId}] ${s}\n`;
     process.stderr.write(line);
-    try { appendFileSync(this.logFile, line); } catch {}
+    this.logger.write(line);
   }
 }

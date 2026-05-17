@@ -12,9 +12,9 @@
 import { spawn, execSync, type ChildProcess } from "node:child_process";
 import { createInterface } from "node:readline";
 import { EventEmitter } from "node:events";
-import { appendFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { StateDirResolver } from "./state-dir";
+import { getAsyncFileLogger, type AsyncFileLogger } from "./log-writer";
 import type { BridgeMessage } from "./types";
 import type { ServerWebSocket } from "bun";
 import {
@@ -1094,7 +1094,7 @@ export class CodexAdapter extends EventEmitter {
           try {
             this.appServerWs.send(forwardedResponse);
             this.serverRequestToProxy.delete(normalizedId);
-            this.log(`TUI → app-server: ${pending.method} response (proxy id=${normalizedId} → server id=${pending.serverId})`);
+            this.proxyLog(`TUI → app-server: ${pending.method} response (proxy id=${normalizedId} → server id=${pending.serverId})`);
           } catch (e: any) {
             this.bufferPendingServerResponse(normalizedId, pending, forwardedResponse, `send failed: ${e.message}`);
           }
@@ -1171,7 +1171,7 @@ export class CodexAdapter extends EventEmitter {
     try {
       const parsed = JSON.parse(data);
       const method = parsed.method ?? `response:${parsed.id}`;
-      this.log(`TUI → app-server: ${method}`);
+      this.proxyLog(`TUI → app-server: ${method}`);
 
       // Rewrite request id to globally unique proxy id
       if (parsed.id !== undefined && parsed.method) {
@@ -1184,7 +1184,7 @@ export class CodexAdapter extends EventEmitter {
         this.trackPendingRequest(parsed, connId);
       }
     } catch {
-      this.log(`TUI → app-server: (unparseable)`);
+      this.proxyLog(`TUI → app-server: (unparseable)`);
     }
 
     // Forward to app-server. The OPEN check above guarantees readyState was
@@ -1344,7 +1344,7 @@ export class CodexAdapter extends EventEmitter {
       }
 
       parsed.id = mapping.clientId;
-      this.log(`app-server → TUI: response (proxy id=${numericId} → client id=${String(mapping.clientId)}, conn #${mapping.connId})`);
+      this.proxyLog(`app-server → TUI: response (proxy id=${numericId} → client id=${String(mapping.clientId)}, conn #${mapping.connId})`);
       const forwarded = this.patchResponse(parsed, JSON.stringify(parsed));
       this.interceptServerMessage(parsed, mapping.connId);
       return forwarded;
@@ -1370,9 +1370,9 @@ export class CodexAdapter extends EventEmitter {
         this.pendingInjectionByReqId.delete(numericId);
         if (typeof turnId === "string" && turnId.length > 0) {
           this.recordInjectedTurnId(turnId, contentHash);
-          this.log(`Bridge-originated request completed (id ${responseId}, turnId=${turnId} dedup)`);
+          this.proxyLog(`Bridge-originated request completed (id ${responseId}, turnId=${turnId} dedup)`);
         } else {
-          this.log(`Bridge-originated request completed (id ${responseId}, no turnId — falling back to content-hash dedup)`);
+          this.proxyLog(`Bridge-originated request completed (id ${responseId}, no turnId — falling back to content-hash dedup)`);
         }
       }
       return null;
@@ -1857,9 +1857,33 @@ export class CodexAdapter extends EventEmitter {
     }
   }
 
+  // Performance fix (2026-05-17 P0): switch from blocking `appendFileSync`
+  // to the shared async WriteStream pool. The proxy hot path called this
+  // log() ~2 times per WS frame; multiplied by streaming Codex deltas,
+  // synchronous disk IO was a measurable bottleneck. Lifecycle / error
+  // logs still flow through here; per-message proxy frame logs are
+  // additionally gated behind AGENTBRIDGE_DEBUG_PROXY (see proxyLog
+  // below) so default operation drops noisy lines entirely.
+  private _logger: AsyncFileLogger | null = null;
+  private get logger(): AsyncFileLogger {
+    if (!this._logger) this._logger = getAsyncFileLogger(this.logFile);
+    return this._logger;
+  }
+
   private log(msg: string) {
     const line = `[${new Date().toISOString()}] [CodexAdapter] ${msg}\n`;
     process.stderr.write(line);
-    try { appendFileSync(this.logFile, line); } catch {}
+    this.logger.write(line);
   }
+
+  /**
+   * Performance fix (2026-05-17 P1): per-frame proxy diagnostics — gated
+   * behind `AGENTBRIDGE_DEBUG_PROXY=1`. Default behavior: no-op (no
+   * stderr write, no file write). Set the env var to bring the verbose
+   * proxy logs back when debugging routing or echo dedup.
+   */
+  private proxyLog(msg: string) {
+    if (CodexAdapter.DEBUG_PROXY) this.log(msg);
+  }
+  private static readonly DEBUG_PROXY = process.env.AGENTBRIDGE_DEBUG_PROXY === "1";
 }
