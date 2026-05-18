@@ -90,6 +90,28 @@ describe("CLI: owned flag conflict detection", () => {
     expect(exited).toBe(false);
   });
 
+  test("detects --remote after 'resume' subcommand", () => {
+    const args = ["resume", "--remote", "ws://evil"];
+    const ownedFlags = ["--remote"];
+    let exited = false;
+    const origExit = process.exit;
+    process.exit = (() => { exited = true; }) as any;
+    checkOwnedFlagConflicts(args, "agentbridge codex", ownedFlags);
+    process.exit = origExit;
+    expect(exited).toBe(true);
+  });
+
+  test("detects --remote=value after 'fork' subcommand", () => {
+    const args = ["fork", "session-id", "--remote=ws://evil"];
+    const ownedFlags = ["--remote"];
+    let exited = false;
+    const origExit = process.exit;
+    process.exit = (() => { exited = true; }) as any;
+    checkOwnedFlagConflicts(args, "agentbridge codex", ownedFlags);
+    process.exit = origExit;
+    expect(exited).toBe(true);
+  });
+
   test("fallback message uses correct native command name", () => {
     const args = ["--remote", "ws://foo"];
     const ownedFlags = ["--remote"];
@@ -183,6 +205,24 @@ describe("CLI: buildCodexArgs", () => {
   test("help subcommand: pass-through, no bridge flags", () => {
     const r = buildCodexArgs(["help", "resume"], PROXY);
     expect(r.fullArgs).toEqual(["help", "resume"]);
+    expect(r.injectedBridgeFlags).toBe(false);
+  });
+
+  test("plugin subcommand: pass-through, no bridge flags", () => {
+    const r = buildCodexArgs(["plugin", "install", "foo"], PROXY);
+    expect(r.fullArgs).toEqual(["plugin", "install", "foo"]);
+    expect(r.injectedBridgeFlags).toBe(false);
+  });
+
+  test("remote-control subcommand: pass-through, no bridge flags", () => {
+    const r = buildCodexArgs(["remote-control"], PROXY);
+    expect(r.fullArgs).toEqual(["remote-control"]);
+    expect(r.injectedBridgeFlags).toBe(false);
+  });
+
+  test("update subcommand: pass-through, no bridge flags", () => {
+    const r = buildCodexArgs(["update"], PROXY);
+    expect(r.fullArgs).toEqual(["update"]);
     expect(r.injectedBridgeFlags).toBe(false);
   });
 
