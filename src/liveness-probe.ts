@@ -45,7 +45,14 @@ export async function probeLiveness(
 
   if (target.readyState !== OPEN) return false;
 
-  const baseline = target.lastPongAt;
+  // Defensive baseline: take max(lastPongAt, now()) so that ONLY pongs that
+  // physically arrive after we initiated the probe count as proof of liveness.
+  // Why: with Bun's `sendPings: true`, background heartbeat pongs also update
+  // lastPongAt, so a pong from a prior heartbeat that landed just before us
+  // would falsely satisfy `lastPongAt > target.lastPongAt`. Using `now()` as
+  // the floor anchors the probe to wall-clock time, not to whatever past pong
+  // happened to be recorded last.
+  const baseline = Math.max(target.lastPongAt, now());
   try {
     target.ping();
   } catch {

@@ -14,7 +14,12 @@ import { TuiConnectionState } from "./tui-connection-state";
 import { DaemonLifecycle } from "./daemon-lifecycle";
 import { StateDirResolver } from "./state-dir";
 import { ConfigService } from "./config-service";
-import { CLOSE_CODE_REPLACED, CLOSE_CODE_EVICTED_STALE } from "./control-protocol";
+import {
+  CLOSE_CODE_REPLACED,
+  CLOSE_CODE_EVICTED_STALE,
+  CLOSE_CODE_PROBE_IN_PROGRESS,
+} from "./control-protocol";
+import { parsePositiveIntEnv } from "./env-utils";
 import type { ControlClientMessage, ControlServerMessage, DaemonStatus } from "./control-protocol";
 import type { BridgeMessage } from "./types";
 import { probeLiveness as probeLivenessImpl } from "./liveness-probe";
@@ -67,9 +72,10 @@ const ATTACH_STATUS_COOLDOWN_MS = 30_000; // Don't re-send status on rapid reatt
 // surface FIN on a half-open TCP, so readyState alone can't tell us the old peer
 // is gone. When a new frontend arrives while a socket is still OPEN, we ping the
 // old peer; if no pong within this window, we evict it and accept the new one.
-const LIVENESS_PROBE_TIMEOUT_MS = parseInt(
-  process.env.AGENTBRIDGE_LIVENESS_PROBE_TIMEOUT_MS ?? "3000",
-  10,
+const LIVENESS_PROBE_TIMEOUT_MS = parsePositiveIntEnv(
+  "AGENTBRIDGE_LIVENESS_PROBE_TIMEOUT_MS",
+  3000,
+  log,
 );
 const LIVENESS_PROBE_POLL_MS = 50;
 let challengeInProgress = false;
@@ -367,7 +373,10 @@ async function attachClaude(ws: ServerWebSocket<ControlSocketData>) {
       log(
         `Rejecting Claude frontend #${ws.data.clientId} — another liveness probe already in flight`,
       );
-      ws.close(CLOSE_CODE_REPLACED, "another Claude session is already connected");
+      ws.close(
+        CLOSE_CODE_PROBE_IN_PROGRESS,
+        "liveness probe in progress, retry shortly",
+      );
       return;
     }
 
@@ -470,6 +479,14 @@ async function probeLiveness(
  * Evict the incumbent Claude frontend so a newer session can take over.
  * Sends CLOSE_CODE_EVICTED_STALE (4002) and releases the slot so the next
  * attachClaude call can accept a contestant.
+ *
+ * detachClaude arms a 5s grace timer that pings Codex with "Claude went
+ * offline" if nobody re-attaches in that window. For the *handoff* eviction
+ * path (a new frontend is about to attach in the same JS task), attachClaude
+ * cancels that timer at the "Claude frontend attached" step before any
+ * 5s window can elapse. For the *cleanup* eviction path (no replacement —
+ * contestant disappeared mid-probe), letting the timer fire is the correct
+ * behavior: Codex genuinely has no Claude attached.
  */
 function evictStale(ws: ServerWebSocket<ControlSocketData>, reason: string) {
   log(`Evicting stale Claude frontend #${ws.data.clientId}: ${reason}`);

@@ -1625,6 +1625,20 @@ class ConfigService {
 // src/control-protocol.ts
 var CLOSE_CODE_REPLACED = 4001;
 var CLOSE_CODE_EVICTED_STALE = 4002;
+var CLOSE_CODE_PROBE_IN_PROGRESS = 4003;
+
+// src/env-utils.ts
+function parsePositiveIntEnv(name, fallback, log = () => {}) {
+  const raw = process.env[name];
+  if (raw == null || raw === "")
+    return fallback;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed <= 0 || parsed > Number.MAX_SAFE_INTEGER) {
+    log(`Invalid ${name}=${JSON.stringify(raw)} (must be a positive integer within ` + `Number.MAX_SAFE_INTEGER); falling back to ${fallback}`);
+    return fallback;
+  }
+  return parsed;
+}
 
 // src/liveness-probe.ts
 var OPEN = 1;
@@ -1637,7 +1651,7 @@ async function probeLiveness(target, options) {
   } = options;
   if (target.readyState !== OPEN)
     return false;
-  const baseline = target.lastPongAt;
+  const baseline = Math.max(target.lastPongAt, now());
   try {
     target.ping();
   } catch {
@@ -1687,7 +1701,7 @@ var claudeOnlineNoticeSent = false;
 var claudeOfflineNoticeShown = false;
 var lastAttachStatusSentTs = 0;
 var ATTACH_STATUS_COOLDOWN_MS = 30000;
-var LIVENESS_PROBE_TIMEOUT_MS = parseInt(process.env.AGENTBRIDGE_LIVENESS_PROBE_TIMEOUT_MS ?? "3000", 10);
+var LIVENESS_PROBE_TIMEOUT_MS = parsePositiveIntEnv("AGENTBRIDGE_LIVENESS_PROBE_TIMEOUT_MS", 3000, log);
 var LIVENESS_PROBE_POLL_MS = 50;
 var challengeInProgress = false;
 var bufferedMessages = [];
@@ -1910,7 +1924,7 @@ async function attachClaude(ws) {
     log(`Claude frontend contest: new=#${ws.data.clientId}, incumbent=#${occupant.data.clientId} ` + `(readyState=${occupant.readyState}, msSincePong=${msSincePong})`);
     if (challengeInProgress) {
       log(`Rejecting Claude frontend #${ws.data.clientId} \u2014 another liveness probe already in flight`);
-      ws.close(CLOSE_CODE_REPLACED, "another Claude session is already connected");
+      ws.close(CLOSE_CODE_PROBE_IN_PROGRESS, "liveness probe in progress, retry shortly");
       return;
     }
     challengeInProgress = true;

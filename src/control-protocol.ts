@@ -30,3 +30,11 @@ export const CLOSE_CODE_REPLACED = 4001;
  * so a newer session can take over when the OS never surfaced FIN on a dead peer.
  */
 export const CLOSE_CODE_EVICTED_STALE = 4002;
+
+/**
+ * WebSocket close code sent by the daemon when a contestant arrives while a
+ * liveness probe is already in flight against the incumbent. Distinct from
+ * CLOSE_CODE_REPLACED so the contestant's UI can suggest retrying shortly
+ * (the in-flight probe will conclude within LIVENESS_PROBE_TIMEOUT_MS).
+ */
+export const CLOSE_CODE_PROBE_IN_PROGRESS = 4003;
