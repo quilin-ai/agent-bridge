@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { execSync } from "node:child_process";
-import { createServer, Socket, type Server } from "node:net";
+import { createServer, Socket, type AddressInfo, type Server } from "node:net";
 import { CodexAdapter } from "../codex-adapter";
 
 function createAdapter() {
@@ -1081,13 +1081,14 @@ describe("CodexAdapter port precheck — LISTEN-only filter", () => {
   });
 
   test("LISTEN filter ignores stale outbound FDs after listener dies", async () => {
-    const port = 40000 + Math.floor(Math.random() * 10000);
-
+    // Use port 0 so the OS picks a guaranteed-free port — random 40000-50000
+    // can collide on shared CI runners, causing s.listen() to error.
     const server: Server = await new Promise((resolve, reject) => {
       const s = createServer();
       s.once("error", reject);
-      s.listen(port, "127.0.0.1", () => resolve(s));
+      s.listen(0, "127.0.0.1", () => resolve(s));
     });
+    const port = (server.address() as AddressInfo).port;
 
     const client: Socket = await new Promise((resolve, reject) => {
       const c = new Socket();
@@ -1100,8 +1101,16 @@ describe("CodexAdapter port precheck — LISTEN-only filter", () => {
       const withListener = runLsof(CodexAdapter.buildPortListenLsofCommand(port).slice(5));
       expect(withListener).toContain(String(process.pid));
 
-      // Close the listener; the established outbound client FD lingers in this process.
-      await new Promise<void>((r) => server.close(() => r()));
+      // Stop accepting new connections. We intentionally do NOT await the
+      // close callback — that callback only fires when ALL existing
+      // connections drain, but the whole point of this test is to keep the
+      // client connection open so a stale outbound FD lingers. The listener
+      // itself is released synchronously; setImmediate yields once so the
+      // close syscall lands before we run lsof. (Previously we awaited the
+      // callback, which hung forever on Bun/Linux and passed only by event-
+      // loop accident on Bun/macOS.)
+      server.close();
+      await new Promise((r) => setImmediate(r));
 
       // OLD impl `lsof -ti :PORT` (no LISTEN filter) would still find this process
       // via the lingering outbound FD — the false positive that broke `abg claude`.
