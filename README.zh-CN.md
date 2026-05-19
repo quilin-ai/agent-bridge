@@ -171,6 +171,13 @@ agentbridge codex
 
 手动传入这些参数会报错，并提示使用原生命令。
 
+> **关于 `agentbridge codex` 参数位置的说明：** 对于无子命令的 TUI 形式
+> （`agentbridge codex …`），bridge 注入的参数放在最前面。对于带有自己参数的
+> TUI 子命令（`resume`、`fork`），bridge 参数注入到**子命令名之后**（这样
+> clap 才会把它们解析为该子命令的选项，而不是根命令的）。`exec`、`mcp`、
+> `plugin`、`remote-control`、`update` 等非 TUI 子命令则原样透传，不注入
+> bridge 参数。完整定位逻辑见 `src/cli/codex.ts` 的 `buildCodexArgs`。
+
 ## 项目配置
 
 运行 `agentbridge init` 会在项目根目录创建 `.agentbridge/` 目录：

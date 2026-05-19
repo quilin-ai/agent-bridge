@@ -171,6 +171,15 @@ Some flags are automatically injected and cannot be manually specified:
 
 Passing these flags manually will result in a hard error with guidance to use the native command directly.
 
+> **Note on flag positioning for `agentbridge codex`:** For the bare TUI form
+> (`agentbridge codex …`), bridge flags are injected at the front. For TUI
+> subcommands that carry per-subcommand args (`resume`, `fork`), they are
+> injected *after* the subcommand name (so clap parses them as options of the
+> actually-invoked command, not the root). Non-TUI subcommands like `exec`,
+> `mcp`, `plugin`, `remote-control`, `update` etc. are passed through
+> unchanged — no bridge flags injected. See `src/cli/codex.ts buildCodexArgs`
+> for the full positioning logic.
+
 ## Project Config
 
 Running `agentbridge init` creates a `.agentbridge/` directory in your project root:

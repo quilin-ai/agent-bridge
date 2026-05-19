@@ -73,13 +73,26 @@ Current behavior:
 - Uses `DaemonLifecycle` to reuse or launch the background daemon.
 - Reads the live proxy URL from daemon status when available.
 - Falls back to the project config when daemon status is unavailable.
-- Launches Codex with:
+- Launches Codex. The bridge flags (`--enable tui_app_server --remote <url>`)
+  are positioned per the actually-invoked (sub)command, because clap defines
+  `--remote` / `--enable` as per-subcommand options:
 
-```bash
-codex --enable tui_app_server --remote ws://127.0.0.1:<proxy-port>
-```
+  ```bash
+  # Bare TUI — bridge flags injected at the front:
+  codex --enable tui_app_server --remote ws://127.0.0.1:<proxy-port> [prompt]
+
+  # TUI subcommands (resume / fork) — bridge flags injected AFTER the subcommand:
+  codex resume --enable tui_app_server --remote ws://127.0.0.1:<proxy-port> [session-id]
+  codex fork   --enable tui_app_server --remote ws://127.0.0.1:<proxy-port> <session-id>
+
+  # Non-TUI subcommands (exec, mcp, plugin, remote-control, update, …):
+  # passed through unchanged, no bridge flags.
+  codex <subcommand> <user-args>
+  ```
 
 - Passes through additional user arguments after the injected transport flags.
+- See `src/cli/codex.ts` `buildCodexArgs` for the full positioning logic and
+  `NON_TUI_SUBCOMMANDS` for the authoritative non-TUI list.
 
 ### `agentbridge kill`
 
