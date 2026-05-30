@@ -8,6 +8,8 @@ export interface DaemonStatus {
   proxyUrl: string;
   appServerUrl: string;
   pid: number;
+  /** Multi-pair identity for diagnostics; null in legacy/manual single-pair mode. */
+  pairId?: string | null;
 }
 
 export type ControlClientMessage =

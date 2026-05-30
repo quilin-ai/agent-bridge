@@ -12,3 +12,7 @@ agentbridge-context.md
 V1_PROGRESS.md
 # Added by code-review-graph
 .code-review-graph/
+
+# Runtime E2E artifacts and python cache
+artifacts/
+__pycache__/

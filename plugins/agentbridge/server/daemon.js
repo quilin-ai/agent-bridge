@@ -17,16 +17,16 @@ import { homedir, platform } from "os";
 
 class StateDirResolver {
   stateDir;
+  static platformBaseDir() {
+    if (platform() === "darwin") {
+      return join(homedir(), "Library", "Application Support", "AgentBridge");
+    }
+    const xdgState = process.env.XDG_STATE_HOME ?? join(homedir(), ".local", "state");
+    return join(xdgState, "agentbridge");
+  }
   constructor(envOverride) {
     const override = envOverride ?? process.env.AGENTBRIDGE_STATE_DIR;
-    if (override) {
-      this.stateDir = override;
-    } else if (platform() === "darwin") {
-      this.stateDir = join(homedir(), "Library", "Application Support", "AgentBridge");
-    } else {
-      const xdgState = process.env.XDG_STATE_HOME ?? join(homedir(), ".local", "state");
-      this.stateDir = join(xdgState, "agentbridge");
-    }
+    this.stateDir = override && override.length > 0 ? override : StateDirResolver.platformBaseDir();
   }
   ensure() {
     if (!existsSync(this.stateDir)) {
@@ -1487,7 +1487,8 @@ class TuiConnectionState {
 import { spawn as spawn2, execFileSync } from "child_process";
 import { existsSync as existsSync2, readFileSync, unlinkSync, writeFileSync, openSync, closeSync, constants } from "fs";
 import { fileURLToPath } from "url";
-var DAEMON_ENTRY = process.env.AGENTBRIDGE_DAEMON_ENTRY ?? "./daemon.ts";
+var DEFAULT_DAEMON_ENTRY = import.meta.url.endsWith(".ts") ? "./daemon.ts" : "./daemon.js";
+var DAEMON_ENTRY = process.env.AGENTBRIDGE_DAEMON_ENTRY || DEFAULT_DAEMON_ENTRY;
 var DAEMON_PATH = fileURLToPath(new URL(DAEMON_ENTRY, import.meta.url));
 
 class DaemonLifecycle {
@@ -2421,7 +2422,8 @@ function writeStatusFile() {
     proxyUrl: codex.proxyUrl,
     appServerUrl: codex.appServerUrl,
     controlPort: CONTROL_PORT,
-    pid: process.pid
+    pid: process.pid,
+    pairId: process.env.AGENTBRIDGE_PAIR_ID ?? null
   });
 }
 function removeStatusFile() {

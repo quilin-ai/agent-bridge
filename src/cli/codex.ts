@@ -10,9 +10,10 @@ import {
   mkdirSync,
 } from "node:fs";
 import { dirname } from "node:path";
-import { StateDirResolver } from "../state-dir";
 import { ConfigService } from "../config-service";
 import { DaemonLifecycle } from "../daemon-lifecycle";
+import { pairScopedCommand } from "../pair-command";
+import { applyPairEnv, parsePairFlag, type PairResolution } from "../pair-resolver";
 import { StderrRingBuffer } from "../stderr-ring-buffer";
 import { checkOwnedFlagConflicts } from "./claude";
 
@@ -125,19 +126,22 @@ export function buildCodexArgs(userArgs: string[], proxyUrl: string): BuildArgsR
 }
 
 export async function runCodex(args: string[]) {
-  // Check for owned flag conflicts
-  checkOwnedFlagConflicts(args, "agentbridge codex", OWNED_FLAGS);
+  // Strip `--pair <name>` first; the rest flows through to codex.
+  const { pairFlag, rest } = parsePairFlag(args);
+
+  // Check for owned flag conflicts (on the real codex args, not the pair flag).
+  checkOwnedFlagConflicts(rest, "agentbridge codex", OWNED_FLAGS);
 
   // Specifically check for --enable tui_app_server (not all --enable values)
-  for (let i = 0; i < args.length; i++) {
-    if (args[i] === "--enable" && args[i + 1] === "tui_app_server") {
+  for (let i = 0; i < rest.length; i++) {
+    if (rest[i] === "--enable" && rest[i + 1] === "tui_app_server") {
       console.error(`Error: "--enable tui_app_server" is automatically set by agentbridge codex.`);
       console.error("");
       console.error("If you need full control over these flags, use the native command directly:");
       console.error("  codex [your flags here]");
       process.exit(1);
     }
-    if (args[i] === "--enable=tui_app_server") {
+    if (rest[i] === "--enable=tui_app_server") {
       console.error(`Error: "--enable=tui_app_server" is automatically set by agentbridge codex.`);
       console.error("");
       console.error("If you need full control over these flags, use the native command directly:");
@@ -146,16 +150,31 @@ export async function runCodex(args: string[]) {
     }
   }
 
-  const stateDir = new StateDirResolver();
-  const configService = new ConfigService();
-  const config = configService.loadOrDefault();
-  const controlPort = parseInt(process.env.AGENTBRIDGE_CONTROL_PORT ?? "4502", 10);
+  // Resolve the pair and inject its env BEFORE ensureRunning, so the daemon this
+  // launches binds this pair's Codex app-server / proxy / control ports.
+  let pair: PairResolution;
+  try {
+    pair = await applyPairEnv({ pairFlag });
+  } catch (err: any) {
+    console.error(`[agentbridge] ${err.message}`);
+    process.exit(1);
+  }
+
+  const stateDir = pair.stateDir;
+  const controlPort = pair.ports.controlPort;
 
   const lifecycle = new DaemonLifecycle({
     stateDir,
     controlPort,
     log: (msg) => console.error(`[agentbridge] ${msg}`),
   });
+
+  if (!pair.manual) {
+    console.error(
+      `[agentbridge] pair "${pair.pairId}" (slot ${pair.slot}) — control :${controlPort}, ` +
+        `codex :${pair.ports.appPort}/:${pair.ports.proxyPort}`,
+    );
+  }
 
   // Ensure daemon is running
   console.error("[agentbridge] Ensuring daemon is running...");
@@ -165,7 +184,7 @@ export async function runCodex(args: string[]) {
     console.error("[agentbridge] Daemon is ready.");
   } catch (err: any) {
     console.error(`[agentbridge] Failed to start daemon: ${err.message}`);
-    console.error("[agentbridge] Try: agentbridge kill && agentbridge claude");
+    console.error(`[agentbridge] Try: ${pairScopedCommand("kill")} && ${pairScopedCommand("claude")}`);
     process.exit(1);
   }
 
@@ -175,8 +194,13 @@ export async function runCodex(args: string[]) {
   if (status?.proxyUrl) {
     proxyUrl = status.proxyUrl;
   } else {
-    proxyUrl = `ws://127.0.0.1:${config.codex.proxyPort}`;
-    console.error(`[agentbridge] No daemon status found, using config default: ${proxyUrl}`);
+    // Mirror exactly how the daemon resolves its proxy port (daemon.ts:39):
+    // CODEX_PROXY_PORT (set by applyPairEnv in pair mode; user-set in manual mode)
+    // else the project config. This is correct for BOTH multi-pair (env carries
+    // the slot's port) and manual/legacy mode (config may be a custom port).
+    const fallbackProxyPort = process.env.CODEX_PROXY_PORT ?? String(new ConfigService().loadOrDefault().codex.proxyPort);
+    proxyUrl = `ws://127.0.0.1:${fallbackProxyPort}`;
+    console.error(`[agentbridge] No daemon status found, using fallback proxy port: ${proxyUrl}`);
   }
 
   try {
@@ -239,7 +263,7 @@ export async function runCodex(args: string[]) {
     }
   }
 
-  const { fullArgs } = buildCodexArgs(args, proxyUrl);
+  const { fullArgs } = buildCodexArgs(rest, proxyUrl);
 
   // Capture the last 64KB of child stderr so the "ERROR: ..." line from
   // codex-rs on ExitReason::Fatal survives even when stdio is inherited by

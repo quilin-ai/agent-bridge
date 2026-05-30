@@ -734,6 +734,8 @@ function writeStatusFile() {
     appServerUrl: codex.appServerUrl,
     controlPort: CONTROL_PORT,
     pid: process.pid,
+    // Pair identity for diagnostics (null in legacy/manual single-pair mode).
+    pairId: process.env.AGENTBRIDGE_PAIR_ID ?? null,
   });
 }
 

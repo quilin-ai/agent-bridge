@@ -13671,16 +13671,16 @@ import { homedir, platform } from "os";
 
 class StateDirResolver {
   stateDir;
+  static platformBaseDir() {
+    if (platform() === "darwin") {
+      return join(homedir(), "Library", "Application Support", "AgentBridge");
+    }
+    const xdgState = process.env.XDG_STATE_HOME ?? join(homedir(), ".local", "state");
+    return join(xdgState, "agentbridge");
+  }
   constructor(envOverride) {
     const override = envOverride ?? process.env.AGENTBRIDGE_STATE_DIR;
-    if (override) {
-      this.stateDir = override;
-    } else if (platform() === "darwin") {
-      this.stateDir = join(homedir(), "Library", "Application Support", "AgentBridge");
-    } else {
-      const xdgState = process.env.XDG_STATE_HOME ?? join(homedir(), ".local", "state");
-      this.stateDir = join(xdgState, "agentbridge");
-    }
+    this.stateDir = override && override.length > 0 ? override : StateDirResolver.platformBaseDir();
   }
   ensure() {
     if (!existsSync(this.stateDir)) {
@@ -14187,7 +14187,8 @@ class DaemonClient extends EventEmitter2 {
 import { spawn, execFileSync } from "child_process";
 import { existsSync as existsSync2, readFileSync, unlinkSync, writeFileSync, openSync, closeSync, constants } from "fs";
 import { fileURLToPath } from "url";
-var DAEMON_ENTRY = process.env.AGENTBRIDGE_DAEMON_ENTRY ?? "./daemon.ts";
+var DEFAULT_DAEMON_ENTRY = import.meta.url.endsWith(".ts") ? "./daemon.ts" : "./daemon.js";
+var DAEMON_ENTRY = process.env.AGENTBRIDGE_DAEMON_ENTRY || DEFAULT_DAEMON_ENTRY;
 var DAEMON_PATH = fileURLToPath(new URL(DAEMON_ENTRY, import.meta.url));
 
 class DaemonLifecycle {
@@ -14539,19 +14540,30 @@ class ConfigService {
   }
 }
 
+// src/pair-command.ts
+function pairScopedCommand(cmd) {
+  const pairId = process.env.AGENTBRIDGE_PAIR_ID;
+  if (!pairId)
+    return `agentbridge ${cmd}`;
+  const [sub, ...rest] = cmd.split(" ");
+  const tail = rest.length > 0 ? ` ${rest.join(" ")}` : "";
+  return `agentbridge ${sub} --pair ${pairId}${tail}`;
+}
+
 // src/bridge-disabled-state.ts
 function disabledReplyError(reason) {
+  const claudeCmd = pairScopedCommand("claude");
   switch (reason) {
     case "rejected":
-      return "AgentBridge rejected this session \u2014 another Claude Code session is already connected. Close the other session first, or run `agentbridge kill` to reset.";
+      return `AgentBridge rejected this session \u2014 another Claude Code session is already connected. Close the other session first, or run \`${pairScopedCommand("kill")}\` to reset.`;
     case "evicted":
-      return "AgentBridge evicted this session because it stopped responding to liveness probes \u2014 a newer Claude Code session has taken over. Close this session and start a new one with `agentbridge claude`.";
+      return `AgentBridge evicted this session because it stopped responding to liveness probes \u2014 a newer Claude Code session has taken over. Close this session and start a new one with \`${claudeCmd}\`.`;
     case "probe_in_progress":
-      return "AgentBridge rejected this session \u2014 a liveness probe is currently checking the incumbent Claude session. Retry in a few seconds with `agentbridge claude`.";
+      return `AgentBridge rejected this session \u2014 a liveness probe is currently checking the incumbent Claude session. Retry in a few seconds with \`${claudeCmd}\`.`;
     case "auto_recovery_exhausted":
-      return "AgentBridge auto-recovery gave up after exhausting its retry budget for the in-flight liveness probe contention. Retry manually with `agentbridge claude`.";
+      return `AgentBridge auto-recovery gave up after exhausting its retry budget for the in-flight liveness probe contention. Retry manually with \`${claudeCmd}\`.`;
     case "killed":
-      return "AgentBridge is disabled by `agentbridge kill`. Restart Claude Code (`agentbridge claude`), switch to a new conversation, or run `/resume` to reconnect.";
+      return `AgentBridge is disabled by \`agentbridge kill\`. Restart Claude Code (\`${claudeCmd}\`), switch to a new conversation, or run \`/resume\` to reconnect.`;
   }
 }
 
@@ -14633,17 +14645,17 @@ daemonClient.on("rejected", async (code) => {
     case CLOSE_CODE_EVICTED_STALE:
       reason = "evicted";
       notificationId = "system_bridge_evicted";
-      notificationContent = "\u26A0\uFE0F AgentBridge evicted this session because it stopped responding to liveness probes \u2014 a newer Claude Code session has taken over. Close this session and start a new one with `agentbridge claude` if you want to reconnect. AgentBridge \u56E0\u6B64\u4F1A\u8BDD\u672A\u54CD\u5E94\u5B58\u6D3B\u63A2\u6D4B\u800C\u5C06\u5176\u9A71\u9010\u2014\u2014\u66F4\u65B0\u7684 Claude Code \u4F1A\u8BDD\u5DF2\u63A5\u7BA1\u3002\u5982\u9700\u91CD\u8FDE\uFF0C\u8BF7\u5173\u95ED\u6B64\u4F1A\u8BDD\u5E76\u8FD0\u884C `agentbridge claude` \u542F\u52A8\u65B0\u4F1A\u8BDD\u3002";
+      notificationContent = `\u26A0\uFE0F AgentBridge evicted this session because it stopped responding to liveness probes \u2014 a newer Claude Code session has taken over. Close this session and start a new one with \`${pairScopedCommand("claude")}\` if you want to reconnect. AgentBridge \u56E0\u6B64\u4F1A\u8BDD\u672A\u54CD\u5E94\u5B58\u6D3B\u63A2\u6D4B\u800C\u5C06\u5176\u9A71\u9010\u2014\u2014\u66F4\u65B0\u7684 Claude Code \u4F1A\u8BDD\u5DF2\u63A5\u7BA1\u3002\u5982\u9700\u91CD\u8FDE\uFF0C\u8BF7\u5173\u95ED\u6B64\u4F1A\u8BDD\u5E76\u8FD0\u884C \`${pairScopedCommand("claude")}\` \u542F\u52A8\u65B0\u4F1A\u8BDD\u3002`;
       break;
     case CLOSE_CODE_PROBE_IN_PROGRESS:
       reason = "probe_in_progress";
       notificationId = "system_bridge_probe_in_progress";
-      notificationContent = "\u26A0\uFE0F AgentBridge rejected this session \u2014 a liveness probe is currently checking whether the incumbent Claude session is still alive. Retry in a few seconds with `agentbridge claude`. AgentBridge \u62D2\u7EDD\u4E86\u6B64\u4F1A\u8BDD\u2014\u2014\u6B63\u5728\u901A\u8FC7\u5B58\u6D3B\u63A2\u6D4B\u68C0\u67E5\u73B0\u6709 Claude \u4F1A\u8BDD\u662F\u5426\u4ECD\u7136\u5728\u7EBF\u3002\u8BF7\u7A0D\u540E\u7528 `agentbridge claude` \u91CD\u8BD5\u3002";
+      notificationContent = `\u26A0\uFE0F AgentBridge rejected this session \u2014 a liveness probe is currently checking whether the incumbent Claude session is still alive. Retry in a few seconds with \`${pairScopedCommand("claude")}\`. AgentBridge \u62D2\u7EDD\u4E86\u6B64\u4F1A\u8BDD\u2014\u2014\u6B63\u5728\u901A\u8FC7\u5B58\u6D3B\u63A2\u6D4B\u68C0\u67E5\u73B0\u6709 Claude \u4F1A\u8BDD\u662F\u5426\u4ECD\u7136\u5728\u7EBF\u3002\u8BF7\u7A0D\u540E\u7528 \`${pairScopedCommand("claude")}\` \u91CD\u8BD5\u3002`;
       break;
     default:
       reason = "rejected";
       notificationId = "system_bridge_replaced";
-      notificationContent = "\u26A0\uFE0F AgentBridge daemon rejected this session \u2014 another Claude Code session is already connected. Close the other session first, or run `agentbridge kill` to reset. AgentBridge \u5B88\u62A4\u8FDB\u7A0B\u62D2\u7EDD\u4E86\u6B64\u4F1A\u8BDD\u2014\u2014\u53E6\u4E00\u4E2A Claude Code \u4F1A\u8BDD\u5DF2\u5728\u8FDE\u63A5\u4E2D\u3002\u8BF7\u5148\u5173\u95ED\u53E6\u4E00\u4E2A\u4F1A\u8BDD\uFF0C\u6216\u8FD0\u884C `agentbridge kill` \u91CD\u7F6E\u3002";
+      notificationContent = `\u26A0\uFE0F AgentBridge daemon rejected this session \u2014 another Claude Code session is already connected. Close the other session first, or run \`${pairScopedCommand("kill")}\` to reset. AgentBridge \u5B88\u62A4\u8FDB\u7A0B\u62D2\u7EDD\u4E86\u6B64\u4F1A\u8BDD\u2014\u2014\u53E6\u4E00\u4E2A Claude Code \u4F1A\u8BDD\u5DF2\u5728\u8FDE\u63A5\u4E2D\u3002\u8BF7\u5148\u5173\u95ED\u53E6\u4E00\u4E2A\u4F1A\u8BDD\uFF0C\u6216\u8FD0\u884C \`${pairScopedCommand("kill")}\` \u91CD\u7F6E\u3002`;
       break;
   }
   log(`Daemon rejected this session (close code ${code}, reason=${reason})`);
@@ -14659,7 +14671,7 @@ daemonClient.on("rejected", async (code) => {
 claude.on("ready", async () => {
   log(`MCP server ready (delivery mode: ${claude.getDeliveryMode()}) \u2014 ensuring AgentBridge daemon...`);
   if (daemonLifecycle.wasKilled()) {
-    await enterDisabledState("Killed sentinel found \u2014 bridge staying idle", "\u26D4 AgentBridge was stopped by `agentbridge kill`. Bridge is staying idle. Restart Claude Code (`agentbridge claude`), switch to a new conversation, or run `/resume` to reconnect.");
+    await enterDisabledState("Killed sentinel found \u2014 bridge staying idle", `\u26D4 AgentBridge was stopped by \`agentbridge kill\`. Bridge is staying idle. Restart Claude Code (\`${pairScopedCommand("claude")}\`), switch to a new conversation, or run \`/resume\` to reconnect.`);
     return;
   }
   await connectToDaemon();
@@ -14675,7 +14687,7 @@ async function connectToDaemon(isReconnect = false) {
     daemonClient.attachClaude();
     daemonDisabledReason = null;
     if (!isReconnect) {
-      claude.pushNotification(systemMessage("system_bridge_ready", "\u2705 AgentBridge bridge is ready. Daemon connected. Start Codex in another terminal with: agentbridge codex"));
+      claude.pushNotification(systemMessage("system_bridge_ready", `\u2705 AgentBridge bridge is ready. Daemon connected. Start Codex in another terminal with: ${pairScopedCommand("codex")}`));
     }
   } catch (err) {
     log(`Failed to connect to daemon: ${err.message}`);
@@ -14698,7 +14710,7 @@ var reconnectTask = null;
 async function notifyIfDaemonKilled(logMessage) {
   if (!daemonLifecycle.wasKilled())
     return false;
-  await enterDisabledState(logMessage, "\u26D4 AgentBridge was stopped by `agentbridge kill`. Bridge is staying idle. Restart Claude Code (`agentbridge claude`), switch to a new conversation, or run `/resume` to reconnect.");
+  await enterDisabledState(logMessage, `\u26D4 AgentBridge was stopped by \`agentbridge kill\`. Bridge is staying idle. Restart Claude Code (\`${pairScopedCommand("claude")}\`), switch to a new conversation, or run \`/resume\` to reconnect.`);
   return true;
 }
 function reconnectToDaemon() {
@@ -14779,7 +14791,7 @@ async function pollDisabledRecovery() {
           daemonDisabledReason = "auto_recovery_exhausted";
           disabledRecoveryAttempts = 0;
           stopDisabledRecoveryPoller();
-          claude.pushNotification(systemMessage("system_bridge_auto_recovery_gave_up", "\u26A0\uFE0F AgentBridge auto-recovery gave up after exhausting its retry budget for the in-flight liveness probe contention. Retry manually with `agentbridge claude`. AgentBridge \u81EA\u52A8\u6062\u590D\u5DF2\u653E\u5F03\u2014\u2014\u5B58\u6D3B\u63A2\u6D4B\u4E89\u7528\u7684\u91CD\u8BD5\u9884\u7B97\u5DF2\u7528\u5C3D\u3002\u8BF7\u4F7F\u7528 `agentbridge claude` \u624B\u52A8\u91CD\u8BD5\u3002"));
+          claude.pushNotification(systemMessage("system_bridge_auto_recovery_gave_up", `\u26A0\uFE0F AgentBridge auto-recovery gave up after exhausting its retry budget for the in-flight liveness probe contention. Retry manually with \`${pairScopedCommand("claude")}\`. AgentBridge \u81EA\u52A8\u6062\u590D\u5DF2\u653E\u5F03\u2014\u2014\u5B58\u6D3B\u63A2\u6D4B\u4E89\u7528\u7684\u91CD\u8BD5\u9884\u7B97\u5DF2\u7528\u5C3D\u3002\u8BF7\u4F7F\u7528 \`${pairScopedCommand("claude")}\` \u624B\u52A8\u91CD\u8BD5\u3002`));
           return;
         }
         disabledRecoveryAttempts += 1;

@@ -1,22 +1,43 @@
 import { spawn } from "node:child_process";
 import { MARKETPLACE_NAME, PLUGIN_NAME } from "../cli";
 import { DaemonLifecycle } from "../daemon-lifecycle";
-import { StateDirResolver } from "../state-dir";
+import { applyPairEnv, parsePairFlag, type PairResolution } from "../pair-resolver";
 
 /** Flags that AgentBridge owns and will inject automatically. */
 const OWNED_FLAGS = ["--channels", "--dangerously-load-development-channels"];
 
 export async function runClaude(args: string[]) {
-  // Check for owned flag conflicts
-  checkOwnedFlagConflicts(args, "agentbridge claude", OWNED_FLAGS);
+  // Strip `--pair <name>` before anything else; the rest flows through to claude.
+  const { pairFlag, rest } = parsePairFlag(args);
 
-  const stateDir = new StateDirResolver();
-  const controlPort = parseInt(process.env.AGENTBRIDGE_CONTROL_PORT ?? "4502", 10);
+  // Check for owned flag conflicts (on the real claude args, not the pair flag).
+  checkOwnedFlagConflicts(rest, "agentbridge claude", OWNED_FLAGS);
+
+  // Resolve the pair and inject its env (state dir + ports) BEFORE building the
+  // lifecycle or spawning claude, so the daemon, the spawned `claude`, and its
+  // plugin MCP server all target this pair's state dir + control port.
+  let pair: PairResolution;
+  try {
+    pair = await applyPairEnv({ pairFlag });
+  } catch (err: any) {
+    console.error(`[agentbridge] ${err.message}`);
+    process.exit(1);
+  }
+
+  const stateDir = pair.stateDir;
+  const controlPort = pair.ports.controlPort;
   const lifecycle = new DaemonLifecycle({
     stateDir,
     controlPort,
     log: (msg) => console.error(`[agentbridge] ${msg}`),
   });
+
+  if (!pair.manual) {
+    console.error(
+      `[agentbridge] pair "${pair.pairId}" (slot ${pair.slot}) — control :${controlPort}, ` +
+        `codex :${pair.ports.appPort}/:${pair.ports.proxyPort}`,
+    );
+  }
 
   lifecycle.clearKilled();
 
@@ -31,7 +52,7 @@ export async function runClaude(args: string[]) {
   // Once published to the official marketplace, switch to --channels.
   const fullArgs = [
     "--dangerously-load-development-channels", channelEntry,
-    ...args,
+    ...rest,
   ];
 
   const child = spawn("claude", fullArgs, {

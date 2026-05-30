@@ -541,6 +541,99 @@ describe("E2E: CLI surface", () => {
     });
   }, 20000);
 
+  test("agentbridge kill --pair scopes the restart hint to that pair", async () => {
+    await withHarness(async (harness) => {
+      const pairId = "work";
+      const pairStateDir = join(harness.stateDir, "pairs", pairId);
+      mkdirSync(pairStateDir, { recursive: true });
+      writeFileSync(
+        join(harness.stateDir, "pairs", "registry.json"),
+        JSON.stringify(
+          {
+            version: 1,
+            pairs: [
+              {
+                pairId,
+                slot: 0,
+                cwd: harness.projectDir,
+                source: "flag",
+                createdAt: new Date().toISOString(),
+              },
+            ],
+          },
+          null,
+          2,
+        ) + "\n",
+        "utf-8",
+      );
+
+      const pairPorts = await Promise.all([reservePort(), reservePort(), reservePort()]);
+      const [controlPort, appPort, proxyPort] = pairPorts.map((reservation) => reservation.port);
+      for (const reservation of pairPorts) {
+        await reservation.release();
+      }
+
+      const daemon = spawn(process.execPath, ["run", harness.fakeDaemonPath], {
+        cwd: harness.projectDir,
+        env: {
+          ...harness.env,
+          AGENTBRIDGE_STATE_DIR: pairStateDir,
+          AGENTBRIDGE_CONTROL_PORT: String(controlPort),
+          CODEX_WS_PORT: String(appPort),
+          CODEX_PROXY_PORT: String(proxyPort),
+        },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      const trackedDaemon: TrackedProcess = { child: daemon, stdout: [], stderr: [] };
+      daemon.stdout?.on("data", (chunk) => trackedDaemon.stdout.push(chunk.toString()));
+      daemon.stderr?.on("data", (chunk) => trackedDaemon.stderr.push(chunk.toString()));
+
+      try {
+        await waitFor(() => existsSync(join(pairStateDir, "daemon.pid")), 80, 50);
+
+        const result = await harness.runCli(["kill", "--pair", pairId]);
+
+        expect(result.code).toBe(0);
+        expect(result.stdout).toContain("AgentBridge stopped.");
+        expect(result.stdout).toContain("Please restart Claude Code (`agentbridge claude --pair work`)");
+        expect(result.stdout).not.toContain("Please restart Claude Code (`agentbridge claude`)");
+      } finally {
+        await stopProcess(trackedDaemon);
+      }
+    });
+  }, 20000);
+
+  test("agentbridge kill --help prints usage without stopping a running daemon", async () => {
+    await withHarness(async (harness) => {
+      await harness.startManagedFakeDaemon();
+      const pid = harness.readPid();
+      expect(pid).not.toBeNull();
+
+      const result = await harness.runCli(["kill", "--help"]);
+
+      expect(result.code).toBe(0);
+      expect(result.stdout).toContain("Usage: abg kill");
+      expect(result.stdout).toContain("--pair <id>");
+      expect(pid && isProcessAlive(pid)).toBe(true);
+      expect(existsSync(join(harness.stateDir, "killed"))).toBe(false);
+    });
+  }, 20000);
+
+  test("agentbridge kill rejects unknown flags without stopping a running daemon", async () => {
+    await withHarness(async (harness) => {
+      await harness.startManagedFakeDaemon();
+      const pid = harness.readPid();
+      expect(pid).not.toBeNull();
+
+      const result = await harness.runCli(["kill", "--badflag"]);
+
+      expect(result.code).toBe(1);
+      expect(result.stderr).toContain("Unknown kill argument: --badflag");
+      expect(pid && isProcessAlive(pid)).toBe(true);
+      expect(existsSync(join(harness.stateDir, "killed"))).toBe(false);
+    });
+  }, 20000);
+
   test("bridge stays idle and does not relaunch daemon after kill writes the killed sentinel", async () => {
     await withHarness(async (harness) => {
       const bridge = await harness.spawnBridge();

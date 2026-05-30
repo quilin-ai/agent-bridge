@@ -7,6 +7,7 @@ import { DaemonLifecycle } from "./daemon-lifecycle";
 import { StateDirResolver } from "./state-dir";
 import { ConfigService } from "./config-service";
 import { disabledReplyError, type BridgeDisabledReason } from "./bridge-disabled-state";
+import { pairScopedCommand } from "./pair-command";
 import {
   CLOSE_CODE_EVICTED_STALE,
   CLOSE_CODE_PROBE_IN_PROGRESS,
@@ -115,17 +116,17 @@ daemonClient.on("rejected", async (code: number) => {
     case CLOSE_CODE_EVICTED_STALE:
       reason = "evicted";
       notificationId = "system_bridge_evicted";
-      notificationContent = "⚠️ AgentBridge evicted this session because it stopped responding to liveness probes — a newer Claude Code session has taken over. Close this session and start a new one with `agentbridge claude` if you want to reconnect. AgentBridge 因此会话未响应存活探测而将其驱逐——更新的 Claude Code 会话已接管。如需重连，请关闭此会话并运行 `agentbridge claude` 启动新会话。";
+      notificationContent = `⚠️ AgentBridge evicted this session because it stopped responding to liveness probes — a newer Claude Code session has taken over. Close this session and start a new one with \`${pairScopedCommand("claude")}\` if you want to reconnect. AgentBridge 因此会话未响应存活探测而将其驱逐——更新的 Claude Code 会话已接管。如需重连，请关闭此会话并运行 \`${pairScopedCommand("claude")}\` 启动新会话。`;
       break;
     case CLOSE_CODE_PROBE_IN_PROGRESS:
       reason = "probe_in_progress";
       notificationId = "system_bridge_probe_in_progress";
-      notificationContent = "⚠️ AgentBridge rejected this session — a liveness probe is currently checking whether the incumbent Claude session is still alive. Retry in a few seconds with `agentbridge claude`. AgentBridge 拒绝了此会话——正在通过存活探测检查现有 Claude 会话是否仍然在线。请稍后用 `agentbridge claude` 重试。";
+      notificationContent = `⚠️ AgentBridge rejected this session — a liveness probe is currently checking whether the incumbent Claude session is still alive. Retry in a few seconds with \`${pairScopedCommand("claude")}\`. AgentBridge 拒绝了此会话——正在通过存活探测检查现有 Claude 会话是否仍然在线。请稍后用 \`${pairScopedCommand("claude")}\` 重试。`;
       break;
     default:
       reason = "rejected";
       notificationId = "system_bridge_replaced";
-      notificationContent = "⚠️ AgentBridge daemon rejected this session — another Claude Code session is already connected. Close the other session first, or run `agentbridge kill` to reset. AgentBridge 守护进程拒绝了此会话——另一个 Claude Code 会话已在连接中。请先关闭另一个会话，或运行 `agentbridge kill` 重置。";
+      notificationContent = `⚠️ AgentBridge daemon rejected this session — another Claude Code session is already connected. Close the other session first, or run \`${pairScopedCommand("kill")}\` to reset. AgentBridge 守护进程拒绝了此会话——另一个 Claude Code 会话已在连接中。请先关闭另一个会话，或运行 \`${pairScopedCommand("kill")}\` 重置。`;
       break;
   }
   log(`Daemon rejected this session (close code ${code}, reason=${reason})`);
@@ -150,7 +151,7 @@ claude.on("ready", async () => {
   if (daemonLifecycle.wasKilled()) {
     await enterDisabledState(
       "Killed sentinel found — bridge staying idle",
-      "⛔ AgentBridge was stopped by `agentbridge kill`. Bridge is staying idle. Restart Claude Code (`agentbridge claude`), switch to a new conversation, or run `/resume` to reconnect.",
+      `⛔ AgentBridge was stopped by \`agentbridge kill\`. Bridge is staying idle. Restart Claude Code (\`${pairScopedCommand("claude")}\`), switch to a new conversation, or run \`/resume\` to reconnect.`,
     );
     return;
   }
@@ -171,7 +172,7 @@ async function connectToDaemon(isReconnect = false) {
     if (!isReconnect) {
       void claude.pushNotification(systemMessage(
         "system_bridge_ready",
-        "✅ AgentBridge bridge is ready. Daemon connected. Start Codex in another terminal with: agentbridge codex",
+        `✅ AgentBridge bridge is ready. Daemon connected. Start Codex in another terminal with: ${pairScopedCommand("codex")}`,
       ));
     }
   } catch (err: any) {
@@ -205,7 +206,7 @@ async function notifyIfDaemonKilled(logMessage: string) {
 
   await enterDisabledState(
     logMessage,
-    "⛔ AgentBridge was stopped by `agentbridge kill`. Bridge is staying idle. Restart Claude Code (`agentbridge claude`), switch to a new conversation, or run `/resume` to reconnect.",
+    `⛔ AgentBridge was stopped by \`agentbridge kill\`. Bridge is staying idle. Restart Claude Code (\`${pairScopedCommand("claude")}\`), switch to a new conversation, or run \`/resume\` to reconnect.`,
   );
   return true;
 }
@@ -311,7 +312,7 @@ async function pollDisabledRecovery() {
           stopDisabledRecoveryPoller();
           void claude.pushNotification(systemMessage(
             "system_bridge_auto_recovery_gave_up",
-            "⚠️ AgentBridge auto-recovery gave up after exhausting its retry budget for the in-flight liveness probe contention. Retry manually with `agentbridge claude`. AgentBridge 自动恢复已放弃——存活探测争用的重试预算已用尽。请使用 `agentbridge claude` 手动重试。",
+            `⚠️ AgentBridge auto-recovery gave up after exhausting its retry budget for the in-flight liveness probe contention. Retry manually with \`${pairScopedCommand("claude")}\`. AgentBridge 自动恢复已放弃——存活探测争用的重试预算已用尽。请使用 \`${pairScopedCommand("claude")}\` 手动重试。`,
           ));
           return;
         }

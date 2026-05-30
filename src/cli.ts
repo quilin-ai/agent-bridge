@@ -39,7 +39,11 @@ async function main() {
       break;
     case "kill":
       const { runKill } = await import("./cli/kill");
-      await runKill();
+      await runKill(restArgs);
+      break;
+    case "pairs":
+      const { runPairs } = await import("./cli/pairs");
+      await runPairs(restArgs);
       break;
     case "--help":
     case "-h":
@@ -66,23 +70,33 @@ Usage:
   abg <command> [args...]
 
 Commands:
-  init              Install plugin, check dependencies, generate project config
-  dev               Register local marketplace + install plugin (for local dev)
-  claude [args...]  Start Claude Code with push channel enabled
-  codex [args...]   Start Codex TUI connected to AgentBridge daemon
-  kill              Force kill all AgentBridge processes
+  init               Install plugin, check dependencies, generate project config
+  dev                Register local marketplace + install plugin (for local dev)
+  claude [args...]   Start Claude Code with push channel enabled
+  codex [args...]    Start Codex TUI connected to AgentBridge daemon
+  pairs [rm <id>]    List running Claude+Codex pairs (or remove one)
+  kill [--pair <id>] Stop all pairs, or just one with --pair (alias: --all)
 
 Options:
-  --help, -h        Show this help message
-  --version, -v     Show version
+  --pair <name>      Run claude/codex in a named pair (multiple pairs per machine).
+                     Without it, the pair is derived from the current directory.
+  --help, -h         Show this help message
+  --version, -v      Show version
+
+Multi-pair:
+  Each pair is an isolated daemon with its own port triple. The first pair uses
+  the classic ports 4500/4501/4502; each additional pair steps +10.
 
 Examples:
   abg init                     # First-time setup
-  abg claude                   # Start Claude Code
-  abg claude --resume          # Start Claude Code and resume session
-  abg codex                    # Start Codex TUI
-  abg codex --model o3         # Start Codex with specific model
-  abg kill                     # Emergency: kill all processes
+  abg claude                   # Start Claude Code (pair derived from cwd)
+  abg claude --pair work       # Start a named pair "work"
+  abg codex  --pair work       # Connect Codex to the "work" pair
+  abg claude --pair review     # A second, parallel pair
+  abg pairs                    # List all pairs and their ports/status
+  abg pairs rm work            # Stop the "work" pair and free its slot
+  abg kill --pair work         # Stop only the "work" pair
+  abg kill                     # Stop ALL pairs
 `.trim());
 }
 

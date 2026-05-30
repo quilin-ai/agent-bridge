@@ -3,9 +3,11 @@ import { existsSync, readFileSync, unlinkSync, writeFileSync, openSync, closeSyn
 import { fileURLToPath } from "node:url";
 import { StateDirResolver } from "./state-dir";
 
-// When bundled into a Claude Code plugin, the frontend runs from the plugin
-// cache directory and must launch the sibling daemon bundle from there.
-const DAEMON_ENTRY = process.env.AGENTBRIDGE_DAEMON_ENTRY ?? "./daemon.ts";
+// In source/dev mode this module is loaded from src/*.ts and can launch the
+// sibling daemon.ts directly. In bundled CLI/plugin mode it is loaded from a
+// generated *.js bundle, so the daemon must be a sibling daemon.js artifact.
+const DEFAULT_DAEMON_ENTRY = import.meta.url.endsWith(".ts") ? "./daemon.ts" : "./daemon.js";
+const DAEMON_ENTRY = process.env.AGENTBRIDGE_DAEMON_ENTRY || DEFAULT_DAEMON_ENTRY;
 const DAEMON_PATH = fileURLToPath(new URL(DAEMON_ENTRY, import.meta.url));
 
 export interface DaemonLifecycleOptions {
