@@ -124,6 +124,8 @@ class CodexAdapter extends EventEmitter {
   pendingRequests = new Map;
   activeTurnIds = new Set;
   turnInProgress = false;
+  turnWatchdogs = new Map;
+  threadSwitchSeq = 0;
   nextProxyId = 1e5;
   upstreamToClient = new Map;
   serverRequestToProxy = new Map;
@@ -197,6 +199,7 @@ class CodexAdapter extends EventEmitter {
     this.proxyServer?.stop();
     this.proxyServer = null;
     this.clearResponseTrackingState();
+    this.resetTurnState("adapter disconnect");
   }
   stop() {
     this.intentionalDisconnect = true;
@@ -323,8 +326,7 @@ class CodexAdapter extends EventEmitter {
       } catch {}
     }
     this.clearResponseTrackingStateForAppServerReconnect();
-    this.activeTurnIds.clear();
-    this.turnInProgress = false;
+    this.resetTurnState("app-server reconnect for new TUI session");
     try {
       await this.connectToAppServer(false);
       this.log("App-server reconnected for new TUI session \u2014 replaying buffered messages");
@@ -378,8 +380,7 @@ class CodexAdapter extends EventEmitter {
     this.log(`App-server connection closed (intentional=${intentional}, tuiConnected=${tuiConnected}, turnInProgress=${this.turnInProgress})`);
     this.appServerWs = null;
     this.clearResponseTrackingState();
-    this.activeTurnIds.clear();
-    this.turnInProgress = false;
+    this.resetTurnState("app-server connection closed");
     if (!intentional) {
       this.scheduleReconnect();
     }
@@ -811,6 +812,9 @@ class CodexAdapter extends EventEmitter {
   handleAppServerPayload(raw) {
     try {
       const parsed = JSON.parse(raw);
+      if (typeof parsed === "object" && parsed !== null) {
+        this.refreshTurnWatchdogs();
+      }
       if (typeof parsed === "object" && parsed !== null && "id" in parsed) {
         if (this.tryConsumeReplayResponse(parsed)) {
           return null;
@@ -1039,6 +1043,9 @@ class CodexAdapter extends EventEmitter {
         pending.threadId = threadId;
       }
     }
+    if (method === "thread/start" || method === "thread/resume") {
+      pending.threadSwitchSeq = ++this.threadSwitchSeq;
+    }
     if (this.pendingRequests.has(key)) {
       this.log(`WARNING: overwriting pending request for key ${key}`);
     }
@@ -1062,6 +1069,10 @@ class CodexAdapter extends EventEmitter {
     }
     switch (pending.method) {
       case "thread/start": {
+        if (!this.isLatestThreadSwitch(pending)) {
+          this.log(`Ignoring stale thread/start response ${key} (seq=${pending.threadSwitchSeq} < latest=${this.threadSwitchSeq})`);
+          break;
+        }
         const threadId = message?.result?.thread?.id;
         if (typeof threadId === "string" && threadId.length > 0) {
           this.setActiveThreadId(threadId, `thread/start response ${key}`);
@@ -1070,6 +1081,10 @@ class CodexAdapter extends EventEmitter {
         break;
       }
       case "thread/resume": {
+        if (!this.isLatestThreadSwitch(pending)) {
+          this.log(`Ignoring stale thread/resume response ${key} (seq=${pending.threadSwitchSeq} < latest=${this.threadSwitchSeq})`);
+          break;
+        }
         const threadId = message?.result?.thread?.id;
         if (typeof threadId === "string" && threadId.length > 0) {
           this.setActiveThreadId(threadId, `thread/resume response ${key}`);
@@ -1082,10 +1097,17 @@ class CodexAdapter extends EventEmitter {
       }
       case "turn/start":
         if (pending.threadId) {
-          this.setActiveThreadId(pending.threadId, `turn/start response ${key}`);
+          if (this.threadId === null || this.threadId === pending.threadId) {
+            this.setActiveThreadId(pending.threadId, `turn/start response ${key}`);
+          } else {
+            this.log(`Ignoring turn/start response ${key} threadId=${pending.threadId} (active thread is ${this.threadId})`);
+          }
         }
         break;
     }
+  }
+  isLatestThreadSwitch(pending) {
+    return pending.threadSwitchSeq === this.threadSwitchSeq;
   }
   setActiveThreadId(threadId, reason) {
     if (this.threadId === threadId)
@@ -1101,11 +1123,9 @@ class CodexAdapter extends EventEmitter {
   }
   markTurnStarted(turnId) {
     const wasInProgress = this.turnInProgress;
-    if (typeof turnId === "string" && turnId.length > 0) {
-      this.activeTurnIds.add(turnId);
-    } else {
-      this.activeTurnIds.add(`unknown:${Date.now()}`);
-    }
+    const turnKey = typeof turnId === "string" && turnId.length > 0 ? turnId : `unknown:${Date.now()}`;
+    this.activeTurnIds.add(turnKey);
+    this.scheduleTurnWatchdog(turnKey);
     this.turnInProgress = this.activeTurnIds.size > 0;
     if (!wasInProgress && this.turnInProgress) {
       this.emit("turnStarted");
@@ -1114,10 +1134,67 @@ class CodexAdapter extends EventEmitter {
   markTurnCompleted(turnId) {
     if (typeof turnId === "string" && turnId.length > 0) {
       this.activeTurnIds.delete(turnId);
+      this.clearTurnWatchdog(turnId);
     } else {
       this.activeTurnIds.clear();
+      this.clearAllTurnWatchdogs();
     }
     this.turnInProgress = this.activeTurnIds.size > 0;
+  }
+  turnWatchdogMs() {
+    const v = Number(process.env.AGENTBRIDGE_TURN_WATCHDOG_MS);
+    return Number.isFinite(v) && v > 0 ? v : 300000;
+  }
+  scheduleTurnWatchdog(turnKey) {
+    this.clearTurnWatchdog(turnKey);
+    const timer = setTimeout(() => {
+      if (!this.activeTurnIds.has(turnKey))
+        return;
+      this.log(`WARNING: turn ${turnKey} watchdog fired after ${this.turnWatchdogMs()}ms of inactivity \u2014 ` + `assuming a lost turn/completed; force-completing to unblock injection`);
+      this.forceCompleteTurn(turnKey);
+    }, this.turnWatchdogMs());
+    timer.unref?.();
+    this.turnWatchdogs.set(turnKey, timer);
+  }
+  clearTurnWatchdog(turnKey) {
+    const timer = this.turnWatchdogs.get(turnKey);
+    if (timer) {
+      clearTimeout(timer);
+      this.turnWatchdogs.delete(turnKey);
+    }
+  }
+  clearAllTurnWatchdogs() {
+    for (const timer of this.turnWatchdogs.values())
+      clearTimeout(timer);
+    this.turnWatchdogs.clear();
+  }
+  refreshTurnWatchdogs() {
+    if (this.turnWatchdogs.size === 0)
+      return;
+    for (const turnKey of [...this.turnWatchdogs.keys()]) {
+      this.scheduleTurnWatchdog(turnKey);
+    }
+  }
+  forceCompleteTurn(turnKey) {
+    const wasInProgress = this.turnInProgress;
+    this.activeTurnIds.delete(turnKey);
+    this.clearTurnWatchdog(turnKey);
+    this.turnInProgress = this.activeTurnIds.size > 0;
+    if (wasInProgress && !this.turnInProgress) {
+      this.emit("turnCompleted");
+    }
+  }
+  resetTurnState(reason, emitCompleted = false) {
+    const wasInProgress = this.turnInProgress;
+    this.activeTurnIds.clear();
+    this.clearAllTurnWatchdogs();
+    this.turnInProgress = false;
+    if (emitCompleted && wasInProgress) {
+      this.emit("turnCompleted");
+    }
+    if (wasInProgress) {
+      this.log(`Turn state reset (${reason})`);
+    }
   }
   requestKey(id) {
     if (typeof id === "number" || typeof id === "string")
