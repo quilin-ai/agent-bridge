@@ -22,3 +22,9 @@ jobs:
 
       - name: Run full check
         run: bun run check
+
+      - name: Release smoke (built CLI artifacts)
+        run: bun run smoke:built
+
+      - name: Release smoke (npm pack completeness)
+        run: bun run smoke:pack

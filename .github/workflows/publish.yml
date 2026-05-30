@@ -27,6 +27,14 @@ jobs:
       - name: Build
         run: bun run prepublishOnly
 
+      - name: Release smoke (built CLI artifacts) — blocks publish if the package can't start a daemon
+        # --skip-build: reuse the exact dist/ from the Build step above (the bytes
+        # that will be published) instead of rebuilding.
+        run: bun scripts/smoke-built-cli.mjs --skip-build
+
+      - name: Release smoke (npm pack completeness) — blocks publish if a shipped artifact is missing
+        run: bun run smoke:pack
+
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
