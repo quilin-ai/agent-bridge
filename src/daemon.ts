@@ -487,6 +487,7 @@ function detachClaude(ws: ServerWebSocket<ControlSocketData>, reason: string) {
  */
 async function handleProbeIncumbent(ws: ServerWebSocket<ControlSocketData>) {
   const occupant = attachedClaude;
+  log(`probe_incumbent from #${ws.data.clientId}: occupant=${occupant ? "#" + occupant.data.clientId : "none"} readyState=${occupant?.readyState}`);
   if (!occupant || occupant === ws || occupant.readyState !== WebSocket.OPEN) {
     sendProtocolMessage(ws, { type: "incumbent_status", connected: false, alive: false });
     return;
@@ -505,6 +506,7 @@ async function handleProbeIncumbent(ws: ServerWebSocket<ControlSocketData>) {
   const alive = await probeLiveness(occupant, LIVENESS_PROBE_TIMEOUT_MS);
   // The probe awaited; re-read state in case the incumbent closed meanwhile.
   const stillConnected = attachedClaude === occupant && occupant.readyState === WebSocket.OPEN;
+  log(`probe_incumbent reply to #${ws.data.clientId}: connected=${stillConnected} alive=${stillConnected && alive}`);
   sendProtocolMessage(ws, {
     type: "incumbent_status",
     connected: stillConnected,

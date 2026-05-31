@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { MARKETPLACE_NAME, PLUGIN_NAME } from "../cli";
 import { DaemonClient } from "../daemon-client";
 import { DaemonLifecycle } from "../daemon-lifecycle";
+import { parsePositiveIntEnv } from "../env-utils";
 import { applyPairEnv, parsePairFlag, type PairResolution } from "../pair-resolver";
 
 /** Flags that AgentBridge owns and will inject automatically. */
@@ -107,7 +108,17 @@ async function assertPairNotLive(lifecycle: DaemonLifecycle, pair: PairResolutio
   let incumbent: { connected: boolean; alive: boolean };
   try {
     await client.connect();
-    incumbent = await client.probeIncumbent();
+    // The daemon answers `probe_incumbent` only AFTER running its own liveness
+    // ping against the incumbent (up to AGENTBRIDGE_LIVENESS_PROBE_TIMEOUT_MS).
+    // The client must therefore wait LONGER than the daemon's probe, or the two
+    // timeouts race and a live-but-slightly-delayed pong reply is missed (→ the
+    // guard wrongly fails open). Use the SAME parser the daemon uses for this env
+    // (parsePositiveIntEnv — rejects "1.5"/"10abc"/negatives) so the two never
+    // disagree on the value, then add a margin. (If the daemon was started with a
+    // larger override than this process sees, the margin may not fully cover it;
+    // the daemon's own admission probe at attach time remains the backstop.)
+    const daemonProbeMs = parsePositiveIntEnv("AGENTBRIDGE_LIVENESS_PROBE_TIMEOUT_MS", 3000);
+    incumbent = await client.probeIncumbent(daemonProbeMs + 2500);
   } catch {
     return; // probe failed → fail open
   } finally {
