@@ -2203,7 +2203,7 @@ async function probeLiveness(target, options) {
   } = options;
   if (target.readyState !== OPEN)
     return false;
-  const baseline = Math.max(target.lastPongAt, now());
+  const baseline = target.pongCount;
   try {
     target.ping();
   } catch {
@@ -2211,13 +2211,13 @@ async function probeLiveness(target, options) {
   }
   const deadline = now() + timeoutMs;
   while (now() < deadline) {
-    if (target.lastPongAt > baseline)
+    if (target.pongCount > baseline)
       return true;
     if (target.readyState !== OPEN)
       return false;
     await sleep(pollMs);
   }
-  return target.lastPongAt > baseline;
+  return target.pongCount > baseline;
 }
 
 // src/daemon.ts
@@ -2372,7 +2372,7 @@ function startControlServer() {
       if (url.pathname === "/readyz") {
         return Response.json(currentStatus(), { status: codexBootstrapped ? 200 : 503 });
       }
-      if (url.pathname === "/ws" && server.upgrade(req, { data: { clientId: 0, attached: false, lastPongAt: Date.now() } })) {
+      if (url.pathname === "/ws" && server.upgrade(req, { data: { clientId: 0, attached: false, lastPongAt: Date.now(), pongCount: 0 } })) {
         return;
       }
       return new Response("AgentBridge daemon");
@@ -2396,6 +2396,7 @@ function startControlServer() {
       },
       pong: (ws) => {
         ws.data.lastPongAt = Date.now();
+        ws.data.pongCount++;
       }
     }
   });
@@ -2571,8 +2572,8 @@ async function probeLiveness2(ws, timeoutMs) {
     get readyState() {
       return ws.readyState;
     },
-    get lastPongAt() {
-      return ws.data.lastPongAt;
+    get pongCount() {
+      return ws.data.pongCount;
     },
     ping: () => {
       ws.ping();

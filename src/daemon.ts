@@ -27,7 +27,10 @@ import { probeLiveness as probeLivenessImpl } from "./liveness-probe";
 interface ControlSocketData {
   clientId: number;
   attached: boolean;
+  /** Wall-clock of the last pong (used only for the contest diagnostic log). */
   lastPongAt: number;
+  /** Monotonic pong counter — the liveness probe's source of truth (see liveness-probe.ts). */
+  pongCount: number;
 }
 
 const stateDir = new StateDirResolver();
@@ -256,7 +259,7 @@ function startControlServer() {
         return Response.json(currentStatus(), { status: codexBootstrapped ? 200 : 503 });
       }
 
-      if (url.pathname === "/ws" && server.upgrade(req, { data: { clientId: 0, attached: false, lastPongAt: Date.now() } })) {
+      if (url.pathname === "/ws" && server.upgrade(req, { data: { clientId: 0, attached: false, lastPongAt: Date.now(), pongCount: 0 } })) {
         return undefined;
       }
 
@@ -281,6 +284,7 @@ function startControlServer() {
       },
       pong: (ws: ServerWebSocket<ControlSocketData>) => {
         ws.data.lastPongAt = Date.now();
+        ws.data.pongCount++;
       },
     },
   });
@@ -521,7 +525,7 @@ async function probeLiveness(
   return probeLivenessImpl(
     {
       get readyState() { return ws.readyState; },
-      get lastPongAt() { return ws.data.lastPongAt; },
+      get pongCount() { return ws.data.pongCount; },
       ping: () => { ws.ping(); },
     },
     { timeoutMs, pollMs: LIVENESS_PROBE_POLL_MS },
