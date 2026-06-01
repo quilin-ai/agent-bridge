@@ -2,6 +2,13 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## 语言 / Language
+
+- **强制使用中文回复**（用户明确要求 / 强制项目级规则）。所有面向用户的输出（解释、报告、问答、plan、commit message 中的中文部分、issue / report）使用中文。
+- 代码内的注释、变量名、提交信息中的英文部分、日志保持英文（与项目既有约定一致）。
+- 涉及给用户读的内容（README、用户文档、终端说明）必须中文优先。
+- 若用户用英文提问，仍**用中文回复**（除非他明确要求英文）。
+
 ## Commands
 
 Runtime is **Bun** — do not change the local Bun version.
