@@ -248,6 +248,15 @@ describe("findPairForFlag — cwd-scoped name resolution (used by kill / pairs r
     expect(findPairForFlag(base, "/tmp/unrelated", pairId)?.pairId).toBe(pairId);
   });
 
+  test("trims a raw composite pairId flag (kill/pairs aligns with launch on whitespace)", () => {
+    const base = makeBase();
+    const cwd = "/tmp/projX";
+    const pairId = seed(base, cwd, "work");
+    // A flag with surrounding whitespace must resolve to the same pair as the trimmed
+    // form — matching resolvePair (launch), which validates/trims before the raw match.
+    expect(findPairForFlag(base, "/tmp/unrelated", `  ${pairId}  `)?.pairId).toBe(pairId);
+  });
+
   test("reaches an OLD verbatim-id entry (no name field) via the raw fallback", () => {
     const base = makeBase();
     writeRegistry(base, { version: 1, pairs: [entry("work", 0)] }); // legacy shape

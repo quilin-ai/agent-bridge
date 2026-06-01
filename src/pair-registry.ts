@@ -86,6 +86,13 @@ export interface ResolvedPair {
   /** Friendly, cwd-scoped name ({@link DEFAULT_PAIR_NAME} when no `--pair` given). */
   name: string;
   entry: PairEntry;
+  /**
+   * Non-blocking advisory the CLI prints to stderr (never thrown, never persisted).
+   * Set when a raw pairId matched a pair from a DIFFERENT cwd (reused, but project
+   * context differs), or when the flag LOOKS like a full pairId yet matched nothing
+   * so a new pair was allocated (likely a pasted/typed pairId mistaken for a name).
+   */
+  warning?: string;
 }
 
 export type PairErrorCode =
@@ -640,9 +647,11 @@ export interface ResolvePairOptions {
  * control port is treated as "already running", not a conflict.
  *
  * UPGRADE NOTE: the pairId scheme changed to the cwd-scoped `<name>-<hash>` form.
- * Entries written by an older build (verbatim `--pair` ids, or a different
- * cwd-derivation) will NOT be matched here, so a launch allocates a fresh slot
- * rather than reusing the legacy one. The legacy entry remains visible in
+ * Entries written by an older build (a different cwd-derivation) will NOT match the
+ * scoped (name + cwd) lookup, so a launch allocates a fresh slot rather than reusing
+ * the legacy one — EXCEPT when an explicit `--pair <verbatim-id>` equals an existing
+ * pairId verbatim: the step-2 raw fallback below then reuses that entry (the
+ * `abg --pair <pairId>` recovery path). The legacy entry remains visible in
  * `abg pairs` and is reclaimable with `abg pairs rm <id>` or `abg kill`
  * (kill-all stops every registered pair regardless of id shape). We intentionally
  * do not auto-migrate: the old id format is ambiguous and this is pre-v1.
@@ -661,12 +670,27 @@ export async function resolvePair(base: string, opts: ResolvePairOptions): Promi
   const pairId = derivePairId(opts.cwd, name);
   const source: PairEntry["source"] = hasFlag ? "flag" : "cwd";
   const lower = pairId.toLowerCase();
+  // Raw match key: the flag verbatim (validated/trimmed into `name`), in case it is
+  // ALREADY a full pairId copied from `abg pairs` (which is cwd-independent).
+  const flagLower = name.toLowerCase();
 
-  const { slot, entry, isNew } = await withRegistryLock(base, () => {
+  const { slot, entry, isNew, matchedRaw } = await withRegistryLock(base, () => {
     const reg = readRegistry(base);
-    const existing = reg.pairs.find((p) => p.pairId.toLowerCase() === lower);
-    if (existing) return { slot: existing.slot, entry: existing, isNew: false };
+    // 1) Scoped (name + cwd) match first: a friendly name in THIS directory always
+    //    wins, so normal `--pair main` is unaffected and a foreign raw pairId can
+    //    never steal a legitimate current-cwd name.
+    const scoped = reg.pairs.find((p) => p.pairId.toLowerCase() === lower);
+    if (scoped) return { slot: scoped.slot, entry: scoped, isNew: false, matchedRaw: false };
+    // 2) Raw pairId fallback: the flag itself IS an already-registered pairId.
+    //    Mirrors findPairForFlag() so a launch (`abg --pair <id> codex`) agrees with
+    //    kill/pairs, and fixes the double-hash strand where passing a full pairId
+    //    silently spawned a brand-new empty pair with no peer.
+    if (hasFlag) {
+      const raw = reg.pairs.find((p) => p.pairId.toLowerCase() === flagLower);
+      if (raw) return { slot: raw.slot, entry: raw, isNew: false, matchedRaw: true };
+    }
 
+    // 3) No match → allocate a fresh slot for the cwd-scoped pairId.
     const newSlot = pickLowestFreeSlot(reg.pairs);
     if (newSlot === 0) {
       const legacy = detectLegacyRootDaemon(base);
@@ -692,7 +716,7 @@ export async function resolvePair(base: string, opts: ResolvePairOptions): Promi
       createdAt: new Date().toISOString(),
     };
     writeRegistry(base, { version: 1, pairs: [...reg.pairs, newEntry] });
-    return { slot: newSlot, entry: newEntry, isNew: true };
+    return { slot: newSlot, entry: newEntry, isNew: true, matchedRaw: false };
   });
 
   const ports = portsForSlot(slot);
@@ -724,6 +748,22 @@ export async function resolvePair(base: string, opts: ResolvePairOptions): Promi
   // NOT the caller's casing — otherwise `--pair Foo` then `--pair foo` would split
   // one logical pair across two state dirs on a case-sensitive filesystem.
   // `entry.name` is backfilled for entries written before the `name` field shipped.
+  // Non-blocking advisory for two confusing cases (CLI prints to stderr; never
+  // thrown, never persisted). matchedRaw implies isNew === false, so these are
+  // mutually exclusive.
+  let warning: string | undefined;
+  if (matchedRaw && entry.cwd !== opts.cwd) {
+    warning =
+      `--pair ${opts.pairFlag ?? name} matched pair "${entry.pairId}" registered for ${entry.cwd} ` +
+      `(you are in ${opts.cwd}); reusing it. Pass a short name (e.g. "${entry.name ?? DEFAULT_PAIR_NAME}") ` +
+      `if you meant a pair in THIS directory.`;
+  } else if (isNew && hasFlag && /-[0-9a-f]{8}$/i.test(name)) {
+    warning =
+      `--pair ${opts.pairFlag ?? name} looks like a full pair id, but no registered pair matched; ` +
+      `creating a NEW pair named "${name}". Pass a short name (e.g. "main") or run \`abg pairs\` ` +
+      `to see existing pairs.`;
+  }
+
   return {
     pairId: entry.pairId,
     slot,
@@ -731,6 +771,7 @@ export async function resolvePair(base: string, opts: ResolvePairOptions): Promi
     stateDir: join(pairsDir(base), entry.pairId),
     name: entry.name ?? name,
     entry,
+    warning,
   };
 }
 

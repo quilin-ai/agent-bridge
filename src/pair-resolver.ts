@@ -31,6 +31,8 @@ export interface PairResolution {
   name: string;
   /** True when running in legacy/manual single-pair mode (env pinned, no --pair). */
   manual: boolean;
+  /** Non-blocking advisory (cross-cwd raw match / pairId-looking new alloc); CLI prints to stderr. */
+  warning?: string;
 }
 
 /**
@@ -161,6 +163,7 @@ export async function applyPairEnv(opts: { pairFlag?: string }): Promise<PairRes
     stateDir: new StateDirResolver(resolved.stateDir),
     name: resolved.name,
     manual: false,
+    warning: resolved.warning,
   };
 }
 
@@ -188,7 +191,10 @@ export function findPair(base: string, pairId: string): PairEntry | null {
 export function findPairForFlag(base: string, cwd: string, flag: string): PairEntry | null {
   const name = validatePairId(flag);
   const scopedId = derivePairId(cwd, name);
-  return findPair(base, scopedId) ?? findPair(base, flag);
+  // Raw fallback uses the validated/trimmed `name` (NOT the raw `flag`) so kill/pairs
+  // and launch (resolvePair, which validates first) agree on whitespace — a quoted
+  // `--pair "  <id>  "` resolves to the same pair in both paths.
+  return findPair(base, scopedId) ?? findPair(base, name);
 }
 
 /** Ports for a pair entry (convenience for kill/pairs). */

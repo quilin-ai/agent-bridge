@@ -437,6 +437,107 @@ describe("resolvePair", () => {
       rmSync(tmpB, { recursive: true, force: true });
     }
   });
+
+  // --- raw-pairId fallback: the double-hash strand fix ---
+  // A launch must reuse a pair when the flag IS an already-registered pairId,
+  // mirroring findPairForFlag() (used by kill/pairs). All these resolves hit an
+  // existing entry (no probe) or pass probePorts:false, so they never flake on
+  // ports. Reuse/precedence cases seed non-zero slots; the one allocation case
+  // seeds slot 0 so the new pair lands on slot 1, avoiding the slot-0
+  // detectLegacyRootDaemon path on a dev machine.
+
+  test("--pair <an already-registered pairId> reuses that pair, no double-hash allocation", async () => {
+    const tmpA = mkdtempSync(join(tmpdir(), "abg-pair-raw-A-"));
+    try {
+      const pairId = derivePairId(tmpA, DEFAULT_PAIR_NAME); // e.g. "main-<hashA>"
+      writeRegistry(base, {
+        version: 1,
+        pairs: [{ pairId, slot: 5, cwd: tmpA, name: DEFAULT_PAIR_NAME, source: "cwd", createdAt: "2026-01-01T00:00:00.000Z" }],
+      });
+      const resolved = await resolvePair(base, { pairFlag: pairId, cwd: tmpA, probePorts: false });
+
+      expect(readRegistry(base).pairs).toHaveLength(1); // NO second double-hashed entry
+      expect(resolved.pairId).toBe(pairId);
+      expect(resolved.slot).toBe(5);
+      expect(resolved.warning).toBeUndefined(); // same cwd → unremarkable reuse
+    } finally {
+      rmSync(tmpA, { recursive: true, force: true });
+    }
+  });
+
+  test("a current-cwd scoped name wins over a same-string raw pairId", async () => {
+    const tmpA = mkdtempSync(join(tmpdir(), "abg-pair-prec-A-"));
+    try {
+      const flag = "foo-1a2b3c4d"; // itself shaped like a pairId
+      const scopedId = derivePairId(tmpA, flag); // "foo-1a2b3c4d-<hash>"
+      expect(scopedId).not.toBe(flag);
+      writeRegistry(base, {
+        version: 1,
+        pairs: [
+          { pairId: scopedId, slot: 2, cwd: tmpA, name: flag, source: "flag", createdAt: "2026-01-01T00:00:00.000Z" },
+          { pairId: flag, slot: 7, cwd: tmpA, name: "foo", source: "cwd", createdAt: "2026-01-01T00:00:00.000Z" },
+        ],
+      });
+      const resolved = await resolvePair(base, { pairFlag: flag, cwd: tmpA, probePorts: false });
+      // Scoped (name+cwd) match has priority over the raw pairId entry.
+      expect(resolved.pairId).toBe(scopedId);
+      expect(resolved.slot).toBe(2);
+      expect(readRegistry(base).pairs).toHaveLength(2); // nothing allocated
+      expect(resolved.warning).toBeUndefined();
+    } finally {
+      rmSync(tmpA, { recursive: true, force: true });
+    }
+  });
+
+  test("a cross-cwd raw pairId match reuses the pair AND warns", async () => {
+    const tmpA = mkdtempSync(join(tmpdir(), "abg-pair-xcwd-A-"));
+    const tmpB = mkdtempSync(join(tmpdir(), "abg-pair-xcwd-B-"));
+    try {
+      const pairId = derivePairId(tmpA, DEFAULT_PAIR_NAME);
+      writeRegistry(base, {
+        version: 1,
+        pairs: [{ pairId, slot: 6, cwd: tmpA, name: DEFAULT_PAIR_NAME, source: "cwd", createdAt: "2026-01-01T00:00:00.000Z" }],
+      });
+      // Resolve the SAME pairId from a DIFFERENT directory.
+      const resolved = await resolvePair(base, { pairFlag: pairId, cwd: tmpB, probePorts: false });
+
+      expect(resolved.pairId).toBe(pairId);
+      expect(resolved.slot).toBe(6); // reused, not reallocated
+      expect(readRegistry(base).pairs).toHaveLength(1);
+      expect(resolved.warning).toBeDefined();
+      expect(resolved.warning!).toContain(tmpA); // the pair's home cwd
+      expect(resolved.warning!).toContain(tmpB); // where the user actually is
+      // Guard the flag→text spacing (a replace_all once ate this space).
+      expect(resolved.warning!).toContain(`--pair ${pairId} matched`);
+    } finally {
+      rmSync(tmpA, { recursive: true, force: true });
+      rmSync(tmpB, { recursive: true, force: true });
+    }
+  });
+
+  test("a pairId-shaped flag matching nothing allocates a new pair WITH a warning", async () => {
+    const tmpA = mkdtempSync(join(tmpdir(), "abg-pair-ghost-A-"));
+    try {
+      // Seed slot 0 so the new pair lands on slot 1 (skips the slot-0 legacy probe).
+      writeRegistry(base, {
+        version: 1,
+        pairs: [{ pairId: "occupied-00000000", slot: 0, cwd: "/occupied", name: "occupied", source: "cwd", createdAt: "2026-01-01T00:00:00.000Z" }],
+      });
+      const flag = "ghost-1a2b3c4d"; // looks like a pairId, but unregistered
+      const resolved = await resolvePair(base, { pairFlag: flag, cwd: tmpA, probePorts: false });
+
+      const reg = readRegistry(base);
+      expect(reg.pairs).toHaveLength(2); // occupied + the newly created pair
+      const created = reg.pairs.find((p) => p.pairId === derivePairId(tmpA, flag));
+      expect(created).toBeDefined();
+      expect(created!.slot).toBe(1);
+      expect(resolved.warning).toBeDefined();
+      // Assert the full flag→text fragment incl. the space, to catch spacing regressions.
+      expect(resolved.warning!).toContain(`--pair ${flag} looks like a full pair id`);
+    } finally {
+      rmSync(tmpA, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("removePairEntry", () => {

@@ -14578,12 +14578,102 @@ class ConfigService {
   }
 }
 
+// src/pair-registry.ts
+import {
+  closeSync as closeSync2,
+  existsSync as existsSync4,
+  fsyncSync,
+  linkSync,
+  mkdirSync as mkdirSync3,
+  openSync as openSync2,
+  readFileSync as readFileSync3,
+  realpathSync,
+  renameSync,
+  statSync,
+  unlinkSync as unlinkSync2,
+  writeFileSync as writeFileSync3
+} from "fs";
+import { basename, join as join3 } from "path";
+var PAIR_BASE_PORT = 4500;
+var PAIR_SLOT_STRIDE = 10;
+var PAIR_ID_REGEX = /^[A-Za-z0-9._-]{1,64}$/;
+var REGISTRY_FILE_NAME = "registry.json";
+class PairError extends Error {
+  code;
+  details;
+  constructor(code, message, details) {
+    super(message);
+    this.name = "PairError";
+    this.code = code;
+    this.details = details;
+  }
+}
+var MAX_PAIR_SLOT = Math.floor((65535 - 2 - PAIR_BASE_PORT) / PAIR_SLOT_STRIDE);
+function pairsDir(base) {
+  return join3(base, "pairs");
+}
+function registryPath(base) {
+  return join3(pairsDir(base), REGISTRY_FILE_NAME);
+}
+function readRegistry(base) {
+  const path = registryPath(base);
+  if (!existsSync4(path))
+    return { version: 1, pairs: [] };
+  let parsed;
+  try {
+    parsed = JSON.parse(readFileSync3(path, "utf-8"));
+  } catch (err) {
+    throw new PairError("PAIR_REGISTRY_CORRUPT", `Registry JSON is not parseable at ${path}: ${err.message}`, {
+      path
+    });
+  }
+  if (!parsed || typeof parsed !== "object" || parsed.version !== 1 || !Array.isArray(parsed.pairs)) {
+    throw new PairError("PAIR_REGISTRY_CORRUPT", `Registry shape is invalid at ${path}`, { path });
+  }
+  const entries = parsed.pairs;
+  const seenSlots = new Set;
+  const seenIds = new Set;
+  for (const e of entries) {
+    const idValid = e && typeof e.pairId === "string" && e.pairId !== "." && e.pairId !== ".." && PAIR_ID_REGEX.test(e.pairId);
+    if (!idValid || !Number.isInteger(e.slot) || e.slot < 0) {
+      throw new PairError("PAIR_REGISTRY_CORRUPT", `Registry has a malformed entry at ${path}`, { path, entry: e });
+    }
+    const lower = e.pairId.toLowerCase();
+    if (seenSlots.has(e.slot) || seenIds.has(lower)) {
+      throw new PairError("PAIR_REGISTRY_CORRUPT", `Registry has duplicate slot/pairId at ${path}`, {
+        path,
+        pairId: e.pairId,
+        slot: e.slot
+      });
+    }
+    seenSlots.add(e.slot);
+    seenIds.add(lower);
+  }
+  return parsed;
+}
+
+// src/pair-resolver.ts
+function computeBaseDir() {
+  return process.env.AGENTBRIDGE_BASE_DIR || process.env.AGENTBRIDGE_STATE_DIR || StateDirResolver.platformBaseDir();
+}
+function findPair(base, pairId) {
+  const lower = pairId.toLowerCase();
+  return readRegistry(base).pairs.find((p) => p.pairId.toLowerCase() === lower) ?? null;
+}
+
 // src/pair-command.ts
 function pairScopedCommand(cmd) {
   const pairId = process.env.AGENTBRIDGE_PAIR_ID;
   if (!pairId)
     return `agentbridge ${cmd}`;
-  const selector = process.env.AGENTBRIDGE_PAIR_NAME || pairId;
+  let selector = process.env.AGENTBRIDGE_PAIR_NAME;
+  if (!selector) {
+    try {
+      selector = findPair(computeBaseDir(), pairId)?.name || pairId;
+    } catch {
+      selector = pairId;
+    }
+  }
   return `agentbridge --pair ${selector} ${cmd}`;
 }
 

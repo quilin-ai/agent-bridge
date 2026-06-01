@@ -192,6 +192,8 @@ export async function runCodex(args: string[]) {
     process.exit(1);
   }
 
+  if (pair.warning) console.error(`[agentbridge] ⚠️  ${pair.warning}`);
+
   const stateDir = pair.stateDir;
   const controlPort = pair.ports.controlPort;
 
