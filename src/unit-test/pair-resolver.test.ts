@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -9,6 +9,7 @@ import {
   computeBaseDir,
   findPair,
   findPairForFlag,
+  listPairsForCwd,
   listPairs,
   parseKillArgs,
   parsePairFlag,
@@ -95,11 +96,14 @@ describe("parsePairFlag", () => {
 });
 
 describe("parseKillArgs", () => {
-  test("no args → all:false, no pair (router treats as kill-all)", () => {
+  test("no args → all:false, no pair (router treats as current-cwd kill)", () => {
     expect(parseKillArgs([])).toEqual({ all: false, pairFlag: undefined });
   });
   test("--all", () => {
     expect(parseKillArgs(["--all"])).toEqual({ all: true, pairFlag: undefined });
+  });
+  test("all", () => {
+    expect(parseKillArgs(["all"])).toEqual({ all: true, pairFlag: undefined });
   });
   test("--pair X", () => {
     expect(parseKillArgs(["--pair", "work"])).toEqual({ all: false, pairFlag: "work" });
@@ -235,6 +239,29 @@ describe("registry helpers", () => {
     const removed = await removePair(base, "a");
     expect(removed?.pairId).toBe("a");
     expect(listPairs(base).map((p) => p.pairId)).toEqual(["b"]);
+  });
+});
+
+describe("listPairsForCwd", () => {
+  test("returns only pairs whose cwd realpath matches the requested cwd", () => {
+    const base = makeBase();
+    const project = mkdtempSync(join(tmpdir(), "agentbridge-project-"));
+    const linked = `${project}-link`;
+    tempBases.push(project, linked);
+    symlinkSync(project, linked, "dir");
+    const sameCwdPairId = derivePairId(project, "main");
+    const otherCwd = mkdtempSync(join(tmpdir(), "agentbridge-other-project-"));
+    tempBases.push(otherCwd);
+    const otherCwdPairId = derivePairId(otherCwd, "main");
+    writeRegistry(base, {
+      version: 1,
+      pairs: [
+        { pairId: sameCwdPairId, slot: 0, cwd: project, name: "main", source: "cwd", createdAt: "2026-01-01T00:00:00.000Z" },
+        { pairId: otherCwdPairId, slot: 1, cwd: otherCwd, name: "main", source: "cwd", createdAt: "2026-01-01T00:00:00.000Z" },
+      ],
+    });
+
+    expect(listPairsForCwd(base, linked).map((p) => p.pairId)).toEqual([sameCwdPairId]);
   });
 });
 

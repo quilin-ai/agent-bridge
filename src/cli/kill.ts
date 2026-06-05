@@ -6,6 +6,7 @@ import {
   computeBaseDir,
   findPairForFlag,
   listPairs,
+  listPairsForCwd,
   parseKillArgs,
   portsForEntry,
 } from "../pair-resolver";
@@ -69,7 +70,7 @@ export async function runKill(args: string[] = []) {
     }
     restartCommand = `agentbridge --pair ${pair.name ?? parsed.pairFlag} claude`;
     results.push(await stopPairEntry(base, pair));
-  } else {
+  } else if (parsed.all) {
     for (const pair of listPairs(base)) {
       results.push(await stopPairEntry(base, pair));
     }
@@ -81,6 +82,23 @@ export async function runKill(args: string[] = []) {
         controlPort: legacy.controlPort,
       }));
     }
+  } else {
+    for (const pair of listPairsForCwd(base, process.cwd())) {
+      results.push(await stopPairEntry(base, pair));
+    }
+    const legacy = detectLegacyRootDaemon(base);
+    if (legacy) {
+      results.push(await stopStateDir("(legacy-root)", new StateDirResolver(base), {
+        appPort: 4500,
+        proxyPort: 4501,
+        controlPort: legacy.controlPort,
+      }));
+    }
+    if (results.length === 0) {
+      console.log(`No AgentBridge pairs registered for current directory: ${process.cwd()}`);
+      console.log("Use `abg kill all` or `abg kill --all` to stop pairs from every directory.");
+      return;
+    }
   }
 
   printSummary(results, restartCommand);
@@ -90,6 +108,7 @@ function validateKillArgs(args: string[]): string | "help" | null {
   for (let i = 0; i < args.length; i++) {
     const arg = args[i]!;
     if (arg === "--help" || arg === "-h") return "help";
+    if (arg === "all") continue;
     if (arg === "--all") continue;
     if (arg === "--pair") {
       const value = args[i + 1];
@@ -113,6 +132,7 @@ function validateKillArgs(args: string[]): string | "help" | null {
 function printKillUsage() {
   console.log(`
 Usage: abg kill [--all]
+       abg kill all
        abg [--pair <name|id>] kill
 
 Stops AgentBridge daemon/TUI processes.
@@ -120,10 +140,10 @@ Stops AgentBridge daemon/TUI processes.
 Options:
   --pair <name|id>  Stop only one pair — a cwd-scoped name (e.g. "main") or the
                     same pair id when run from that directory.
-  --all             Stop all registered pairs and any legacy-root daemon.
+  all, --all        Stop all registered pairs and any legacy-root daemon.
   --help, -h        Show this help message.
 
-No arguments are equivalent to --all.
+No arguments stop this directory's registered pairs and any legacy-root daemon.
 `.trim());
 }
 

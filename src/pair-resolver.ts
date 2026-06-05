@@ -1,3 +1,5 @@
+import { realpathSync } from "node:fs";
+import { resolve } from "node:path";
 import { StateDirResolver } from "./state-dir";
 import {
   type PairEntry,
@@ -83,12 +85,16 @@ export function parsePairFlag(args: string[]): { pairFlag?: string; rest: string
   return { pairFlag, rest };
 }
 
-/** Parse `abg kill` flags: `--all` and/or `--pair <name>`. No flag ⇒ kill all. */
+/** Parse `abg kill` flags: `all`, `--all`, and/or `--pair <name>`. No flag ⇒ kill current cwd. */
 export function parseKillArgs(args: string[]): { all: boolean; pairFlag?: string } {
   let all = false;
   let pairFlag: string | undefined;
   for (let i = 0; i < args.length; i++) {
     const a = args[i]!;
+    if (a === "all") {
+      all = true;
+      continue;
+    }
     if (a === "--all") {
       all = true;
       continue;
@@ -172,6 +178,12 @@ export function listPairs(base: string): PairEntry[] {
   return readRegistry(base).pairs;
 }
 
+/** Registered pairs whose cwd resolves to the current project directory. */
+export function listPairsForCwd(base: string, cwd: string): PairEntry[] {
+  const canonicalCwd = canonicalizeCwd(cwd);
+  return listPairs(base).filter((pair) => canonicalizeCwd(pair.cwd) === canonicalCwd);
+}
+
 /** Look up a single pair entry by id (case-insensitive), without allocating. */
 export function findPair(base: string, pairId: string): PairEntry | null {
   const lower = pairId.toLowerCase();
@@ -211,4 +223,17 @@ export function portsForEntry(entry: PairEntry): PairPorts {
 /** Remove a pair entry from the registry, freeing its slot. */
 export async function removePair(base: string, pairId: string): Promise<PairEntry | null> {
   return removePairEntry(base, pairId);
+}
+
+function canonicalizeCwd(cwd: string): string {
+  const absolute = resolve(cwd);
+  try {
+    return realpathSync.native(absolute);
+  } catch {
+    try {
+      return realpathSync(absolute);
+    } catch {
+      return absolute;
+    }
+  }
 }
