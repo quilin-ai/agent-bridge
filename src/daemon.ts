@@ -13,7 +13,9 @@ import {
 import { TuiConnectionState } from "./tui-connection-state";
 import { DaemonLifecycle } from "./daemon-lifecycle";
 import { StateDirResolver } from "./state-dir";
-import { ConfigService } from "./config-service";
+import { ConfigService, applyBudgetEnvOverrides } from "./config-service";
+import { BudgetCoordinator } from "./budget/budget-coordinator";
+import { createQuotaSource } from "./budget/quota-source";
 import {
   CLOSE_CODE_REPLACED,
   CLOSE_CODE_EVICTED_STALE,
@@ -72,6 +74,8 @@ const BOOTSTRAP_TIMEOUT_MS = parsePositiveIntEnv("AGENTBRIDGE_BOOTSTRAP_TIMEOUT_
 // replacement is owned by the lifecycle (ensureRunning), not by retrying forever here.
 const CODEX_BOOT_RETRIES = parsePositiveIntEnv("AGENTBRIDGE_CODEX_BOOT_RETRIES", 2);
 const ALLOW_IDENTITYLESS_CLIENT = process.env.AGENTBRIDGE_COMPAT_IDENTITYLESS === "1";
+// Budget coordination config: file config normalized + AGENTBRIDGE_BUDGET_* env overlay.
+const BUDGET_CONFIG = applyBudgetEnvOverrides(config.budget);
 
 const daemonLifecycle = new DaemonLifecycle({ stateDir, controlPort: CONTROL_PORT, log });
 
@@ -106,6 +110,72 @@ const LIVENESS_PROBE_POLL_MS = 50;
 let challengeInProgress = false;
 
 const bufferedMessages: BridgeMessage[] = [];
+
+// --- Budget coordination (plan v2.3 P1) ---
+// Constructed lazily on the first codex "ready" and kept for the daemon's lifetime.
+// The coordinator owns polling/dedup/pause-hysteresis; the daemon owns the
+// claude_to_codex pause gate and snapshot exposure via DaemonStatus.budget.
+let budgetCoordinator: BudgetCoordinator | null = null;
+let budgetStatusTimer: ReturnType<typeof setInterval> | null = null;
+
+function ensureBudgetCoordinatorStarted() {
+  if (!BUDGET_CONFIG.enabled) return;
+  if (!budgetCoordinator) {
+    // One effective-config line so clamped/overridden values are observable
+    // (config normalization itself is silent by design).
+    log(
+      `Budget coordinator config: pollSeconds=${BUDGET_CONFIG.pollSeconds} pauseAt=${BUDGET_CONFIG.pauseAt} ` +
+      `resumeBelow=${BUDGET_CONFIG.resumeBelow} syncDriftPct=${BUDGET_CONFIG.syncDriftPct} ` +
+      `parallel=${BUDGET_CONFIG.parallel.minRemainingPct}%/${BUDGET_CONFIG.parallel.timeWindowSec}s ` +
+      `codexTierControl=${BUDGET_CONFIG.codexTierControl}`,
+    );
+    budgetCoordinator = new BudgetCoordinator({
+      source: createQuotaSource({ log }),
+      config: BUDGET_CONFIG,
+      emit: (id, content) => {
+        emitToClaude(systemMessage(id, content));
+        // Defer one microtask: the coordinator writes latestSnapshot AFTER its
+        // applyState() callbacks return, so an immediate broadcast would push
+        // the previous poll's snapshot on directive edges.
+        queueMicrotask(() => broadcastStatus());
+      },
+      onPauseChange: (paused) => {
+        log(`Budget pause gate ${paused ? "CLOSED" : "OPEN"}`);
+        queueMicrotask(() => broadcastStatus());
+      },
+      log,
+    });
+  }
+  void budgetCoordinator.start();
+  // Keep DaemonStatus.budget (and the bridge's get_budget cache) fresh between
+  // directives: snapshots change every poll even when no directive fires.
+  if (!budgetStatusTimer) {
+    budgetStatusTimer = setInterval(() => broadcastStatus(), BUDGET_CONFIG.pollSeconds * 1000);
+    budgetStatusTimer.unref?.();
+  }
+}
+
+function stopBudgetCoordinator() {
+  budgetCoordinator?.stop();
+  if (budgetStatusTimer) {
+    clearInterval(budgetStatusTimer);
+    budgetStatusTimer = null;
+  }
+}
+
+function budgetPauseGateError(): string {
+  const snapshot = budgetCoordinator?.getSnapshot() ?? null;
+  const reason = snapshot?.pauseReason ?? "额度接近耗尽";
+  const resumeAt = snapshot?.resumeAfterEpoch
+    ? new Date(snapshot.resumeAfterEpoch * 1000).toISOString().replace("T", " ").replace(/\.\d+Z$/, "Z")
+    : null;
+  return (
+    `预算联合暂停中，已拒绝转发：${reason}。` +
+    `双方 gateUtil 均低于 ${BUDGET_CONFIG.resumeBelow}% 后闸门自动放开` +
+    (resumeAt ? `（预计恢复不早于 ${resumeAt}）` : "") +
+    "。收到 RESUME 通知前请勿重试；请写 checkpoint 并停止委派。"
+  );
+}
 
 const tuiConnectionState = new TuiConnectionState({
   disconnectGraceMs: TUI_DISCONNECT_GRACE_MS,
@@ -247,6 +317,7 @@ codex.on("ready", (threadId: string) => {
   emitToClaude(
     systemMessage("system_ready", currentReadyMessage()),
   );
+  ensureBudgetCoordinatorStarted();
 });
 
 codex.on("threadChanged", (event: { threadId: string; previousThreadId: string | null; reason: string }) => {
@@ -411,6 +482,21 @@ function handleControlMessage(ws: ServerWebSocket<ControlSocketData>, raw: strin
           requestId: message.requestId,
           success: false,
           error: "Codex is not ready. Wait for TUI to connect and create a thread.",
+        });
+        return;
+      }
+
+      // Budget pause gate (plan v2.3 R4): while jointly paused, refuse to start
+      // Codex turns at all — not sending a turn IS the park. Same shape as the
+      // busy-guard rejection below.
+      if (budgetCoordinator?.isPaused()) {
+        const reason = budgetPauseGateError();
+        log(`Injection rejected by budget pause gate`);
+        sendProtocolMessage(ws, {
+          type: "claude_to_codex_result",
+          requestId: message.requestId,
+          success: false,
+          error: reason,
         });
         return;
       }
@@ -801,6 +887,7 @@ function currentStatus(): DaemonStatus {
     cwd: process.cwd(),
     stateDir: stateDir.dir,
     build: daemonStatusBuildInfo(),
+    budget: budgetCoordinator?.getSnapshot() ?? undefined,
   };
 }
 
@@ -945,6 +1032,7 @@ function shutdown(reason: string, exitCode = 0) {
   shuttingDown = true;
   log(`Shutting down daemon (${reason})...`);
   clearBootDeadline();
+  stopBudgetCoordinator();
   tuiConnectionState.dispose(`daemon shutdown (${reason})`);
   clearPendingClaudeDisconnect(`daemon shutdown (${reason})`);
   controlServer?.stop();

@@ -92,8 +92,9 @@ function normalizeBoundedInteger(
 
 function normalizeBoolean(value: unknown, fallback: boolean): boolean {
   if (typeof value === "boolean") return value;
-  if (value === "true") return true;
-  if (value === "false") return false;
+  // Accept common env-var spellings ("1"/"0") alongside JSON-ish "true"/"false".
+  if (value === "true" || value === "1") return true;
+  if (value === "false" || value === "0") return false;
   return fallback;
 }
 

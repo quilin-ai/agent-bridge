@@ -293,3 +293,31 @@ describe("applyBudgetEnvOverrides", () => {
     expect(applyBudgetEnvOverrides(base, {})).toEqual(base);
   });
 });
+
+describe("applyBudgetEnvOverrides — boolean spellings", () => {
+  const base = {
+    enabled: true,
+    pollSeconds: 60,
+    pauseAt: 90,
+    resumeBelow: 30,
+    syncDriftPct: 10,
+    parallel: { minRemainingPct: 60, timeWindowSec: 3600 },
+    codexTierControl: false,
+  };
+
+  test('accepts "0"/"1" alongside "true"/"false"', () => {
+    const zeroOne = applyBudgetEnvOverrides(base, {
+      AGENTBRIDGE_BUDGET_ENABLED: "0",
+      AGENTBRIDGE_BUDGET_CODEX_TIER_CONTROL: "1",
+    });
+    expect(zeroOne.enabled).toBe(false);
+    expect(zeroOne.codexTierControl).toBe(true);
+  });
+
+  test("unrecognized boolean spellings fall back to base values", () => {
+    const result = applyBudgetEnvOverrides(base, {
+      AGENTBRIDGE_BUDGET_ENABLED: "yes",
+    });
+    expect(result.enabled).toBe(true);
+  });
+});

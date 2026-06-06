@@ -34,6 +34,10 @@ function launchDaemon(): ChildProcess {
     CODEX_WS_PORT: String(TEST_APP_PORT),
     CODEX_PROXY_PORT: String(TEST_PROXY_PORT),
     AGENTBRIDGE_IDLE_SHUTDOWN_MS: "60000", // don't auto-shutdown during tests
+    // Hermetic: never let a test daemon poll the REAL installed budget probe
+    // (~/.budget-guard/bin) — real quota ≥ pauseAt would close the reply gate
+    // and break unrelated tests.
+    AGENTBRIDGE_BUDGET_ENABLED: "0",
   };
   delete env.AGENTBRIDGE_BASE_DIR;
   delete env.AGENTBRIDGE_PAIR_ID;
