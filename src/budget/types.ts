@@ -1,0 +1,127 @@
+/**
+ * Shared type contract for the budget coordination layer (see budgetcoordinationplan.md v2.2).
+ *
+ * Ownership split:
+ * - quota-source.ts / budget-state.ts / budget-coordinator.ts implement against these types (Codex).
+ * - daemon/bridge/claude-adapter/cli wiring consumes them (Claude).
+ *
+ * Keep this file dependency-free; it is bundled into the plugin daemon.
+ */
+
+/** One quota window (5h primary or weekly secondary). */
+export interface BudgetWindow {
+  /** Utilization percent, 0-100. */
+  util: number;
+  /** Unix seconds when this window resets; 0 if unknown. */
+  resetEpoch: number;
+}
+
+/**
+ * Normalized per-agent usage from an agent-quota-guard probe.
+ *
+ * Normalization rules (dual probe shapes — bash `budget-probe` emits `hard_util`,
+ * node `probe.mjs` does not):
+ *   gateUtil  = raw.util ?? raw.hard_util ?? 0   // resettable hard winner — R4 gating metric
+ *   warnUtil  = raw.warn_util ?? gateUtil        // max across ALL buckets — parity/display only
+ *   rateLimitedUntil = raw.rate_limited_until ?? 0
+ *
+ * IMPORTANT: a probe result with ok:false but a meaningful rate_limited_until must
+ * still be surfaced as an AgentUsage (not dropped to null) so R4 can pause on it.
+ */
+export interface AgentUsage {
+  /** Probe reported ok. ok:false with rateLimitedUntil > 0 is still actionable. */
+  ok: boolean;
+  /** Data served from a stale cache (probe `stale` flag). */
+  stale: boolean;
+  /** Resettable hard-winner utilization percent (probe `util`). R4 gates ONLY on this. */
+  gateUtil: number;
+  /** Max utilization across all buckets incl. non-resettable (probe `warn_util`). */
+  warnUtil: number;
+  /** 5h window detail when identifiable, else null. */
+  fiveHour: BudgetWindow | null;
+  /** Weekly window detail when identifiable, else null. */
+  weekly: BudgetWindow | null;
+  /** Convenience: 100 - gateUtil, clamped to [0, 100]. */
+  remaining: number;
+  /** Unix seconds until which the provider is rate-limiting probes; 0 if none. */
+  rateLimitedUntil: number;
+  /** Unix seconds the underlying data was fetched. */
+  fetchedAt: number;
+}
+
+export type AgentName = "claude" | "codex";
+
+export type BudgetPhase = "normal" | "balance" | "parallel" | "paused";
+
+export type CodexTier = "full" | "balanced" | "eco";
+
+/** Budget section of AgentBridgeConfig (defaults in config-service.ts). */
+export interface BudgetConfig {
+  enabled: boolean;
+  /** Coordinator poll interval in seconds (first poll fires immediately on start()). */
+  pollSeconds: number;
+  /** Joint-pause entry threshold on gateUtil; intentionally below guard's hard=92. */
+  pauseAt: number;
+  /** Joint-pause exit threshold; BOTH sides must drop below this on gateUtil. */
+  resumeBelow: number;
+  /** |warnUtil drift| above this triggers balance directives. */
+  syncDriftPct: number;
+  parallel: {
+    /** Both sides must have at least this much remaining (100 - gateUtil). */
+    minRemainingPct: number;
+    /** Nearest 5h reset must be within this many seconds. */
+    timeWindowSec: number;
+  };
+  /** When false (default), model/effort overrides are never injected into turn/start. */
+  codexTierControl: boolean;
+}
+
+/** Pure-function output of computeBudgetState(). */
+export interface BudgetState {
+  phase: BudgetPhase;
+  /** Unix seconds used for all decisions (injected, never Date.now() inside). */
+  now: number;
+  perAgent: { claude: AgentUsage | null; codex: AgentUsage | null };
+  drift: {
+    /** warnUtil(claude) - warnUtil(codex); 0 when either side is unknown. */
+    pct: number;
+    heavier: AgentName | null;
+    lighter: AgentName | null;
+  };
+  pause: {
+    active: boolean;
+    /** Which side tripped the gate. */
+    side: AgentName | "both" | null;
+    reason: string | null;
+    resumeBelow: number;
+    /** Earliest plausible resume epoch considering only sides still blocking resume; null when unknown/not paused. */
+    resumeAfterEpoch: number | null;
+    resetEpochs: { claude: number; codex: number };
+  };
+  parallel: { recommended: boolean; reason: string | null };
+  effort: { claudeAdvice: string | null; codexTier: CodexTier };
+  /** Rendered Chinese directive for Claude, or null when nothing to say (dedup is the coordinator's job). */
+  directiveToClaude: string | null;
+}
+
+/** Serializable summary exposed via DaemonStatus.budget, get_budget and `abg budget`. */
+export interface BudgetSnapshot {
+  phase: BudgetPhase;
+  /** Unix seconds of the poll that produced this snapshot. */
+  updatedAt: number;
+  claude: AgentUsage | null;
+  codex: AgentUsage | null;
+  driftPct: number;
+  paused: boolean;
+  pauseReason: string | null;
+  /** Earliest unix seconds at which resume is plausible (max of gating reset epochs), null when not paused. */
+  resumeAfterEpoch: number | null;
+  parallelRecommended: boolean;
+  codexTier: CodexTier;
+}
+
+/** Optional per-turn overrides injected into Codex turn/start (sticky on the thread). */
+export interface CodexTurnOverrides {
+  model?: string;
+  effort?: string;
+}

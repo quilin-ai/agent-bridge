@@ -20,7 +20,7 @@ const REFRESH_COMMANDS = new Set(["claude", "codex"]);
 const NOTIFY_COMMANDS = new Set(["claude", "codex", "init", "dev"]);
 
 /** Subcommands that accept a `--pair <name>` selector. */
-const PAIR_AWARE_COMMANDS = new Set(["claude", "codex", "kill", "doctor"]);
+const PAIR_AWARE_COMMANDS = new Set(["claude", "codex", "kill", "doctor", "budget"]);
 
 /**
  * Split argv into the subcommand and its args, allowing a leading `--pair <name>`
@@ -104,6 +104,10 @@ async function main(command: string | undefined, restArgs: string[]) {
       const { runDoctor } = await import("./cli/doctor");
       await runDoctor(restArgs);
       break;
+    case "budget":
+      const { runBudget } = await import("./cli/budget");
+      await runBudget(restArgs);
+      break;
     case "--help":
     case "-h":
     case undefined:
@@ -137,6 +141,7 @@ Commands:
                      List pairs; remove one (rm), or delete orphan state dirs (prune)
   doctor [--json]    Diagnose env, daemon, build drift, logs, and current thread
   doctor resume-pollution [--apply]  Find/fix old AgentBridge kickoff metadata
+  budget [--json]    Show both agents' subscription quota snapshot (5h/weekly, drift, pause state)
   kill [all | --all | --pair <name|id>]
                      Stop this directory's pairs (default), every pair (all/--all), or one (--pair)
 

@@ -269,3 +269,52 @@ describe("Dual-mode transport: reply pending hint", () => {
     expect(result.content[0].text).toContain("bridge not initialized");
   });
 });
+
+describe("get_budget tool (handleGetBudget)", () => {
+  const snapshot = {
+    phase: "normal" as const,
+    updatedAt: 1_780_711_700,
+    claude: {
+      ok: true,
+      stale: false,
+      gateUtil: 42,
+      warnUtil: 45,
+      fiveHour: { util: 42, resetEpoch: 1_780_750_000 },
+      weekly: { util: 19, resetEpoch: 1_781_193_812 },
+      remaining: 58,
+      rateLimitedUntil: 0,
+      fetchedAt: 1_780_711_639,
+    },
+    codex: null,
+    driftPct: 0,
+    paused: false,
+    pauseReason: null,
+    resumeAfterEpoch: null,
+    parallelRecommended: false,
+    codexTier: "full" as const,
+  };
+
+  test("returns unavailable text when no snapshot is cached", () => {
+    const adapter = new ClaudeAdapter() as any;
+    const result = adapter.handleGetBudget();
+    expect(result.content[0].text).toContain("预算感知不可用");
+    expect(result.isError).toBeUndefined();
+  });
+
+  test("renders the shared renderer output when a snapshot is cached", () => {
+    const adapter = new ClaudeAdapter() as any;
+    adapter.setBudgetSnapshot(snapshot);
+    const result = adapter.handleGetBudget();
+    expect(result.content[0].text).toContain("【预算快照 · 账号级】");
+    expect(result.content[0].text).toContain("Claude：");
+    expect(result.content[0].text).toContain("Codex：未知（探测不可用）");
+  });
+
+  test("clearing the snapshot reverts to unavailable text", () => {
+    const adapter = new ClaudeAdapter() as any;
+    adapter.setBudgetSnapshot(snapshot);
+    adapter.setBudgetSnapshot(null);
+    const result = adapter.handleGetBudget();
+    expect(result.content[0].text).toContain("预算感知不可用");
+  });
+});

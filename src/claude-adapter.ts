@@ -23,6 +23,8 @@ import { randomUUID } from "node:crypto";
 import { createProcessLogger, type ProcessLogger } from "./process-log";
 import { StateDirResolver } from "./state-dir";
 import type { BridgeMessage } from "./types";
+import type { BudgetSnapshot } from "./budget/types";
+import { renderBudgetSnapshot, BUDGET_UNAVAILABLE_TEXT } from "./budget/render";
 
 export type ReplySender = (msg: BridgeMessage, requireReply?: boolean) => Promise<{ success: boolean; error?: string }>;
 export type DeliveryMode = "push" | "pull" | "auto";
@@ -59,6 +61,10 @@ export const CLAUDE_INSTRUCTIONS = [
   "- When you see '⏳ Codex is working', do NOT call the reply tool — wait for '✅ Codex finished'.",
   "- After Codex finishes a turn, you have an attention window to review and respond before new messages arrive.",
   "- If the reply tool returns a busy error, Codex is still executing — wait and try again later.",
+  "",
+  "## Budget awareness",
+  "- Use the get_budget tool to check both agents' subscription quota (5h/weekly windows, drift, pause state).",
+  "- If the reply tool returns a budget-pause error, do NOT retry; checkpoint your work and wait for the resume notice.",
 ].join("\n");
 
 export class ClaudeAdapter extends EventEmitter {
@@ -77,6 +83,9 @@ export class ClaudeAdapter extends EventEmitter {
   private pendingMessages: BridgeMessage[] = [];
   private readonly maxBufferedMessages: number;
   private droppedMessageCount = 0;
+
+  // Latest budget snapshot, fed by bridge from DaemonStatus.budget broadcasts.
+  private budgetSnapshot: BudgetSnapshot | null = null;
 
   constructor(logFile = new StateDirResolver().logFile) {
     super();
@@ -128,6 +137,11 @@ export class ClaudeAdapter extends EventEmitter {
   /** Returns the number of messages waiting in the pull queue. */
   getPendingMessageCount(): number {
     return this.pendingMessages.length;
+  }
+
+  /** Cache the latest budget snapshot from the daemon (null clears it). */
+  setBudgetSnapshot(snapshot: BudgetSnapshot | null) {
+    this.budgetSnapshot = snapshot;
   }
 
   // ── Mode Detection ─────────────────────────────────────────
@@ -274,6 +288,16 @@ export class ClaudeAdapter extends EventEmitter {
             required: [],
           },
         },
+        {
+          name: "get_budget",
+          description:
+            "Check both agents' subscription quota usage (Claude + Codex): 5h/weekly window percentages, drift between the two sides, joint-pause state and model/effort tier recommendation.",
+          inputSchema: {
+            type: "object" as const,
+            properties: {},
+            required: [],
+          },
+        },
       ],
     }));
 
@@ -288,11 +312,25 @@ export class ClaudeAdapter extends EventEmitter {
         return this.drainMessages();
       }
 
+      if (name === "get_budget") {
+        return this.handleGetBudget();
+      }
+
       return {
         content: [{ type: "text" as const, text: `Unknown tool: ${name}` }],
         isError: true,
       };
     });
+  }
+
+  private handleGetBudget() {
+    this.log(`get_budget called (instance=${this.instanceId}, hasSnapshot=${this.budgetSnapshot !== null})`);
+    const text = this.budgetSnapshot
+      ? renderBudgetSnapshot(this.budgetSnapshot)
+      : BUDGET_UNAVAILABLE_TEXT;
+    return {
+      content: [{ type: "text" as const, text }],
+    };
   }
 
   private async handleReply(args: Record<string, unknown>) {

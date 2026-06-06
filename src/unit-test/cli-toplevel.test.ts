@@ -70,3 +70,19 @@ describe("parseTopLevel — leading --pair before the subcommand", () => {
     expect(parseTopLevel(["--version"]).command).toBe("--version");
   });
 });
+
+describe("parseTopLevel — budget is pair-aware", () => {
+  test("leading --pair is re-attached for budget", () => {
+    expect(parseTopLevel(["--pair", "work", "budget", "--json"])).toEqual({
+      command: "budget",
+      restArgs: ["--pair", "work", "--json"],
+    });
+  });
+
+  test("budget without --pair passes args through", () => {
+    expect(parseTopLevel(["budget", "--json"])).toEqual({
+      command: "budget",
+      restArgs: ["--json"],
+    });
+  });
+});

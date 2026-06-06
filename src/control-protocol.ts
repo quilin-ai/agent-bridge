@@ -1,5 +1,6 @@
 import type { BridgeMessage } from "./types";
 import type { AgentBridgeBuildInfo } from "./build-info";
+import type { BudgetSnapshot } from "./budget/types";
 
 export interface ControlClientIdentity {
   pairId?: string | null;
@@ -24,6 +25,8 @@ export interface DaemonStatus {
   cwd?: string | null;
   stateDir?: string | null;
   build?: AgentBridgeBuildInfo;
+  /** Latest budget coordination snapshot; absent when budget sensing is unavailable/disabled. */
+  budget?: BudgetSnapshot;
 }
 
 export type ControlClientMessage =

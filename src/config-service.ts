@@ -1,5 +1,6 @@
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { join } from "node:path";
+import type { BudgetConfig } from "./budget/types";
 
 /** Machine-readable project config schema. */
 export interface AgentBridgeConfig {
@@ -12,7 +13,24 @@ export interface AgentBridgeConfig {
     attentionWindowSeconds: number;
   };
   idleShutdownSeconds: number;
+  budget: BudgetConfig;
 }
+
+const DEFAULT_BUDGET_CONFIG: BudgetConfig = {
+  enabled: true,
+  pollSeconds: 60,
+  // Intentionally below quota-guard's per-agent hard line (92) so the bridge's
+  // coordinated pause fires first and leaves wrap-up headroom; the guard stays
+  // as the per-agent backstop.
+  pauseAt: 90,
+  resumeBelow: 30,
+  syncDriftPct: 10,
+  parallel: {
+    minRemainingPct: 60,
+    timeWindowSec: 3600,
+  },
+  codexTierControl: false,
+};
 
 const DEFAULT_CONFIG: AgentBridgeConfig = {
   version: "1.0",
@@ -24,6 +42,7 @@ const DEFAULT_CONFIG: AgentBridgeConfig = {
     attentionWindowSeconds: 15,
   },
   idleShutdownSeconds: 30,
+  budget: DEFAULT_BUDGET_CONFIG,
 };
 
 const CONFIG_DIR = ".agentbridge";
@@ -43,6 +62,7 @@ interface LegacyAgentBridgeConfig {
     attentionWindowSeconds?: unknown;
   };
   idleShutdownSeconds?: unknown;
+  budget?: unknown;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -56,6 +76,109 @@ function normalizeInteger(value: unknown, fallback: number): number {
     if (Number.isFinite(parsed)) return parsed;
   }
   return fallback;
+}
+
+/** Like normalizeInteger but rejects values outside [min, max] (falls back to default). */
+function normalizeBoundedInteger(
+  value: unknown,
+  fallback: number,
+  min: number,
+  max: number,
+): number {
+  const parsed = normalizeInteger(value, fallback);
+  if (parsed < min || parsed > max) return fallback;
+  return parsed;
+}
+
+function normalizeBoolean(value: unknown, fallback: boolean): boolean {
+  if (typeof value === "boolean") return value;
+  if (value === "true") return true;
+  if (value === "false") return false;
+  return fallback;
+}
+
+/**
+ * Normalize the budget section with boundary protection: out-of-range values
+ * fall back to defaults, and an unsatisfiable pause lifecycle
+ * (pauseAt <= resumeBelow) resets BOTH thresholds to defaults so the
+ * coordinator can never enter a pause it cannot exit.
+ */
+function normalizeBudgetConfig(raw: unknown): BudgetConfig {
+  const budget = isRecord(raw) ? raw : {};
+  const parallel = isRecord(budget.parallel) ? budget.parallel : {};
+
+  let pauseAt = normalizeBoundedInteger(budget.pauseAt, DEFAULT_BUDGET_CONFIG.pauseAt, 1, 100);
+  let resumeBelow = normalizeBoundedInteger(
+    budget.resumeBelow,
+    DEFAULT_BUDGET_CONFIG.resumeBelow,
+    0,
+    99,
+  );
+  if (pauseAt <= resumeBelow) {
+    pauseAt = DEFAULT_BUDGET_CONFIG.pauseAt;
+    resumeBelow = DEFAULT_BUDGET_CONFIG.resumeBelow;
+  }
+
+  return {
+    enabled: normalizeBoolean(budget.enabled, DEFAULT_BUDGET_CONFIG.enabled),
+    pollSeconds: normalizeBoundedInteger(
+      budget.pollSeconds,
+      DEFAULT_BUDGET_CONFIG.pollSeconds,
+      5,
+      3600,
+    ),
+    pauseAt,
+    resumeBelow,
+    syncDriftPct: normalizeBoundedInteger(
+      budget.syncDriftPct,
+      DEFAULT_BUDGET_CONFIG.syncDriftPct,
+      1,
+      100,
+    ),
+    parallel: {
+      minRemainingPct: normalizeBoundedInteger(
+        parallel.minRemainingPct,
+        DEFAULT_BUDGET_CONFIG.parallel.minRemainingPct,
+        1,
+        100,
+      ),
+      timeWindowSec: normalizeBoundedInteger(
+        parallel.timeWindowSec,
+        DEFAULT_BUDGET_CONFIG.parallel.timeWindowSec,
+        60,
+        604800,
+      ),
+    },
+    codexTierControl: normalizeBoolean(
+      budget.codexTierControl,
+      DEFAULT_BUDGET_CONFIG.codexTierControl,
+    ),
+  };
+}
+
+/**
+ * Overlay AGENTBRIDGE_BUDGET_* environment variables on a normalized budget
+ * config (env wins; invalid env values are ignored via the same boundary rules).
+ */
+export function applyBudgetEnvOverrides(
+  budget: BudgetConfig,
+  env: Record<string, string | undefined> = process.env,
+): BudgetConfig {
+  const overlay: Record<string, unknown> = {
+    enabled: env.AGENTBRIDGE_BUDGET_ENABLED ?? budget.enabled,
+    pollSeconds: env.AGENTBRIDGE_BUDGET_POLL_SECONDS ?? budget.pollSeconds,
+    pauseAt: env.AGENTBRIDGE_BUDGET_PAUSE_AT ?? budget.pauseAt,
+    resumeBelow: env.AGENTBRIDGE_BUDGET_RESUME_BELOW ?? budget.resumeBelow,
+    syncDriftPct: env.AGENTBRIDGE_BUDGET_SYNC_DRIFT_PCT ?? budget.syncDriftPct,
+    parallel: {
+      minRemainingPct:
+        env.AGENTBRIDGE_BUDGET_PARALLEL_MIN_REMAINING_PCT ?? budget.parallel.minRemainingPct,
+      timeWindowSec:
+        env.AGENTBRIDGE_BUDGET_PARALLEL_TIME_WINDOW_SEC ?? budget.parallel.timeWindowSec,
+    },
+    codexTierControl: env.AGENTBRIDGE_BUDGET_CODEX_TIER_CONTROL ?? budget.codexTierControl,
+  };
+  return normalizeBudgetConfig(overlay);
 }
 
 function normalizeConfig(raw: unknown): AgentBridgeConfig | null {
@@ -88,6 +211,7 @@ function normalizeConfig(raw: unknown): AgentBridgeConfig | null {
       config.idleShutdownSeconds,
       DEFAULT_CONFIG.idleShutdownSeconds,
     ),
+    budget: normalizeBudgetConfig(config.budget),
   };
 }
 
@@ -151,4 +275,4 @@ export class ConfigService {
   }
 }
 
-export { DEFAULT_CONFIG };
+export { DEFAULT_CONFIG, DEFAULT_BUDGET_CONFIG };

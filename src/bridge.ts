@@ -113,6 +113,9 @@ daemonClient.on("status", (status) => {
     `Daemon status: ready=${status.bridgeReady} tui=${status.tuiConnected} thread=${status.threadId ?? "none"} queued=${status.queuedMessageCount}`,
   );
 
+  // Cache the latest budget snapshot for the get_budget tool (absent = sensing unavailable).
+  claude.setBudgetSnapshot(status.budget ?? null);
+
   // Kickoff message on first TUI connect transition (not reconnects)
   if (!hasSeenTuiConnect && status.tuiConnected && !previousTuiConnected) {
     hasSeenTuiConnect = true;

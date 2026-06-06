@@ -27,6 +27,7 @@ Runtime is **Bun** — do not change the local Bun version.
 | Validate plugin manifest | `bun run validate:plugin` (requires `claude` CLI) |
 | Local dev link | `bun link` then `agentbridge dev` (registers local marketplace + installs plugin) |
 | Start session | `agentbridge claude` (one terminal) + `agentbridge codex` (another) |
+| Show quota snapshot | `agentbridge budget [--json]` (both agents' 5h/weekly usage, drift, pause state) |
 | Stop everything | `agentbridge kill` |
 
 **Before committing**: run `bun run typecheck && bun test src`.
