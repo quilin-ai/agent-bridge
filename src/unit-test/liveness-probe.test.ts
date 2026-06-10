@@ -5,12 +5,9 @@ const OPEN = 1;
 const CLOSED = 3;
 
 function makeTarget(initial: Partial<ProbeTarget> = {}): ProbeTarget & { pingCount: number } {
-  // Seed lastPongAt at "now - 1s" so the defensive baseline (max(lastPongAt, now()))
-  // resolves to now() rather than a synthetic-stale value — preserves the assertion
-  // semantics for tests that simulate a real-time pong arriving during the probe.
   return {
     readyState: OPEN,
-    lastPongAt: Date.now() - 1_000,
+    pongCount: 0,
     pingCount: 0,
     ping() { this.pingCount++; },
     ...initial,
@@ -18,20 +15,16 @@ function makeTarget(initial: Partial<ProbeTarget> = {}): ProbeTarget & { pingCou
 }
 
 describe("probeLiveness", () => {
-  test("returns true when pong observed before timeout", async () => {
+  test("returns true when a pong (counter advances) is observed before timeout", async () => {
     const target = makeTarget();
-
     const promise = probeLiveness(target, { timeoutMs: 500, pollMs: 10 });
-    // Simulate a pong landing after the first poll tick. The timestamp must
-    // exceed Date.now() at the moment the probe takes its baseline; using
-    // `Date.now() + 60_000` is safely far enough in the future for the assertion.
-    setTimeout(() => { target.lastPongAt = Date.now() + 60_000; }, 30);
-
+    // Simulate a pong landing after the first poll tick.
+    setTimeout(() => { target.pongCount++; }, 30);
     expect(await promise).toBe(true);
     expect(target.pingCount).toBe(1);
   });
 
-  test("returns false when no pong within timeout", async () => {
+  test("returns false when no pong (counter never advances) within timeout", async () => {
     const target = makeTarget();
     const result = await probeLiveness(target, { timeoutMs: 120, pollMs: 20 });
     expect(result).toBe(false);
@@ -60,15 +53,25 @@ describe("probeLiveness", () => {
     expect(result).toBe(false);
   });
 
-  test("treats pong received before ping (baseline = same value) as NOT alive", async () => {
-    // Critical: a stale pong that landed before the probe started must not
-    // be interpreted as proof of liveness. Only pongs arriving AFTER the
-    // ping count. The defensive baseline takes max(lastPongAt, now()) so a
-    // recent-but-pre-probe pong is also filtered out — see the dedicated
-    // defensive-baseline tests below for that case.
-    const target = makeTarget({ lastPongAt: Date.now() - 500 });
+  test("a pong observed BEFORE the probe (already in baseline) is NOT proof of liveness", async () => {
+    // pongCount is non-zero at probe start (a prior keepalive pong). The probe
+    // snapshots it as the baseline; with no NEW pong during the probe, it must
+    // return false — a stale pre-probe pong can't be mistaken for fresh liveness.
+    const target = makeTarget({ pongCount: 7 });
     const result = await probeLiveness(target, { timeoutMs: 80, pollMs: 20 });
     expect(result).toBe(false);
+  });
+
+  test("REGRESSION: a pong landing in the SAME tick/ms as the probe start still registers", async () => {
+    // The old implementation compared `lastPongAt(ms) > max(lastPongAt, now())`,
+    // which false-negatived whenever the localhost round-trip completed within the
+    // probe's start millisecond. With a counter, a synchronous same-tick pong
+    // (incremented inside ping()) is unambiguously counted → alive.
+    const target = makeTarget();
+    target.ping = () => { target.pingCount++; target.pongCount++; };
+    const result = await probeLiveness(target, { timeoutMs: 100, pollMs: 25 });
+    expect(result).toBe(true);
+    expect(target.pingCount).toBe(1);
   });
 
   test("uses injected clock and sleep for deterministic timeout", async () => {
@@ -87,33 +90,10 @@ describe("probeLiveness", () => {
     expect(sleeps.every((s) => s === 25)).toBe(true);
   });
 
-  test("defensive baseline: pongs older than probe start are ignored even if newer than lastPongAt seed", async () => {
-    // Regression for Bun's sendPings: true. Without max(lastPongAt, now()),
-    // a recent-but-pre-probe pong (e.g. from Bun's background heartbeat that
-    // landed during the same JS tick before our ping() ran) would falsely
-    // satisfy `lastPongAt > baseline`. Use an injected clock so we can stage
-    // the timestamp ordering deterministically.
+  test("a counter advance DURING the probe (after ping) is accepted with injected clock", async () => {
     let fakeNow = 10_000;
-    const target = makeTarget({ lastPongAt: 9_500 });
-    const result = await probeLiveness(target, {
-      timeoutMs: 100,
-      pollMs: 25,
-      now: () => fakeNow,
-      sleep: async (ms) => { fakeNow += ms; },
-    });
-    expect(result).toBe(false);
-  });
-
-  test("defensive baseline: pong arriving DURING probe (after now()) is accepted", async () => {
-    let fakeNow = 10_000;
-    // lastPongAt seeded BELOW now() — proves we anchor baseline to now(), not lastPongAt.
-    const target = makeTarget({ lastPongAt: 9_500 });
-    let pingCalls = 0;
-    target.ping = () => {
-      pingCalls++;
-      // Simulate peer responding with a pong AFTER the probe started.
-      target.lastPongAt = fakeNow + 1; // strictly greater than baseline (=fakeNow)
-    };
+    const target = makeTarget({ pongCount: 3 });
+    target.ping = () => { target.pingCount++; target.pongCount++; }; // peer pongs in response
     const result = await probeLiveness(target, {
       timeoutMs: 100,
       pollMs: 25,
@@ -121,6 +101,5 @@ describe("probeLiveness", () => {
       sleep: async (ms) => { fakeNow += ms; },
     });
     expect(result).toBe(true);
-    expect(pingCalls).toBe(1);
   });
 });

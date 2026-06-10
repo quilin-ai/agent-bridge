@@ -3,6 +3,10 @@
   "version": "0.1.6",
   "description": "Bridge between Claude Code and Codex — bidirectional agent communication via MCP Channel + JSON-RPC",
   "type": "module",
+  "packageManager": "bun@1.3.11",
+  "engines": {
+    "bun": ">=1.3.11"
+  },
   "bin": {
     "agentbridge": "dist/cli.js",
     "abg": "dist/cli.js"
@@ -12,18 +16,26 @@
     "plugins/",
     ".claude-plugin/",
     "scripts/postinstall.cjs",
+    "scripts/install-safety.cjs",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
     "start": "bun run src/bridge.ts",
-    "build:cli": "mkdir -p dist && bun build src/cli.ts --outfile dist/cli.js --target bun && chmod +x dist/cli.js",
-    "build:plugin": "mkdir -p plugins/agentbridge/server && bun build src/bridge.ts --outfile plugins/agentbridge/server/bridge-server.js --target bun && bun build src/daemon.ts --outfile plugins/agentbridge/server/daemon.js --target bun",
+    "build:cli": "node scripts/build-bundles.mjs cli daemon",
+    "build:plugin": "node scripts/build-bundles.mjs bridge-plugin daemon-plugin",
+    "smoke:built": "bun scripts/smoke-built-cli.mjs",
+    "smoke:pack": "bun scripts/smoke-pack.mjs",
     "verify:plugin-sync": "node scripts/verify-plugin-sync.cjs",
     "postinstall": "node scripts/postinstall.cjs",
-    "prepublishOnly": "bun run build:cli && bun run build:plugin",
+    "prepublishOnly": "bun run build:cli && bun run build:plugin && bun run verify:plugin-sync && bun scripts/check-plugin-versions.js",
     "validate:plugin": "claude plugin validate plugins/agentbridge && claude plugin validate .claude-plugin/marketplace.json",
     "test": "bun test src",
+    "e2e:transport": "bun scripts/e2e-codex-transport.mjs",
+    "install:global": "node scripts/install-global.mjs local",
+    "install:global:local": "node scripts/install-global.mjs local",
+    "install:global:npm": "node scripts/install-global.mjs npm",
+    "release:bump": "node scripts/bump-version.mjs",
     "typecheck": "tsc --noEmit",
     "validate:plugin-versions": "bun scripts/check-plugin-versions.js",
     "check": "tsc --noEmit && bun test src && bun run verify:plugin-sync && bun scripts/check-plugin-versions.js"

@@ -9,6 +9,11 @@ agent_collab/
 codex-plugin-cc/
 /.mcp.json
 agentbridge-context.md
+.agentbridge/
 V1_PROGRESS.md
 # Added by code-review-graph
 .code-review-graph/
+
+# Runtime E2E artifacts and python cache
+artifacts/
+__pycache__/

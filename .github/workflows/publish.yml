@@ -18,14 +18,23 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
-      - name: Type check
-        run: bun run typecheck
-
-      - name: Run tests
-        run: bun test src
+      # Final integrity gate before publishing: typecheck + full test suite +
+      # plugin-bundle sync + version alignment. Never publish a build that can't
+      # pass `bun run check`. (When #90's release-form smoke lands, add
+      # `bun run smoke:built` + `bun run smoke:pack` here too.)
+      - name: Check (typecheck + tests + plugin sync + version align)
+        run: bun run check
 
       - name: Build
         run: bun run prepublishOnly
+
+      - name: Release smoke (built CLI artifacts) — blocks publish if the package can't start a daemon
+        # --skip-build: reuse the exact dist/ from the Build step above (the bytes
+        # that will be published) instead of rebuilding.
+        run: bun scripts/smoke-built-cli.mjs --skip-build
+
+      - name: Release smoke (npm pack completeness) — blocks publish if a shipped artifact is missing
+        run: bun run smoke:pack
 
       - uses: actions/setup-node@v4
         with:

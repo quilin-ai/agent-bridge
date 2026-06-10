@@ -9,13 +9,13 @@ const repoRoot = resolve(__dirname, "..");
 const pluginBundles = [
   {
     label: "plugins/agentbridge/server/bridge-server.js",
-    source: "src/bridge.ts",
+    target: "bridge-plugin",
     output: resolve(repoRoot, "plugins/agentbridge/server/bridge-server.js"),
     outfileName: "bridge-server.js",
   },
   {
     label: "plugins/agentbridge/server/daemon.js",
-    source: "src/daemon.ts",
+    target: "daemon-plugin",
     output: resolve(repoRoot, "plugins/agentbridge/server/daemon.js"),
     outfileName: "daemon.js",
   },
@@ -46,7 +46,7 @@ const tempDir = mkdtempSync(join(tmpdir(), "agentbridge-plugin-sync-"));
 try {
   for (const bundle of pluginBundles) {
     const tempOutput = join(tempDir, bundle.outfileName);
-    run("bun", ["build", bundle.source, "--outfile", tempOutput, "--target", "bun"]);
+    run("node", ["scripts/build-bundles.mjs", bundle.target, "--outfile", tempOutput]);
     bundle.generated = tempOutput;
   }
 

@@ -1,39 +1,200 @@
 import { execFileSync } from "node:child_process";
 import { readFileSync, unlinkSync } from "node:fs";
-import { StateDirResolver } from "../state-dir";
+import { join } from "node:path";
 import { DaemonLifecycle, isProcessAlive } from "../daemon-lifecycle";
+import { PairError, detectLegacyRootDaemon, type PairEntry, type PairPorts } from "../pair-registry";
+import {
+  computeBaseDir,
+  findPairForFlag,
+  listPairs,
+  parseKillArgs,
+  portsForEntry,
+} from "../pair-resolver";
+import { StateDirResolver } from "../state-dir";
 
-export async function runKill() {
-  console.log("AgentBridge Kill — stopping daemon and managed Codex TUI\n");
+type LogFn = (msg: string) => void;
 
-  const stateDir = new StateDirResolver();
-  const controlPort = parseInt(process.env.AGENTBRIDGE_CONTROL_PORT ?? "4502", 10);
+export interface StopResult {
+  label: string;
+  daemonKilled: boolean;
+  tuiKilled: boolean;
+  error?: unknown;
+}
 
-  const lifecycle = new DaemonLifecycle({
-    stateDir,
-    controlPort,
-    log: (msg) => console.log(`  ${msg}`),
-  });
-
-  // Mark the daemon as intentionally stopped before terminating the process.
-  // This closes the reconnect race where the frontend sees the disconnect
-  // before the sentinel is written and relaunches the daemon.
-  lifecycle.markKilled();
-  const tuiKilled = await killManagedCodexTui(stateDir, (msg) => console.log(`  ${msg}`));
-  const killed = await lifecycle.kill();
-
-  if (killed || tuiKilled) {
-    console.log("\nAgentBridge stopped.");
-    console.log("Please restart Claude Code (`agentbridge claude`), switch to a new conversation, or run `/resume` to fully disconnect.");
-  } else {
-    console.log("\nNo running AgentBridge daemon or managed Codex TUI found.");
-    console.log("Stale state files cleaned up (if any).");
+export async function runKill(args: string[] = []) {
+  const argError = validateKillArgs(args);
+  if (argError === "help") {
+    printKillUsage();
+    return;
   }
+  if (argError) {
+    console.error(`Error: ${argError}`);
+    printKillUsage();
+    process.exit(1);
+  }
+
+  const parsed = parseKillArgs(args);
+
+  if (parsed.pairFlag !== undefined && parsed.all) {
+    console.error('Error: use either "--pair <name>" or "--all", not both.');
+    process.exit(1);
+  }
+
+  const base = computeBaseDir();
+  console.log("AgentBridge Kill — stopping AgentBridge pair processes\n");
+
+  const results: StopResult[] = [];
+  let restartCommand = "agentbridge claude";
+  if (parsed.pairFlag !== undefined) {
+    // The friendly name is scoped to the current directory (same name elsewhere
+    // is a different pair); findPairForFlag composes it with the cwd, falling
+    // back to a raw pairId match for an id copied from `abg pairs` — same cwd only.
+    let pair: PairEntry | null;
+    try {
+      pair = findPairForFlag(base, process.cwd(), parsed.pairFlag);
+    } catch (err) {
+      console.error(`Error: ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+    }
+    if (!pair) {
+      console.log(`No such pair: "${parsed.pairFlag}" in ${process.cwd()}`);
+      printKnownPairs(base);
+      return;
+    }
+    restartCommand = `agentbridge --pair ${pair.name ?? parsed.pairFlag} claude`;
+    results.push(await stopPairEntry(base, pair));
+  } else {
+    for (const pair of listPairs(base)) {
+      results.push(await stopPairEntry(base, pair));
+    }
+    const legacy = detectLegacyRootDaemon(base);
+    if (legacy) {
+      results.push(await stopStateDir("(legacy-root)", new StateDirResolver(base), {
+        appPort: 4500,
+        proxyPort: 4501,
+        controlPort: legacy.controlPort,
+      }));
+    }
+  }
+
+  printSummary(results, restartCommand);
+}
+
+function validateKillArgs(args: string[]): string | "help" | null {
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]!;
+    if (arg === "--help" || arg === "-h") return "help";
+    if (arg === "--all") continue;
+    if (arg === "--pair") {
+      const value = args[i + 1];
+      if (value === undefined || value.startsWith("-")) {
+        return 'Missing value for "--pair".';
+      }
+      i++;
+      continue;
+    }
+    if (arg.startsWith("--pair=")) {
+      if (arg.slice("--pair=".length).length === 0) {
+        return 'Missing value for "--pair".';
+      }
+      continue;
+    }
+    return `Unknown kill argument: ${arg}`;
+  }
+  return null;
+}
+
+function printKillUsage() {
+  console.log(`
+Usage: abg kill [--all]
+       abg [--pair <name|id>] kill
+
+Stops AgentBridge daemon/TUI processes.
+
+Options:
+  --pair <name|id>  Stop only one pair — a cwd-scoped name (e.g. "main") or the
+                    same pair id when run from that directory.
+  --all             Stop all registered pairs and any legacy-root daemon.
+  --help, -h        Show this help message.
+
+No arguments are equivalent to --all.
+`.trim());
+}
+
+export async function stopPairEntry(base: string, pair: PairEntry): Promise<StopResult> {
+  const ports = portsForEntry(pair);
+  const stateDir = new StateDirResolver(join(base, "pairs", pair.pairId));
+  return stopStateDir(pair.pairId, stateDir, ports);
+}
+
+async function stopStateDir(label: string, stateDir: StateDirResolver, ports: PairPorts): Promise<StopResult> {
+  const prefix = `  [${label} ${ports.appPort}/${ports.proxyPort}/${ports.controlPort}]`;
+  const log: LogFn = (msg) => console.log(`${prefix} ${msg}`);
+
+  console.log(`${prefix} stopping`);
+  try {
+    const lifecycle = new DaemonLifecycle({
+      stateDir,
+      controlPort: ports.controlPort,
+      log,
+    });
+
+    lifecycle.markKilled();
+    const tuiKilled = await killManagedCodexTui(stateDir, log);
+    const daemonKilled = await lifecycle.kill();
+    return { label, daemonKilled, tuiKilled };
+  } catch (error) {
+    log(`ERROR: ${error instanceof Error ? error.message : String(error)}`);
+    return { label, daemonKilled: false, tuiKilled: false, error };
+  }
+}
+
+function printKnownPairs(base: string) {
+  try {
+    const pairs = listPairs(base);
+    if (pairs.length === 0) {
+      console.log("No pairs registered.");
+      return;
+    }
+    console.log("Known pairs:");
+    for (const pair of pairs) {
+      const ports = portsForEntry(pair);
+      console.log(`  ${pair.pairId} (slot ${pair.slot}, ports ${ports.appPort}/${ports.proxyPort}/${ports.controlPort})`);
+    }
+  } catch (error) {
+    if (error instanceof PairError) {
+      console.log(`Could not read pair registry: ${error.message}`);
+      return;
+    }
+    throw error;
+  }
+}
+
+function printSummary(results: StopResult[], restartCommand: string) {
+  if (results.length === 0) {
+    console.log("No pairs registered.");
+    return;
+  }
+
+  const stopped = results.filter((r) => r.daemonKilled || r.tuiKilled).length;
+  const failed = results.filter((r) => r.error).length;
+  console.log("");
+  if (stopped > 0) {
+    console.log("AgentBridge stopped.");
+    console.log(`Please restart Claude Code (\`${restartCommand}\`), switch to a new conversation, or run \`/resume\` to fully disconnect.`);
+  } else {
+    console.log("No running AgentBridge daemon or managed Codex TUI found.");
+  }
+  console.log(`Stopped ${stopped}/${results.length} target${results.length === 1 ? "" : "s"}.`);
+  if (failed > 0) {
+    console.log(`${failed} target${failed === 1 ? "" : "s"} reported errors; see log lines above.`);
+  }
+  console.log("Registry entries were preserved. Use `abg pairs rm <name|id>` to stop and release a slot.");
 }
 
 async function killManagedCodexTui(
   stateDir: StateDirResolver,
-  log: (msg: string) => void,
+  log: LogFn,
   gracefulTimeoutMs = 3000,
 ): Promise<boolean> {
   const pid = readTuiPid(stateDir);
@@ -103,10 +264,10 @@ function isManagedCodexTuiProcess(pid: number): boolean {
   try {
     const cmd = execFileSync("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf-8" }).trim();
     return (
-      cmd.includes("codex")
-      && cmd.includes("--enable")
-      && cmd.includes("tui_app_server")
-      && cmd.includes("--remote")
+      cmd.includes("codex") &&
+      cmd.includes("--enable") &&
+      cmd.includes("tui_app_server") &&
+      cmd.includes("--remote")
     );
   } catch {
     return false;

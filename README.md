@@ -249,9 +249,26 @@ agent_bridge/
 | `CODEX_PROXY_PORT` | `4501` | Bridge proxy port for the Codex TUI |
 | `AGENTBRIDGE_CONTROL_PORT` | `4502` | Control port between bridge.ts and daemon.ts |
 | `AGENTBRIDGE_LIVENESS_PROBE_TIMEOUT_MS` | `3000` | Maximum wait for incumbent Claude pong before evicting on contention (issue #68) |
+| `AGENTBRIDGE_TURN_WATCHDOG_MS` | `300000` | Per-turn inactivity watchdog: force-completes a turn after this many ms of app-server silence so a lost `turn/completed` can't lock injection forever (issue #69) |
+| `AGENTBRIDGE_CODEX_TRANSPORT` | `auto` | How the daemon reaches the Codex app-server: `auto` (probe `codex app-server --help`, use `ws://` if supported else fall back to a `unix://` socket via a transparent relay), `ws` (force ws), or `unix` (force unix socket + relay). For builds that drop `ws://` listen support (issue #85) |
 | `AGENTBRIDGE_STATE_DIR` | Platform default | State directory for pid, status, logs (macOS: `~/Library/Application Support/agentbridge/`, Linux: `$XDG_STATE_HOME/agentbridge/`) |
 | `AGENTBRIDGE_MODE` | `push` | Message delivery mode (`push` for channels, `pull` for API key mode) |
 | `AGENTBRIDGE_DAEMON_ENTRY` | `./daemon.ts` | Override daemon entry point (used by plugin bundles) |
+| `NO_UPDATE_NOTIFIER` | unset | Set to any value to disable the "update available" notice (ecosystem-standard opt-out) |
+| `AGENTBRIDGE_NO_UPDATE_NOTIFIER` | unset | Namespaced opt-out for the update notice (same effect as `NO_UPDATE_NOTIFIER`) |
+| `AGENTBRIDGE_UPDATE_CHECK_INTERVAL_MS` | `86400000` | How often `abg claude`/`abg codex` may check npm for a newer version (default once/day). The notice is otherwise printed from cache — zero network on most runs |
+
+### Update notifications
+
+`abg claude` and `abg codex` print a one-line notice to stderr when a newer **stable** AgentBridge is published to npm, e.g.:
+
+```
+⚠ AgentBridge update available: 0.1.6 → 0.1.7
+  CLI:    npm install -g @raysonmeng/agentbridge@latest
+  Plugin: /plugin marketplace update agentbridge   (then /reload-plugins)
+```
+
+The check is best-effort and never blocks, delays, or fails your command: the notice is printed from a cached result, the npm check runs at most once per day in the background, and any network/registry failure is silently ignored. It is suppressed automatically for non-interactive (piped) output and in CI, and can be disabled with `NO_UPDATE_NOTIFIER=1`. The notifier never installs anything — it only shows you the command.
 
 ### State Directory
 

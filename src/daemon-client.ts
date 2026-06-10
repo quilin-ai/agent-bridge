@@ -4,17 +4,23 @@ import {
   CLOSE_CODE_REPLACED,
   CLOSE_CODE_EVICTED_STALE,
   CLOSE_CODE_PROBE_IN_PROGRESS,
+  CLOSE_CODE_PAIR_MISMATCH,
 } from "./control-protocol";
-import type { ControlClientMessage, ControlServerMessage, DaemonStatus } from "./control-protocol";
+import type { ControlClientIdentity, ControlClientMessage, ControlServerMessage, DaemonStatus } from "./control-protocol";
 
 interface DaemonClientEvents {
   codexMessage: [BridgeMessage];
   disconnect: [];
   rejected: [number];
   status: [DaemonStatus];
+  incumbentStatus: [{ connected: boolean; alive: boolean }];
 }
 
 let nextSocketId = 0;
+
+export interface DaemonClientOptions {
+  identity?: ControlClientIdentity;
+}
 
 export class DaemonClient extends EventEmitter<DaemonClientEvents> {
   private ws: WebSocket | null = null;
@@ -28,7 +34,7 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
     }
   >();
 
-  constructor(private readonly url: string) {
+  constructor(private readonly url: string, private readonly options: DaemonClientOptions = {}) {
     super();
   }
 
@@ -76,15 +82,18 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
   }
 
   attachClaude() {
-    this.send({ type: "claude_connect" });
+    this.send({
+      type: "claude_connect",
+      ...(this.options.identity ? { identity: this.options.identity } : {}),
+    });
   }
 
-  async attachClaudeAndWaitForStatus(timeoutMs = 1000): Promise<boolean> {
+  async attachClaudeAndWaitForStatus(timeoutMs = 1000): Promise<DaemonStatus | null> {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      return false;
+      return null;
     }
 
-    return await new Promise<boolean>((resolve) => {
+    return await new Promise<DaemonStatus | null>((resolve) => {
       let settled = false;
       let timer: ReturnType<typeof setTimeout> | null = null;
 
@@ -100,27 +109,73 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
         this.off("disconnect", onDisconnect);
       };
 
-      const finish = (value: boolean) => {
+      const finish = (value: DaemonStatus | null) => {
         cleanup();
         resolve(value);
       };
 
-      const onStatus = () => finish(true);
-      const onRejected = () => finish(false);
-      const onDisconnect = () => finish(false);
+      const onStatus = (status: DaemonStatus) => finish(status);
+      const onRejected = () => finish(null);
+      const onDisconnect = () => finish(null);
 
       this.on("status", onStatus);
       this.on("rejected", onRejected);
       this.on("disconnect", onDisconnect);
 
       timer = setTimeout(() => {
-        finish(false);
+        finish(null);
       }, timeoutMs);
 
       try {
         this.attachClaude();
       } catch {
-        finish(false);
+        finish(null);
+      }
+    });
+  }
+
+  /**
+   * Ask the daemon whether it already has a LIVE Claude frontend attached,
+   * WITHOUT attaching this socket (so it never contests the incumbent).
+   *
+   * Fail-OPEN: on timeout, a closed socket, or an older daemon that doesn't
+   * understand `probe_incumbent` (it stays silent), this resolves to
+   * `{ connected:false, alive:false }` so the conflict guard never blocks a
+   * legitimate launch on a probe failure — admission (#68) is the backstop.
+   */
+  async probeIncumbent(timeoutMs = 3000): Promise<{ connected: boolean; alive: boolean }> {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      return { connected: false, alive: false };
+    }
+
+    return await new Promise((resolve) => {
+      let settled = false;
+      let timer: ReturnType<typeof setTimeout> | null = null;
+
+      const finish = (value: { connected: boolean; alive: boolean }) => {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        this.off("incumbentStatus", onStatus);
+        this.off("disconnect", onDisconnect);
+        this.off("rejected", onRejected);
+        resolve(value);
+      };
+
+      const onStatus = (s: { connected: boolean; alive: boolean }) => finish(s);
+      const onDisconnect = () => finish({ connected: false, alive: false });
+      const onRejected = () => finish({ connected: false, alive: false });
+
+      this.on("incumbentStatus", onStatus);
+      this.on("disconnect", onDisconnect);
+      this.on("rejected", onRejected);
+
+      timer = setTimeout(() => finish({ connected: false, alive: false }), timeoutMs);
+
+      try {
+        this.send({ type: "probe_incumbent" });
+      } catch {
+        finish({ connected: false, alive: false });
       }
     });
   }
@@ -188,6 +243,9 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
         case "status":
           this.emit("status", message.status);
           return;
+        case "incumbent_status":
+          this.emit("incumbentStatus", { connected: message.connected, alive: message.alive });
+          return;
       }
     };
 
@@ -200,7 +258,8 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
         if (
           event.code === CLOSE_CODE_REPLACED ||
           event.code === CLOSE_CODE_EVICTED_STALE ||
-          event.code === CLOSE_CODE_PROBE_IN_PROGRESS
+          event.code === CLOSE_CODE_PROBE_IN_PROGRESS ||
+          event.code === CLOSE_CODE_PAIR_MISMATCH
         ) {
           this.emit("rejected", event.code);
         } else {

@@ -1,6 +1,5 @@
 import { describe, expect, test } from "bun:test";
 import {
-  BRIDGE_CONTRACT_REMINDER,
   StatusBuffer,
   classifyMessage,
   parseMarker,
@@ -186,11 +185,4 @@ describe("StatusBuffer pause/resume", () => {
     buf.dispose();
   });
 });
-
-describe("BRIDGE_CONTRACT_REMINDER", () => {
-  test("contains marker instructions", () => {
-    expect(BRIDGE_CONTRACT_REMINDER).toContain("[IMPORTANT]");
-    expect(BRIDGE_CONTRACT_REMINDER).toContain("[STATUS]");
-    expect(BRIDGE_CONTRACT_REMINDER).toContain("[FYI]");
-  });
-});
+// (The bridge-contract marker spec moved to AGENTS_MD_SECTION; see role-patterns.test.ts.)

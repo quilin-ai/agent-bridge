@@ -1,10 +1,10 @@
 #!/usr/bin/env bun
 
-import { appendFileSync } from "node:fs";
 import type { ServerWebSocket } from "bun";
+import { daemonStatusBuildInfo } from "./build-info";
 import { CodexAdapter } from "./codex-adapter";
+import { validateClaudeClientIdentity } from "./daemon-identity";
 import {
-  BRIDGE_CONTRACT_REMINDER,
   REPLY_REQUIRED_INSTRUCTION,
   StatusBuffer,
   classifyMessage,
@@ -20,14 +20,26 @@ import {
   CLOSE_CODE_PROBE_IN_PROGRESS,
 } from "./control-protocol";
 import { parsePositiveIntEnv } from "./env-utils";
-import type { ControlClientMessage, ControlServerMessage, DaemonStatus } from "./control-protocol";
+import { ReplyRequiredTracker } from "./reply-required-tracker";
+import { persistCurrentThreadWithRolloutRetry } from "./thread-state";
+import { appendRotatingLog } from "./rotating-log";
+import type {
+  ControlClientIdentity,
+  ControlClientMessage,
+  ControlServerMessage,
+  DaemonStatus,
+} from "./control-protocol";
 import type { BridgeMessage } from "./types";
 import { probeLiveness as probeLivenessImpl } from "./liveness-probe";
 
 interface ControlSocketData {
   clientId: number;
   attached: boolean;
+  /** Wall-clock of the last pong (used only for the contest diagnostic log). */
   lastPongAt: number;
+  /** Monotonic pong counter — the liveness probe's source of truth (see liveness-probe.ts). */
+  pongCount: number;
+  identity?: ControlClientIdentity;
 }
 
 const stateDir = new StateDirResolver();
@@ -45,6 +57,17 @@ const FILTER_MODE: FilterMode =
   (process.env.AGENTBRIDGE_FILTER_MODE as FilterMode) === "full" ? "full" : "filtered";
 const IDLE_SHUTDOWN_MS = parseInt(process.env.AGENTBRIDGE_IDLE_SHUTDOWN_MS ?? String(config.idleShutdownSeconds * 1000), 10);
 const ATTENTION_WINDOW_MS = parseInt(process.env.AGENTBRIDGE_ATTENTION_WINDOW_MS ?? String(config.turnCoordination.attentionWindowSeconds * 1000), 10);
+// Bootstrap-readiness watchdog: if the Codex layer never becomes ready within this
+// window the daemon self-exits to release its control port (prevents the
+// healthz-200/readyz-503 zombie). Default 45s is deliberately > the worst-case
+// bootCodex retry budget (CODEX_BOOT_RETRIES+1 attempts × ~10s codex.start internal
+// timeout + 1s/2s backoff ≈ 33s) so it never cuts off a legitimately-retrying boot.
+const BOOTSTRAP_TIMEOUT_MS = parsePositiveIntEnv("AGENTBRIDGE_BOOTSTRAP_TIMEOUT_MS", 45000);
+// In-daemon bounded retries for a transient Codex bootstrap failure (e.g. a just-killed
+// codex's port not yet released). After these, the daemon self-exits — further
+// replacement is owned by the lifecycle (ensureRunning), not by retrying forever here.
+const CODEX_BOOT_RETRIES = parsePositiveIntEnv("AGENTBRIDGE_CODEX_BOOT_RETRIES", 2);
+const ALLOW_IDENTITYLESS_CLIENT = process.env.AGENTBRIDGE_COMPAT_IDENTITYLESS === "1";
 
 const daemonLifecycle = new DaemonLifecycle({ stateDir, controlPort: CONTROL_PORT, log });
 
@@ -58,14 +81,11 @@ let nextSystemMessageId = 0;
 let codexBootstrapped = false;
 let attentionWindowTimer: ReturnType<typeof setTimeout> | null = null;
 let inAttentionWindow = false;
-let replyRequired = false;
-let replyReceivedDuringTurn = false;
+const replyTracker = new ReplyRequiredTracker();
 let shuttingDown = false;
+let bootDeadlineTimer: ReturnType<typeof setTimeout> | null = null;
 let idleShutdownTimer: ReturnType<typeof setTimeout> | null = null;
 let claudeDisconnectTimer: ReturnType<typeof setTimeout> | null = null;
-let claudeOnlineNoticeSent = false;
-let claudeOfflineNoticeShown = false;
-let codexCollaborationKickoffSent = false;
 let lastAttachStatusSentTs = 0;
 const ATTACH_STATUS_COOLDOWN_MS = 30_000; // Don't re-send status on rapid reattach
 
@@ -101,7 +121,10 @@ const tuiConnectionState = new TuiConnectionState({
         `✅ Codex TUI reconnected (conn #${connId}). Bridge restored, communication can continue.`,
       ),
     );
-    codex.injectMessage("✅ Claude Code is still online, bridge restored. Bidirectional communication can continue.");
+    // No status notice injected into Codex: runtime online/offline/reconnect events
+    // can only go through turn/start, which pollutes the Codex thread/title and can
+    // trigger spurious responses (see the kickoff removal). Codex resumes normally
+    // on the next real Claude message.
   },
 });
 
@@ -121,10 +144,10 @@ codex.on("agentMessage", (msg: BridgeMessage) => {
   if (msg.source !== "codex") return;
   const result = classifyMessage(msg.content, FILTER_MODE);
 
-  // When replyRequired is active, force-forward ALL messages regardless of marker
-  if (replyRequired) {
+  // When require_reply is armed, force-forward ALL messages regardless of marker
+  if (replyTracker.isArmed) {
     log(`Codex → Claude [${result.marker}/force-forward-reply-required] (${msg.content.length} chars)`);
-    replyReceivedDuringTurn = true;
+    replyTracker.noteForwarded();
     if (statusBuffer.size > 0) {
       statusBuffer.flush("reply-required message arrived");
     }
@@ -163,8 +186,10 @@ codex.on("turnCompleted", () => {
   log("Codex turn completed");
   statusBuffer.flush("turn completed");
 
-  // Check if reply was required but Codex didn't send any agentMessage
-  if (replyRequired && !replyReceivedDuringTurn) {
+  // Check if reply was required but Codex didn't send any agentMessage, then
+  // clear the reply-required state.
+  const { warnReplyMissing } = replyTracker.consumeOnTurnComplete();
+  if (warnReplyMissing) {
     log("⚠️ Reply was required but Codex did not send any agentMessage");
     emitToClaude(
       systemMessage(
@@ -174,10 +199,6 @@ codex.on("turnCompleted", () => {
     );
   }
 
-  // Reset reply-required state
-  replyRequired = false;
-  replyReceivedDuringTurn = false;
-
   emitToClaude(
     systemMessage(
       "system_turn_completed",
@@ -185,11 +206,24 @@ codex.on("turnCompleted", () => {
     ),
   );
   startAttentionWindow();
+});
 
-  // Retry Claude-online notice if it was deferred while the turn was in progress.
-  if (attachedClaude && shouldNotifyCodexClaudeOnline()) {
-    notifyCodexClaudeOnline();
-  }
+codex.on("turnAborted", (reason: string) => {
+  // A turn ended without a normal turn/completed (app-server close / reconnect /
+  // stop). Clear the require_reply tracker so its armed state cannot be inherited
+  // by a later, unrelated turn (force-forward leak + misattributed warning).
+  log(`Codex turn aborted (${reason}) — clearing reply-required state`);
+  replyTracker.reset();
+});
+
+codex.on("turnStalled", (event: { turnId: string; inactivityMs: number }) => {
+  log(`Codex turn stalled (${event.turnId}, inactivity ${event.inactivityMs}ms)`);
+  emitToClaude(
+    systemMessage(
+      "system_turn_stalled",
+      `⚠️ Codex has been silent for ${event.inactivityMs}ms while a turn is still in progress. AgentBridge is keeping the turn busy and will not send a fake completion; wait for Codex to finish or reconnect the TUI if it is stuck.`,
+    ),
+  );
 });
 
 codex.on("ready", (threadId: string) => {
@@ -200,10 +234,29 @@ codex.on("ready", (threadId: string) => {
   emitToClaude(
     systemMessage("system_ready", currentReadyMessage()),
   );
+});
 
-  if (attachedClaude && shouldNotifyCodexClaudeOnline()) {
-    notifyCodexClaudeOnline();
-  }
+codex.on("threadChanged", (event: { threadId: string; previousThreadId: string | null; reason: string }) => {
+  broadcastStatus();
+  void persistCurrentThreadWithRolloutRetry(
+    {
+      stateDir,
+      pairId: process.env.AGENTBRIDGE_PAIR_ID ?? null,
+      pairName: process.env.AGENTBRIDGE_PAIR_NAME,
+      cwd: process.cwd(),
+    },
+    event.threadId,
+    event.reason,
+    {
+      log,
+      // Abandon this loop the moment a newer thread switch supersedes it, so a
+      // lingering retry cannot clobber current-thread.json with an abandoned
+      // threadId (which would auto-resume the wrong thread or break resume).
+      shouldContinue: () => codex.activeThreadId === event.threadId,
+    },
+  ).catch((err) => {
+    log(`Failed to persist current thread ${event.threadId}: ${err?.message ?? err}`);
+  });
 });
 
 codex.on("tuiConnected", (connId: number) => {
@@ -227,11 +280,10 @@ codex.on("error", (err: Error) => {
 codex.on("exit", (code: number | null) => {
   log(`Codex process exited (code ${code})`);
   codexBootstrapped = false;
+  replyTracker.reset(); // any in-flight require_reply turn is gone with the process
   statusBuffer.flush("codex exited");
   tuiConnectionState.handleCodexExit();
   clearPendingClaudeDisconnect("Codex process exited");
-  claudeOnlineNoticeSent = false;
-  claudeOfflineNoticeShown = false;
   emitToClaude(
     systemMessage(
       "system_codex_exit",
@@ -239,6 +291,10 @@ codex.on("exit", (code: number | null) => {
     ),
   );
   broadcastStatus();
+  // Codex died after a successful boot (a dead proc is not auto-respawned). Re-arm
+  // the readiness watchdog so that if it does not come back and no TUI is using us,
+  // the daemon self-exits instead of lingering as a healthz-200/readyz-503 zombie.
+  armBootDeadline();
 });
 
 function startControlServer() {
@@ -256,7 +312,7 @@ function startControlServer() {
         return Response.json(currentStatus(), { status: codexBootstrapped ? 200 : 503 });
       }
 
-      if (url.pathname === "/ws" && server.upgrade(req, { data: { clientId: 0, attached: false, lastPongAt: Date.now() } })) {
+      if (url.pathname === "/ws" && server.upgrade(req, { data: { clientId: 0, attached: false, lastPongAt: Date.now(), pongCount: 0 } })) {
         return undefined;
       }
 
@@ -281,6 +337,7 @@ function startControlServer() {
       },
       pong: (ws: ServerWebSocket<ControlSocketData>) => {
         ws.data.lastPongAt = Date.now();
+        ws.data.pongCount++;
       },
     },
   });
@@ -298,7 +355,18 @@ function handleControlMessage(ws: ServerWebSocket<ControlSocketData>, raw: strin
 
   switch (message.type) {
     case "claude_connect":
-      attachClaude(ws).catch((err) => {
+      const admission = validateClaudeClientIdentity({
+        expectedPairId: process.env.AGENTBRIDGE_PAIR_ID ?? null,
+        daemonCwd: process.cwd(),
+        identity: message.identity,
+        allowIdentityless: ALLOW_IDENTITYLESS_CLIENT,
+      });
+      if (!admission.ok) {
+        log(`Rejecting Claude frontend #${ws.data.clientId}: ${admission.reason}`);
+        ws.close(admission.closeCode, admission.reason);
+        return;
+      }
+      attachClaude(ws, message.identity).catch((err) => {
         log(`attachClaude threw for #${ws.data.clientId}: ${err?.message ?? err}`);
       });
       return;
@@ -307,6 +375,11 @@ function handleControlMessage(ws: ServerWebSocket<ControlSocketData>, raw: strin
       return;
     case "status":
       sendStatus(ws);
+      return;
+    case "probe_incumbent":
+      handleProbeIncumbent(ws).catch((err) => {
+        log(`handleProbeIncumbent threw for #${ws.data.clientId}: ${err?.message ?? err}`);
+      });
       return;
     case "claude_to_codex": {
       if (message.message.source !== "claude") {
@@ -330,15 +403,16 @@ function handleControlMessage(ws: ServerWebSocket<ControlSocketData>, raw: strin
       }
 
       const requireReply = !!message.requireReply;
-      let contentWithReminder = message.message.content + "\n\n" + BRIDGE_CONTRACT_REMINDER;
+      // The static bridge contract (markers / git-forbidden / role guidance) now
+      // lives in AGENTS.md (injected by `abg init`), so it is no longer appended to
+      // every message — appending it polluted every Codex turn and the thread title.
+      // Only the DYNAMIC reply-required instruction is appended, on demand.
+      let contentToSend = message.message.content;
       if (requireReply) {
-        contentWithReminder += REPLY_REQUIRED_INSTRUCTION;
-        replyRequired = true;
-        replyReceivedDuringTurn = false;
-        log(`Reply required flag set for this message`);
+        contentToSend += REPLY_REQUIRED_INSTRUCTION;
       }
       log(`Forwarding Claude → Codex (${message.message.content.length} chars, requireReply=${requireReply})`);
-      const injected = codex.injectMessage(contentWithReminder);
+      const injected = codex.injectMessage(contentToSend);
       if (!injected) {
         const reason = codex.turnInProgress
           ? "Codex is busy executing a turn. Wait for it to finish before sending another message."
@@ -352,6 +426,14 @@ function handleControlMessage(ws: ServerWebSocket<ControlSocketData>, raw: strin
         });
         return;
       }
+      // Arm reply-required tracking ONLY after a successful injection: a turn has
+      // now started, so turnCompleted will reset it. Arming before this guard
+      // (on a rejected injection, e.g. Codex busy) would strand the flag on an
+      // unrelated in-flight turn and silently lose this require_reply request.
+      if (requireReply) {
+        replyTracker.arm();
+        log(`Reply required flag set for this message`);
+      }
       clearAttentionWindow(); // Claude successfully replied, end attention window
       sendProtocolMessage(ws, {
         type: "claude_to_codex_result",
@@ -363,7 +445,7 @@ function handleControlMessage(ws: ServerWebSocket<ControlSocketData>, raw: strin
   }
 }
 
-async function attachClaude(ws: ServerWebSocket<ControlSocketData>) {
+async function attachClaude(ws: ServerWebSocket<ControlSocketData>, identity?: ControlClientIdentity) {
   const occupant = attachedClaude;
   if (occupant && occupant !== ws && occupant.readyState !== WebSocket.CLOSED) {
     // Slot is occupied by another socket that hasn't yet shown us FIN.
@@ -426,10 +508,13 @@ async function attachClaude(ws: ServerWebSocket<ControlSocketData>) {
   }
 
   clearPendingClaudeDisconnect("Claude frontend attached");
+  ws.data.identity = identity;
   attachedClaude = ws;
   ws.data.attached = true;
   cancelIdleShutdown();
-  log(`Claude frontend attached (#${ws.data.clientId})`);
+  log(
+    `Claude frontend attached (#${ws.data.clientId}, pair=${identity?.pairId ?? "<none>"}, cwd=${identity?.cwd ?? "<unknown>"})`,
+  );
 
   statusBuffer.flush("claude reconnected");
   sendStatus(ws);
@@ -449,10 +534,6 @@ async function attachClaude(ws: ServerWebSocket<ControlSocketData>) {
   }
 
   lastAttachStatusSentTs = now;
-
-  if (tuiConnectionState.canReply() && shouldNotifyCodexClaudeOnline()) {
-    notifyCodexClaudeOnline();
-  }
 }
 
 function detachClaude(ws: ServerWebSocket<ControlSocketData>, reason: string) {
@@ -467,6 +548,48 @@ function detachClaude(ws: ServerWebSocket<ControlSocketData>, reason: string) {
   scheduleIdleShutdown();
 }
 
+/**
+ * Answer a non-attaching `probe_incumbent` request: does this daemon currently
+ * have a LIVE Claude frontend attached? The asking socket (`ws`) is the CLI's
+ * throwaway control connection — it never attaches, so it can never be the
+ * occupant and probing it has no side effect on admission.
+ *
+ * Semantics mirror the challenge-on-contest path (issue #68):
+ *   - no occupant / closed occupant            → { connected:false, alive:false }
+ *   - a real contest probe already in flight    → { connected:true,  alive:true } (defer)
+ *   - otherwise actively ping the incumbent      → alive = pong observed in time
+ * A half-open dead incumbent reports connected:true, alive:false, telling the CLI
+ * it is safe to launch and let admission evict the stale frontend.
+ */
+async function handleProbeIncumbent(ws: ServerWebSocket<ControlSocketData>) {
+  const occupant = attachedClaude;
+  log(`probe_incumbent from #${ws.data.clientId}: occupant=${occupant ? "#" + occupant.data.clientId : "none"} readyState=${occupant?.readyState}`);
+  if (!occupant || occupant === ws || occupant.readyState !== WebSocket.OPEN) {
+    sendProtocolMessage(ws, { type: "incumbent_status", connected: false, alive: false });
+    return;
+  }
+  // A real challenge-on-contest decision is already running — defer to it (report
+  // live so the CLI guard errs on the safe side and does not race the admission).
+  if (challengeInProgress) {
+    sendProtocolMessage(ws, { type: "incumbent_status", connected: true, alive: true });
+    return;
+  }
+  // Deliberately do NOT set challengeInProgress here: this is a read-only probe,
+  // not a contest. Setting it would make a genuine concurrent claude_connect get
+  // bounced with CLOSE_CODE_PROBE_IN_PROGRESS (a ~3s reconnect delay) even though
+  // the probing socket never intends to attach. A real contest that races this
+  // probe just runs its own ping concurrently — harmless (ping is idempotent).
+  const alive = await probeLiveness(occupant, LIVENESS_PROBE_TIMEOUT_MS);
+  // The probe awaited; re-read state in case the incumbent closed meanwhile.
+  const stillConnected = attachedClaude === occupant && occupant.readyState === WebSocket.OPEN;
+  log(`probe_incumbent reply to #${ws.data.clientId}: connected=${stillConnected} alive=${stillConnected && alive}`);
+  sendProtocolMessage(ws, {
+    type: "incumbent_status",
+    connected: stillConnected,
+    alive: stillConnected && alive,
+  });
+}
+
 async function probeLiveness(
   ws: ServerWebSocket<ControlSocketData>,
   timeoutMs: number,
@@ -474,7 +597,7 @@ async function probeLiveness(
   return probeLivenessImpl(
     {
       get readyState() { return ws.readyState; },
-      get lastPongAt() { return ws.data.lastPongAt; },
+      get pongCount() { return ws.data.pongCount; },
       ping: () => { ws.ping(); },
     },
     { timeoutMs, pollMs: LIVENESS_PROBE_POLL_MS },
@@ -576,25 +699,10 @@ function scheduleClaudeDisconnectNotification(clientId: number) {
       return;
     }
 
-    if (!tuiConnectionState.canReply()) {
-      log(
-        `Suppressing Claude disconnect notification for client #${clientId} because Codex cannot reply`,
-      );
-      return;
-    }
-
-    if (!claudeOnlineNoticeSent) {
-      log(
-        `Suppressing Claude disconnect notification for client #${clientId} because Claude was never announced online`,
-      );
-      return;
-    }
-
-    codex.injectMessage(
-      "⚠️ Claude Code went offline. AgentBridge is still running in the background; it will reconnect automatically when Claude reopens.",
-    );
-    claudeOnlineNoticeSent = false;
-    claudeOfflineNoticeShown = true;
+    // Runtime offline events are no longer injected into Codex: the only channel
+    // (turn/start) pollutes the Codex thread/title and can trigger spurious
+    // responses. Logged for ops; Codex simply receives no further messages until
+    // Claude reconnects (the static collaboration context lives in AGENTS.md).
     log(`Claude disconnect persisted past grace window (client #${clientId})`);
   }, CLAUDE_DISCONNECT_GRACE_MS);
 }
@@ -673,6 +781,13 @@ function currentStatus(): DaemonStatus {
     proxyUrl: codex.proxyUrl,
     appServerUrl: codex.appServerUrl,
     pid: process.pid,
+    // Pair identity so ensureRunning() can detect a foreign daemon squatting this
+    // control port (wrong pairId) and replace it instead of reusing it. null in
+    // legacy/manual single-pair mode (no pairId enforcement there).
+    pairId: process.env.AGENTBRIDGE_PAIR_ID ?? null,
+    cwd: process.cwd(),
+    stateDir: stateDir.dir,
+    build: daemonStatusBuildInfo(),
   };
 }
 
@@ -682,33 +797,6 @@ function currentWaitingMessage() {
 
 function currentReadyMessage() {
   return `✅ Codex TUI connected (${codex.activeThreadId}). Bridge ready.`;
-}
-
-function notifyCodexClaudeOnline(): boolean {
-  const message = !codexCollaborationKickoffSent
-    ? [
-        "🤝 Claude Code has connected via AgentBridge.",
-        "You are now in a multi-agent collaboration session.",
-        "When you receive a complex task, propose a division of labor to Claude.",
-        "Claude can send you messages — they will appear as injected user messages.",
-        "Respond naturally and Claude will receive your output via AgentBridge.",
-      ].join("\n")
-    : "✅ AgentBridge connected to Claude Code.";
-
-  const delivered = codex.injectMessage(message);
-  if (!delivered) {
-    log("Deferred Claude-online notice to Codex — will retry after current turn completes");
-    return false;
-  }
-
-  claudeOnlineNoticeSent = true;
-  claudeOfflineNoticeShown = false;
-  codexCollaborationKickoffSent = true;
-  return true;
-}
-
-function shouldNotifyCodexClaudeOnline() {
-  return !claudeOnlineNoticeSent || claudeOfflineNoticeShown;
 }
 
 function systemMessage(idPrefix: string, content: string): BridgeMessage {
@@ -734,11 +822,49 @@ function writeStatusFile() {
     appServerUrl: codex.appServerUrl,
     controlPort: CONTROL_PORT,
     pid: process.pid,
+    // Pair identity for diagnostics (null in legacy/manual single-pair mode).
+    pairId: process.env.AGENTBRIDGE_PAIR_ID ?? null,
+    cwd: process.cwd(),
+    stateDir: stateDir.dir,
+    build: daemonStatusBuildInfo(),
   });
 }
 
 function removeStatusFile() {
   daemonLifecycle.removeStatusFile();
+}
+
+/**
+ * Arm the bootstrap-readiness watchdog. If the Codex layer is not ready within
+ * BOOTSTRAP_TIMEOUT_MS (and no TUI is actively using us), self-exit to release the
+ * control port. This is the ONLY backstop for the case where codex.start() HANGS
+ * (never resolves/rejects), so bootCodex's retry/self-exit never runs — without it
+ * the process lingers as a healthz-200/readyz-503 zombie and ensureRunning() keeps
+ * reusing it. bootCodex clears it on success; codex 'exit' re-arms it.
+ */
+function armBootDeadline() {
+  // The deadline is an ABSOLUTE start-up window — not a recurring idle timer. If a
+  // timer is already armed, leave it alone: re-arming on every codex 'exit' would let
+  // a codex crash-loop keep the daemon alive past BOOTSTRAP_TIMEOUT_MS forever. Only
+  // the very first call (right after writePidFile/startControlServer) sets the timer;
+  // subsequent 'exit' events must not extend the deadline.
+  if (bootDeadlineTimer) return;
+  bootDeadlineTimer = setTimeout(() => {
+    bootDeadlineTimer = null;
+    if (codexBootstrapped) return; // became ready in time — nothing to do
+    if (tuiConnectionState.snapshot().tuiConnected) return; // a TUI is actively using it
+    log(`Codex not ready within bootstrap deadline (${BOOTSTRAP_TIMEOUT_MS}ms) — self-exiting to release control port`);
+    shutdown("codex not ready within bootstrap deadline", 1);
+  }, BOOTSTRAP_TIMEOUT_MS);
+  // Don't let the watchdog itself keep the event loop alive.
+  bootDeadlineTimer.unref?.();
+}
+
+function clearBootDeadline() {
+  if (bootDeadlineTimer) {
+    clearTimeout(bootDeadlineTimer);
+    bootDeadlineTimer = null;
+  }
 }
 
 async function bootCodex() {
@@ -747,29 +873,49 @@ async function bootCodex() {
   log(`Codex proxy: ${codex.proxyUrl}`);
   log(`Control server: ws://127.0.0.1:${CONTROL_PORT}/ws`);
 
-  try {
-    await codex.start();
-    codexBootstrapped = true;
-    writeStatusFile();
-
-    emitToClaude(systemMessage("system_waiting", currentWaitingMessage()));
-    broadcastStatus();
-  } catch (err: any) {
-    log(`Failed to start Codex: ${err.message}`);
-    emitToClaude(
-      systemMessage(
-        "system_codex_start_failed",
-        `❌ AgentBridge failed to start Codex app-server: ${err.message}`,
-      ),
-    );
-    broadcastStatus();
+  for (let attempt = 0; attempt <= CODEX_BOOT_RETRIES; attempt++) {
+    try {
+      await codex.start();
+      codexBootstrapped = true;
+      clearBootDeadline(); // codex up — cancel the self-exit watchdog
+      writeStatusFile();
+      emitToClaude(systemMessage("system_waiting", currentWaitingMessage()));
+      broadcastStatus();
+      return;
+    } catch (err: any) {
+      const attemptsLeft = CODEX_BOOT_RETRIES - attempt;
+      log(`Failed to start Codex (attempt ${attempt + 1}/${CODEX_BOOT_RETRIES + 1}): ${err.message}`);
+      if (attemptsLeft > 0) {
+        const backoffMs = 1000 * (attempt + 1); // 1s, 2s, … — covers transient failures (e.g. a just-killed codex's port not yet released)
+        log(`Retrying Codex bootstrap in ${backoffMs}ms (${attemptsLeft} attempt(s) left)...`);
+        await new Promise((r) => setTimeout(r, backoffMs));
+        if (shuttingDown) return; // a deadline/signal fired during backoff
+        continue;
+      }
+      // Retries exhausted: notify Claude, then SELF-EXIT to release the control port.
+      // Staying alive here is exactly what created the healthz-200/readyz-503 zombie
+      // that ensureRunning() then reused. Releasing the port lets the next
+      // ensureRunning() launch a clean daemon. Replacement beyond this is owned by the
+      // lifecycle, not by retrying forever in-process.
+      emitToClaude(
+        systemMessage(
+          "system_codex_start_failed",
+          `❌ AgentBridge failed to start Codex app-server after ${CODEX_BOOT_RETRIES + 1} attempts: ${err.message}`,
+        ),
+      );
+      broadcastStatus();
+      shutdown("codex bootstrap failed", 1);
+      return; // shutdown() calls process.exit; explicit return also makes the
+      // "shutdown ⇒ stop" intent clear and guards the already-shutting-down path.
+    }
   }
 }
 
-function shutdown(reason: string) {
+function shutdown(reason: string, exitCode = 0) {
   if (shuttingDown) return;
   shuttingDown = true;
   log(`Shutting down daemon (${reason})...`);
+  clearBootDeadline();
   tuiConnectionState.dispose(`daemon shutdown (${reason})`);
   clearPendingClaudeDisconnect(`daemon shutdown (${reason})`);
   controlServer?.stop();
@@ -777,7 +923,7 @@ function shutdown(reason: string) {
   codex.stop();
   removePidFile();
   removeStatusFile();
-  process.exit(0);
+  process.exit(exitCode);
 }
 
 process.on("SIGINT", () => shutdown("SIGINT"));
@@ -794,7 +940,7 @@ function log(msg: string) {
   const line = `[${new Date().toISOString()}] [AgentBridgeDaemon] ${msg}\n`;
   process.stderr.write(line);
   try {
-    appendFileSync(stateDir.logFile, line);
+    appendRotatingLog(stateDir.logFile, line);
   } catch {}
 }
 
@@ -808,4 +954,8 @@ if (daemonLifecycle.wasKilled()) {
 
 writePidFile();
 startControlServer();
+// Arm the readiness watchdog BEFORE bootCodex: if codex.start() hangs (never
+// resolves/rejects), bootCodex's retry/self-exit never runs, so this deadline is
+// the only thing that releases the control port. bootCodex clears it on success.
+armBootDeadline();
 void bootCodex();

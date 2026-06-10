@@ -26,15 +26,20 @@ let daemonProc: ChildProcess | null = null;
 
 function launchDaemon(): ChildProcess {
   mkdirSync(TEST_STATE_DIR, { recursive: true });
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    AGENTBRIDGE_MANUAL: "1",
+    AGENTBRIDGE_CONTROL_PORT: String(TEST_CONTROL_PORT),
+    AGENTBRIDGE_STATE_DIR: TEST_STATE_DIR,
+    CODEX_WS_PORT: String(TEST_APP_PORT),
+    CODEX_PROXY_PORT: String(TEST_PROXY_PORT),
+    AGENTBRIDGE_IDLE_SHUTDOWN_MS: "60000", // don't auto-shutdown during tests
+  };
+  delete env.AGENTBRIDGE_BASE_DIR;
+  delete env.AGENTBRIDGE_PAIR_ID;
+  delete env.AGENTBRIDGE_PAIR_NAME;
   const proc = spawn(process.execPath, ["run", DAEMON_PATH], {
-    env: {
-      ...process.env,
-      AGENTBRIDGE_CONTROL_PORT: String(TEST_CONTROL_PORT),
-      AGENTBRIDGE_STATE_DIR: TEST_STATE_DIR,
-      CODEX_WS_PORT: String(TEST_APP_PORT),
-      CODEX_PROXY_PORT: String(TEST_PROXY_PORT),
-      AGENTBRIDGE_IDLE_SHUTDOWN_MS: "60000", // don't auto-shutdown during tests
-    },
+    env,
     stdio: "pipe",
   });
   return proc;

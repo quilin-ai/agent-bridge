@@ -15,16 +15,26 @@ import { homedir, platform } from "node:os";
 export class StateDirResolver {
   private readonly stateDir: string;
 
+  /**
+   * The platform default base directory, with NO override applied.
+   *
+   * Single source of truth for both the resolver and the multi-pair layer
+   * (`pair-resolver.ts`), which nests each pair under `<base>/pairs/<id>/`.
+   * Keeping this static avoids the base-dir logic drifting between the two.
+   */
+  static platformBaseDir(): string {
+    if (platform() === "darwin") {
+      return join(homedir(), "Library", "Application Support", "AgentBridge");
+    }
+    const xdgState = process.env.XDG_STATE_HOME ?? join(homedir(), ".local", "state");
+    return join(xdgState, "agentbridge");
+  }
+
   constructor(envOverride?: string) {
     const override = envOverride ?? process.env.AGENTBRIDGE_STATE_DIR;
-    if (override) {
-      this.stateDir = override;
-    } else if (platform() === "darwin") {
-      this.stateDir = join(homedir(), "Library", "Application Support", "AgentBridge");
-    } else {
-      const xdgState = process.env.XDG_STATE_HOME ?? join(homedir(), ".local", "state");
-      this.stateDir = join(xdgState, "agentbridge");
-    }
+    // Treat an empty string as "unset" (master behaviour) — `??` alone would
+    // accept "" and resolve all state files relative to cwd.
+    this.stateDir = override && override.length > 0 ? override : StateDirResolver.platformBaseDir();
   }
 
   /** Ensure the state directory exists. */
@@ -58,6 +68,10 @@ export class StateDirResolver {
     return join(this.stateDir, "ports.json");
   }
 
+  get currentThreadFile(): string {
+    return join(this.stateDir, "current-thread.json");
+  }
+
   get logFile(): string {
     return join(this.stateDir, "agentbridge.log");
   }
@@ -77,5 +91,14 @@ export class StateDirResolver {
 
   get killedFile(): string {
     return join(this.stateDir, "killed");
+  }
+
+  /**
+   * Cache for the update-notifier: `{ lastCheckMs, latest }`. Machine/user-global
+   * (not per-project) so the daily npm check runs once per machine, not once per
+   * project — see src/update-notifier.ts.
+   */
+  get updateCheckFile(): string {
+    return join(this.stateDir, "update-check.json");
   }
 }

@@ -34,31 +34,16 @@ export function classifyMessage(content: string, mode: FilterMode): FilterResult
   }
 }
 
-const BRIDGE_CONTRACT_REMINDER = `[Bridge Contract] When sending agentMessage, put the marker at the very start of the message:
-- [IMPORTANT] for decisions, reviews, completions, blockers
-- [STATUS] for progress updates
-- [FYI] for background context
-The marker MUST be the first text in the message (e.g. "[IMPORTANT] Task done", not "Task done [IMPORTANT]").
-Keep agentMessage for high-value communication only.
-
-[Git Operations — FORBIDDEN]
-You MUST NOT execute any git write commands. This includes but is not limited to:
-git commit, git push, git pull, git fetch, git checkout -b, git branch, git merge, git rebase, git cherry-pick, git tag, git stash.
-These commands write to the .git directory, which is blocked by your sandbox. Attempting them will cause your session to hang indefinitely.
-Read-only git commands (git status, git log, git diff, git show, git rev-parse) are allowed.
-All git write operations must be delegated to Claude Code via agentMessage. Report what you changed and let Claude handle branching, committing, and pushing.
-
-[Role Guidance for Codex]
-- Your default role: Implementer, Executor, Verifier
-- Analytical/review tasks: Independent Analysis & Convergence
-- Implementation tasks: Architect -> Builder -> Critic
-- Debugging tasks: Hypothesis -> Experiment -> Interpretation
-- Do not blindly follow Claude - challenge with evidence when you disagree
-- Use explicit collaboration phrases: "My independent view is:", "I agree on:", "I disagree on:", "Current consensus:"`;
-
+// NOTE: the static "bridge contract" (message markers, git-write prohibition,
+// Codex role guidance) used to be appended to EVERY claude→codex message here.
+// It now lives once in AGENTS_MD_SECTION (src/collaboration-content.ts), injected
+// into the project's AGENTS.md by `abg init` and loaded by Codex on startup.
+// Appending it per-message polluted every Codex thread + its resume title, so it
+// was removed. AGENTS.md is the single source of truth for that contract now.
+// Only the DYNAMIC, per-message reply-required instruction remains here.
 const REPLY_REQUIRED_INSTRUCTION = `\n\n[⚠️ REPLY REQUIRED] Claude has explicitly requested a reply. You MUST send an agentMessage with [IMPORTANT] marker containing your response. This is a mandatory requirement — do not skip or use [STATUS]/[FYI] markers for this reply.`;
 
-export { BRIDGE_CONTRACT_REMINDER, REPLY_REQUIRED_INSTRUCTION };
+export { REPLY_REQUIRED_INSTRUCTION };
 
 export class StatusBuffer {
   private buffer: BridgeMessage[] = [];

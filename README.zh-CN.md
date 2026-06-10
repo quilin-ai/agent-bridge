@@ -247,9 +247,26 @@ agent_bridge/
 | `CODEX_PROXY_PORT` | `4501` | Bridge 代理端口，Codex TUI 连接此端口 |
 | `AGENTBRIDGE_CONTROL_PORT` | `4502` | bridge.ts 与 daemon.ts 之间的控制端口 |
 | `AGENTBRIDGE_LIVENESS_PROBE_TIMEOUT_MS` | `3000` | 等待在位 Claude pong 的最长时间，超时后在争用时驱逐（issue #68） |
+| `AGENTBRIDGE_TURN_WATCHDOG_MS` | `300000` | 单 turn 非活动看门狗：app-server 静默超过该毫秒数后强制完成该 turn，避免丢失 `turn/completed` 永久锁死注入（issue #69） |
+| `AGENTBRIDGE_CODEX_TRANSPORT` | `auto` | daemon 连接 Codex app-server 的方式：`auto`（探测 `codex app-server --help`，支持 `ws://` 则用 ws，否则经透明中继回退到 `unix://` socket）、`ws`（强制 ws）、`unix`（强制 unix socket + 中继）。用于去掉 `ws://` listen 支持的 Codex 版本（issue #85） |
 | `AGENTBRIDGE_STATE_DIR` | 平台默认 | 状态目录（pid、status、日志）。macOS: `~/Library/Application Support/agentbridge/`，Linux: `$XDG_STATE_HOME/agentbridge/` |
 | `AGENTBRIDGE_MODE` | `push` | 消息投递模式（`push` 用于 channel，`pull` 用于 API key 模式） |
 | `AGENTBRIDGE_DAEMON_ENTRY` | `./daemon.ts` | 覆盖 daemon 入口（插件包使用） |
+| `NO_UPDATE_NOTIFIER` | 未设置 | 设为任意值即关闭「有新版本」提示（生态通用 opt-out） |
+| `AGENTBRIDGE_NO_UPDATE_NOTIFIER` | 未设置 | 命名空间化的关闭开关（效果同 `NO_UPDATE_NOTIFIER`） |
+| `AGENTBRIDGE_UPDATE_CHECK_INTERVAL_MS` | `86400000` | `abg claude`/`abg codex` 多久查一次 npm 新版本（默认每天一次）。其余时候只读缓存打印，大多数调用零网络 |
+
+### 更新提示
+
+`abg claude` 和 `abg codex` 在 npm 上有更新的**稳定**版本时,会向 stderr 打印一行提示,例如:
+
+```
+⚠ AgentBridge update available: 0.1.6 → 0.1.7
+  CLI:    npm install -g @raysonmeng/agentbridge@latest
+  Plugin: /plugin marketplace update agentbridge   (then /reload-plugins)
+```
+
+该检查是 best-effort,绝不阻塞/拖慢/弄坏你的命令:提示从缓存打印,npm 检查每天最多在后台跑一次,任何网络/registry 失败都静默忽略。非交互(管道)输出和 CI 下自动抑制,可用 `NO_UPDATE_NOTIFIER=1` 关闭。notifier 永远不会自动安装任何东西——只告诉你升级命令。
 
 ### 状态目录
 

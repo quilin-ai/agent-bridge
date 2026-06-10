@@ -1,22 +1,69 @@
 import { spawn } from "node:child_process";
 import { MARKETPLACE_NAME, PLUGIN_NAME } from "../cli";
+import { DaemonClient } from "../daemon-client";
 import { DaemonLifecycle } from "../daemon-lifecycle";
-import { StateDirResolver } from "../state-dir";
+import { BUILD_INFO } from "../build-info";
+import { guardAgentBridgeEnv, normalizeEnvGuardMode } from "../env-guard";
+import { parsePositiveIntEnv } from "../env-utils";
+import { applyPairEnv, parsePairFlag, type PairResolution } from "../pair-resolver";
+import { appendTraceEvent, pickRelevantEnv } from "../trace-log";
 
 /** Flags that AgentBridge owns and will inject automatically. */
 const OWNED_FLAGS = ["--channels", "--dangerously-load-development-channels"];
 
 export async function runClaude(args: string[]) {
-  // Check for owned flag conflicts
-  checkOwnedFlagConflicts(args, "agentbridge claude", OWNED_FLAGS);
+  const originalEnv = { ...process.env };
+  const envGuardResult = guardAgentBridgeEnv({
+    cwd: process.cwd(),
+    env: process.env,
+    mode: normalizeEnvGuardMode(process.env.AGENTBRIDGE_ENV_GUARD),
+    allowStrict: true,
+    log: (msg) => console.error(msg),
+  });
 
-  const stateDir = new StateDirResolver();
-  const controlPort = parseInt(process.env.AGENTBRIDGE_CONTROL_PORT ?? "4502", 10);
+  // Strip `--pair <name>` before anything else; the rest flows through to claude.
+  const { pairFlag, rest } = parsePairFlag(args);
+
+  // Check for owned flag conflicts (on the real claude args, not the pair flag).
+  checkOwnedFlagConflicts(rest, "agentbridge claude", OWNED_FLAGS);
+
+  // Resolve the pair and inject its env (state dir + ports) BEFORE building the
+  // lifecycle or spawning claude, so the daemon, the spawned `claude`, and its
+  // plugin MCP server all target this pair's state dir + control port.
+  let pair: PairResolution;
+  try {
+    pair = await applyPairEnv({ pairFlag });
+  } catch (err: any) {
+    console.error(`[agentbridge] ${err.message}`);
+    process.exit(1);
+  }
+
+  if (pair.warning) console.error(`[agentbridge] ⚠️  ${pair.warning}`);
+  if (process.env.AGENTBRIDGE_TRACE === "1") {
+    traceCliStart("cli.claude.start", args, originalEnv, envGuardResult.action, pair);
+  }
+
+  const stateDir = pair.stateDir;
+  const controlPort = pair.ports.controlPort;
   const lifecycle = new DaemonLifecycle({
     stateDir,
     controlPort,
     log: (msg) => console.error(`[agentbridge] ${msg}`),
   });
+
+  if (!pair.manual) {
+    console.error(
+      `[agentbridge] pair "${pair.pairId}" (slot ${pair.slot}) — control :${controlPort}, ` +
+        `codex :${pair.ports.appPort}/:${pair.ports.proxyPort}`,
+    );
+  }
+
+  // Conflict guard: refuse to launch a SECOND Claude frontend into a pair that
+  // already has a LIVE one (the confirmed "smart" behaviour: live → error here,
+  // stale/none → fall through and let admission take over). Also applies in
+  // explicit manual mode so manual sessions do not silently fight over attach.
+  // Fail-open on any probe error.
+  await assertPairNotLive(lifecycle, pair);
 
   lifecycle.clearKilled();
 
@@ -31,7 +78,7 @@ export async function runClaude(args: string[]) {
   // Once published to the official marketplace, switch to --channels.
   const fullArgs = [
     "--dangerously-load-development-channels", channelEntry,
-    ...args,
+    ...rest,
   ];
 
   const child = spawn("claude", fullArgs, {
@@ -52,6 +99,96 @@ export async function runClaude(args: string[]) {
     console.error(`Error starting Claude Code: ${err.message}`);
     process.exit(1);
   });
+}
+
+function traceCliStart(
+  event: string,
+  args: string[],
+  originalEnv: NodeJS.ProcessEnv,
+  envGuardAction: string,
+  pair: PairResolution,
+) {
+  try {
+    appendTraceEvent({
+      cwd: process.cwd(),
+      event,
+      pid: process.pid,
+      argv: ["agentbridge", "claude", ...args],
+      env: process.env,
+      data: {
+        originalEnv: pickRelevantEnv(originalEnv),
+        effectiveEnv: pickRelevantEnv(process.env),
+        envGuardAction,
+        pairId: pair.pairId,
+        pairName: pair.name,
+        manual: pair.manual,
+        slot: pair.slot,
+        stateDir: pair.stateDir.dir,
+        ports: pair.ports,
+        build: BUILD_INFO,
+      },
+    });
+  } catch {
+    // Trace logging is diagnostic only.
+  }
+}
+
+/**
+ * Refuse to start a second Claude session in a pair that already has a LIVE one.
+ *
+ * Probes the pair's running daemon (if any) WITHOUT attaching, so it never
+ * contests the incumbent. If a live frontend is found, prints a clear conflict
+ * message and exits — the user picks another `--pair` name or stops the live one.
+ * If there is no daemon, no incumbent, or only a stale (half-open dead) one, it
+ * returns so the launch proceeds; the daemon's admission logic then takes over
+ * the stale slot cleanly. Any probe error fails open (launch proceeds).
+ */
+async function assertPairNotLive(lifecycle: DaemonLifecycle, pair: PairResolution): Promise<void> {
+  let healthy = false;
+  try {
+    healthy = await lifecycle.isHealthy();
+  } catch {
+    return; // can't tell → don't block
+  }
+  if (!healthy) return; // no daemon yet → fresh start, no conflict
+
+  const client = new DaemonClient(lifecycle.controlWsUrl);
+  let incumbent: { connected: boolean; alive: boolean };
+  try {
+    await client.connect();
+    // The daemon answers `probe_incumbent` only AFTER running its own liveness
+    // ping against the incumbent (up to AGENTBRIDGE_LIVENESS_PROBE_TIMEOUT_MS).
+    // The client must therefore wait LONGER than the daemon's probe, or the two
+    // timeouts race and a live-but-slightly-delayed pong reply is missed (→ the
+    // guard wrongly fails open). Use the SAME parser the daemon uses for this env
+    // (parsePositiveIntEnv — rejects "1.5"/"10abc"/negatives) so the two never
+    // disagree on the value, then add a margin. (If the daemon was started with a
+    // larger override than this process sees, the margin may not fully cover it;
+    // the daemon's own admission probe at attach time remains the backstop.)
+    const daemonProbeMs = parsePositiveIntEnv("AGENTBRIDGE_LIVENESS_PROBE_TIMEOUT_MS", 3000);
+    incumbent = await client.probeIncumbent(daemonProbeMs + 2500);
+  } catch {
+    return; // probe failed → fail open
+  } finally {
+    try {
+      await client.disconnect();
+    } catch {}
+  }
+
+  if (incumbent.connected && incumbent.alive) {
+    const name = pair.name;
+    console.error(
+      `[agentbridge] Pair "${name}" in ${process.cwd()} already has an active Claude session.`,
+    );
+    console.error(`[agentbridge] Refusing to open a second one in the same pair.`);
+    console.error(`[agentbridge]`);
+    console.error(`[agentbridge]   • Use that existing session, or`);
+    console.error(`[agentbridge]   • Start a different pair:  abg --pair <other-name> claude`);
+    console.error(
+      `[agentbridge]   • If that session is actually dead, take it over with:  abg --pair ${name} kill`,
+    );
+    process.exit(1);
+  }
 }
 
 /**

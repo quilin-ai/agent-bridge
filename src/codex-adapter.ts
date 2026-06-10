@@ -12,8 +12,8 @@
 import { spawn, execSync, type ChildProcess } from "node:child_process";
 import { createInterface } from "node:readline";
 import { EventEmitter } from "node:events";
-import { appendFileSync } from "node:fs";
 import { StateDirResolver } from "./state-dir";
+import { appendRotatingLog } from "./rotating-log";
 import type { BridgeMessage } from "./types";
 import type { ServerWebSocket } from "bun";
 import {
@@ -29,6 +29,18 @@ import {
   type AppServerTrackedRequestMethod,
   type TurnStartParams,
 } from "./app-server-protocol";
+import {
+  CODEX_TRANSPORT_ENV,
+  TcpToUnixRelay,
+  type CodexTransport,
+  codexListenArg,
+  codexSocketPath,
+  ensureSocketDir,
+  parseTransportMode,
+  removeSocketFile,
+  resolveCodexTransport,
+  waitForUnixWsReady,
+} from "./codex-transport";
 
 interface TuiSocketData {
   connId: number;
@@ -60,6 +72,12 @@ interface PendingServerResponse {
 interface PendingRequest {
   method: AppServerTrackedRequestMethod;
   threadId?: string;
+  /**
+   * Monotonic "thread switch" sequence (latest-issued) for thread/start and
+   * thread/resume. Used so an out-of-order OLD response can't clobber the active
+   * thread the user most recently switched to (#70).
+   */
+  threadSwitchSeq?: number;
 }
 
 export class CodexAdapter extends EventEmitter {
@@ -69,6 +87,12 @@ export class CodexAdapter extends EventEmitter {
   private appServerWs: WebSocket | null = null;
   private tuiWs: ServerWebSocket<TuiSocketData> | null = null;
   private proxyServer: ReturnType<typeof Bun.serve> | null = null;
+  // #85 transport: how Codex app-server is reached. In "unix" mode the adapter
+  // still connects to ws://127.0.0.1:appPort, but a TcpToUnixRelay bridges that
+  // TCP port to Codex's unix socket (Codex builds may drop ws:// listen support).
+  private transport: CodexTransport = "ws";
+  private socketPath: string | null = null;
+  private relay: TcpToUnixRelay | null = null;
   private threadId: string | null = null;
   // Reserve negative ids for bridge-originated requests so they never collide
   // with proxy-rewritten TUI request ids.
@@ -84,12 +108,30 @@ export class CodexAdapter extends EventEmitter {
     tuiWs: ServerWebSocket<TuiSocketData>;
     appServerWs: WebSocket | null;
     buffer: string[];
+    initialized: boolean;
+    initializationReplayed: boolean;
   }>();
 
   private agentMessageBuffers = new Map<string, string[]>();
   private pendingRequests = new Map<string, PendingRequest>();
   private activeTurnIds = new Set<string>();
   turnInProgress = false;
+  // #69: per-turn inactivity watchdog. A lost `turn/completed` would otherwise
+  // leave turnInProgress=true forever and permanently block injection. Each
+  // active turn gets a timer (keyed identically to activeTurnIds) that is
+  // refreshed on any app-server notification and, on expiry, marks the turn as
+  // stalled. It must NOT complete the turn: a long silent command is still a
+  // live busy turn until Codex emits turn/completed or the connection is reset.
+  private turnWatchdogs = new Map<string, ReturnType<typeof setTimeout>>();
+  // turnStalled must fire AT MOST ONCE per turn: the watchdog is intentionally
+  // NOT cleared on stall (the turn stays busy), so every subsequent app-server
+  // notification re-arms it and a later expiry would emit a duplicate stalled
+  // notification. This set records turnIds already reported stalled so we
+  // suppress repeats; a turnId is removed when its turn completes/resets or a
+  // new turn starts, so a genuinely new stall in a later turn still notifies.
+  private stalledTurnIds = new Set<string>();
+  // #70: latest-issued thread-switch sequence (see PendingRequest.threadSwitchSeq).
+  private threadSwitchSeq = 0;
 
   // Proxy-layer id rewriting: upstream uses globally unique ids
   private nextProxyId = 100000;
@@ -155,9 +197,19 @@ export class CodexAdapter extends EventEmitter {
 
   async start() {
     this.intentionalDisconnect = false;
+    // #85: pick the Codex transport. checkPorts still applies in both modes —
+    // in unix mode the relay (not Codex) binds appPort, but the port must still
+    // be free for the relay to bind it; proxyPort is always ours.
     await this.checkPorts();
-    this.log(`Spawning codex app-server on ${this.appServerUrl}`);
-    this.proc = spawn("codex", ["app-server", "--listen", this.appServerUrl], {
+    this.resolveTransport();
+
+    const listen = codexListenArg(this.transport, this.appPort, this.socketPath ?? "");
+    if (this.transport === "unix" && this.socketPath) {
+      ensureSocketDir(this.socketPath);
+      removeSocketFile(this.socketPath); // clear any stale socket from a prior run
+    }
+    this.log(`Spawning codex app-server (transport=${this.transport}) --listen ${listen}`);
+    this.proc = spawn("codex", ["app-server", "--listen", listen], {
       stdio: ["pipe", "pipe", "pipe"],
     });
 
@@ -169,13 +221,31 @@ export class CodexAdapter extends EventEmitter {
     const stdoutRl = createInterface({ input: this.proc.stdout! });
     stdoutRl.on("line", (l) => this.log(`[codex-stdout] ${l}`));
 
-    await this.waitForHealthy();
+    if (this.transport === "unix" && this.socketPath) {
+      // Codex's unix listener does NOT serve HTTP /healthz — probe readiness via
+      // a WS upgrade against the socket, then stand up the TCP↔unix relay so the
+      // adapter's unchanged `new WebSocket(ws://127.0.0.1:appPort)` reaches it.
+      await waitForUnixWsReady(this.socketPath);
+      this.relay = new TcpToUnixRelay("127.0.0.1", this.appPort, this.socketPath, (m) => this.log(`[relay] ${m}`));
+      await this.relay.start();
+      this.log(`Transport relay ready: ws://127.0.0.1:${this.appPort} → unix://${this.socketPath}`);
+    } else {
+      await this.waitForHealthy();
+    }
 
     // Connect to app-server once, keep it alive permanently
     await this.connectToAppServer();
 
     this.startProxy();
     this.log(`Proxy ready on ${this.proxyUrl}`);
+  }
+
+  /** #85: resolve the transport (env-driven, `auto` probes ws support) and the unix socket path. */
+  private resolveTransport() {
+    const mode = parseTransportMode(process.env[CODEX_TRANSPORT_ENV]);
+    this.transport = resolveCodexTransport(mode);
+    this.socketPath = this.transport === "unix" ? codexSocketPath(this.appPort) : null;
+    this.log(`Codex transport mode=${mode} resolved=${this.transport}`);
   }
 
   /** Disconnect the bridge (proxy + app-server WS) without killing the Codex process. */
@@ -201,7 +271,21 @@ export class CodexAdapter extends EventEmitter {
     }
     this.proxyServer?.stop();
     this.proxyServer = null;
+    // #85: tear down the transport relay and remove the unix socket file.
+    if (this.relay) {
+      this.relay.stop();
+      this.relay = null;
+    }
+    if (this.socketPath) removeSocketFile(this.socketPath);
     this.clearResponseTrackingState();
+    // #69: an intentional disconnect must synchronously drop turn state +
+    // watchdog timers. We cannot rely on handleAppServerClose for this: we set
+    // appServerWs=null above, and the close callback is async (and may be
+    // skipped entirely if the socket was already gone), so without this the
+    // turnInProgress flag and a pending watchdog timer leak past disconnect().
+    // emitCompleted stays false — an intentional teardown is not a real turn
+    // completion and must not signal "Codex finished" downstream.
+    this.resetTurnState("adapter disconnect");
   }
 
   /** Fully stop: disconnect bridge AND kill the Codex process. */
@@ -350,8 +434,7 @@ export class CodexAdapter extends EventEmitter {
     // pendingServerRequests — those must survive the intentional reconnect
     // so they can be replayed after the TUI completes thread/resume.
     this.clearResponseTrackingStateForAppServerReconnect();
-    this.activeTurnIds.clear();
-    this.turnInProgress = false;
+    this.resetTurnState("app-server reconnect for new TUI session");
 
     try {
       await this.connectToAppServer(false);
@@ -430,8 +513,7 @@ export class CodexAdapter extends EventEmitter {
     // Approval request/response ids are scoped to the current app-server session.
     // If the socket reconnects, replaying old approval state would forward stale ids.
     this.clearResponseTrackingState();
-    this.activeTurnIds.clear();
-    this.turnInProgress = false;
+    this.resetTurnState("app-server connection closed");
     if (!intentional) {
       this.scheduleReconnect();
     }
@@ -751,7 +833,13 @@ export class CodexAdapter extends EventEmitter {
     // Store the appWs handle immediately (not just in onopen) so that
     // onTuiDisconnect can close it even if the picker disconnects before
     // the app-server WS finishes connecting.
-    const entry = { tuiWs: ws, appServerWs: appWs, buffer: [] as string[] };
+    const entry = {
+      tuiWs: ws,
+      appServerWs: appWs,
+      buffer: [] as string[],
+      initialized: false,
+      initializationReplayed: false,
+    };
     this.secondaryConnections.set(connId, entry);
 
     appWs.onopen = () => {
@@ -905,11 +993,13 @@ export class CodexAdapter extends EventEmitter {
     // Route secondary (picker) connection messages to their own app-server WS
     const secondary = this.secondaryConnections.get(connId);
     if (secondary) {
-      if (secondary.appServerWs && secondary.appServerWs.readyState === WebSocket.OPEN) {
-        try { secondary.appServerWs.send(data); } catch {}
-      } else {
-        secondary.buffer.push(data);
+      const method = this.detectJsonMethod(data);
+      if (method === "initialize" || method === "initialized") {
+        secondary.initialized = true;
+      } else if (!secondary.initialized) {
+        this.ensureSecondaryInitialized(secondary, connId);
       }
+      this.sendOrBufferSecondary(secondary, data);
       return;
     }
 
@@ -1048,11 +1138,72 @@ export class CodexAdapter extends EventEmitter {
     }
   }
 
+  private detectJsonMethod(raw: string): string | undefined {
+    try {
+      const parsed = JSON.parse(raw);
+      return typeof parsed?.method === "string" ? parsed.method : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private ensureSecondaryInitialized(
+    secondary: {
+      appServerWs: WebSocket | null;
+      buffer: string[];
+      initialized: boolean;
+      initializationReplayed: boolean;
+    },
+    connId: number,
+  ) {
+    if (secondary.initializationReplayed) return;
+    secondary.initializationReplayed = true;
+
+    if (!this.lastInitializeRaw) {
+      this.log(`Secondary conn #${connId}: no cached initialize available before first non-initialize request`);
+      return;
+    }
+
+    this.log(`Secondary conn #${connId}: replaying cached initialize before picker request`);
+    this.sendOrBufferSecondary(secondary, this.lastInitializeRaw);
+    if (this.lastInitializedRaw) {
+      this.sendOrBufferSecondary(secondary, this.lastInitializedRaw);
+    }
+    secondary.initialized = true;
+  }
+
+  private sendOrBufferSecondary(
+    secondary: {
+      appServerWs: WebSocket | null;
+      buffer: string[];
+    },
+    raw: string,
+  ) {
+    if (secondary.appServerWs && secondary.appServerWs.readyState === WebSocket.OPEN) {
+      try { secondary.appServerWs.send(raw); } catch {}
+    } else {
+      secondary.buffer.push(raw);
+    }
+  }
+
   // ── Response Patching ──────────────────────────────────────
 
   private handleAppServerPayload(raw: string): string | null {
     try {
       const parsed: unknown = JSON.parse(raw);
+      // #69: ANY inbound app-server message proves the turn is alive — refresh
+      // the inactivity watchdog(s) here, at the single inbound funnel. This
+      // MUST be broader than the modeled notification set: Codex streams many
+      // notification types we deliberately do NOT forward (item/agentReasoning/
+      // delta, item/commandExecution/*, item/fileChange/*, …). A long but
+      // actively-streaming turn (e.g. a multi-minute build) emits only these
+      // "unknown" notifications between turn/started and turn/completed; if we
+      // refreshed only on the handful in isAppServerNotification() we would
+      // mark a live turn stalled. Responses and server requests count as
+      // activity too. (refreshTurnWatchdogs() no-ops when no turn is active.)
+      if (typeof parsed === "object" && parsed !== null) {
+        this.refreshTurnWatchdogs();
+      }
       // Short-circuit: response carries an id that matches a pending
       // session-restore replay? Consume it and suppress forwarding to
       // the TUI (which didn't send the request and would be confused).
@@ -1202,6 +1353,12 @@ export class CodexAdapter extends EventEmitter {
     if (!isNaN(numericId) && this.consumeBridgeRequestId(numericId)) {
       if (parsed.error) {
         this.log(`Bridge-originated request failed (id ${responseId}): ${parsed.error.message ?? "unknown error"}`);
+        // A bridge-originated request is always an injected turn/start. If Codex
+        // REJECTS it (error response) before any turn/started, no turn ever goes
+        // in-progress, so resetTurnState's wasInProgress-gated turnAborted never
+        // fires. Signal the abort here so daemon-level per-turn state (the
+        // require_reply tracker) is not stranded on a turn that never started.
+        this.emit("turnAborted", `injected turn/start rejected: ${parsed.error.message ?? "unknown error"}`);
       } else {
         this.log(`Bridge-originated request completed (id ${responseId})`);
       }
@@ -1254,6 +1411,9 @@ export class CodexAdapter extends EventEmitter {
 
   private handleServerNotification(msg: AppServerNotification) {
     const { method, params } = msg;
+    // Note: the inactivity watchdog is refreshed for ALL inbound messages at
+    // the handleAppServerPayload funnel (see #69 there), not here — this method
+    // only runs for the modeled subset, which would miss the long-build case.
     switch (method) {
       case "turn/started":
         this.markTurnStarted(params?.turn?.id);
@@ -1327,6 +1487,12 @@ export class CodexAdapter extends EventEmitter {
         pending.threadId = threadId;
       }
     }
+    // #70: stamp explicit thread switches (thread/start, thread/resume) with the
+    // latest-issued sequence so an out-of-order OLD response can't clobber the
+    // thread the user most recently switched to.
+    if (method === "thread/start" || method === "thread/resume") {
+      pending.threadSwitchSeq = ++this.threadSwitchSeq;
+    }
 
     if (this.pendingRequests.has(key)) {
       this.log(`WARNING: overwriting pending request for key ${key}`);
@@ -1360,6 +1526,16 @@ export class CodexAdapter extends EventEmitter {
 
     switch (pending.method) {
       case "thread/start": {
+        // #70: ignore an out-of-order OLD thread switch. Only the response to
+        // the most-recently-issued thread/start|resume may mutate activeThreadId
+        // or drop orphans — a stale one would clobber the thread the user just
+        // switched to and re-orphan its in-flight approvals.
+        if (!this.isLatestThreadSwitch(pending)) {
+          this.log(
+            `Ignoring stale thread/start response ${key} (seq=${pending.threadSwitchSeq} < latest=${this.threadSwitchSeq})`,
+          );
+          break;
+        }
         const threadId = message?.result?.thread?.id;
         if (typeof threadId === "string" && threadId.length > 0) {
           this.setActiveThreadId(threadId, `thread/start response ${key}`);
@@ -1371,6 +1547,14 @@ export class CodexAdapter extends EventEmitter {
         break;
       }
       case "thread/resume": {
+        // #70: same staleness guard as thread/start — a late resume response
+        // must not steal activeThreadId back from a newer switch.
+        if (!this.isLatestThreadSwitch(pending)) {
+          this.log(
+            `Ignoring stale thread/resume response ${key} (seq=${pending.threadSwitchSeq} < latest=${this.threadSwitchSeq})`,
+          );
+          break;
+        }
         const threadId = message?.result?.thread?.id;
         if (typeof threadId === "string" && threadId.length > 0) {
           this.setActiveThreadId(threadId, `thread/resume response ${key}`);
@@ -1384,11 +1568,30 @@ export class CodexAdapter extends EventEmitter {
         break;
       }
       case "turn/start":
+        // #70: a turn/start response carries the threadId the turn ran against.
+        // Only adopt it when it agrees with the active thread (or none is set
+        // yet). If the user has already switched threads, a late turn/start must
+        // not drag activeThreadId back to the abandoned thread.
         if (pending.threadId) {
-          this.setActiveThreadId(pending.threadId, `turn/start response ${key}`);
+          if (this.threadId === null || this.threadId === pending.threadId) {
+            this.setActiveThreadId(pending.threadId, `turn/start response ${key}`);
+          } else {
+            this.log(
+              `Ignoring turn/start response ${key} threadId=${pending.threadId} (active thread is ${this.threadId})`,
+            );
+          }
         }
         break;
     }
+  }
+
+  /**
+   * #70: true only if this pending request is the most-recently-issued explicit
+   * thread switch (thread/start | thread/resume). Out-of-order responses to
+   * superseded switches return false and must not mutate activeThreadId.
+   */
+  private isLatestThreadSwitch(pending: PendingRequest): boolean {
+    return pending.threadSwitchSeq === this.threadSwitchSeq;
   }
 
   private setActiveThreadId(threadId: string, reason: string) {
@@ -1396,6 +1599,7 @@ export class CodexAdapter extends EventEmitter {
 
     const previousThreadId = this.threadId;
     this.threadId = threadId;
+    this.emit("threadChanged", { threadId, previousThreadId, reason });
 
     if (previousThreadId) {
       this.log(`Active thread changed: ${previousThreadId} → ${threadId} (${reason})`);
@@ -1408,11 +1612,15 @@ export class CodexAdapter extends EventEmitter {
 
   private markTurnStarted(turnId?: string) {
     const wasInProgress = this.turnInProgress;
-    if (typeof turnId === "string" && turnId.length > 0) {
-      this.activeTurnIds.add(turnId);
-    } else {
-      this.activeTurnIds.add(`unknown:${Date.now()}`);
-    }
+    // Compute the key ONCE and use it for both the set and the watchdog so the
+    // two never diverge (incl. the no-turn-id `unknown:` fallback).
+    const turnKey = typeof turnId === "string" && turnId.length > 0 ? turnId : `unknown:${Date.now()}`;
+    this.activeTurnIds.add(turnKey);
+    // A new turn must be eligible to notify on stall even if a prior turn
+    // reused the same id (e.g. the `unknown:` fallback is time-stamped, but
+    // real ids could repeat across reconnects).
+    this.stalledTurnIds.delete(turnKey);
+    this.scheduleTurnWatchdog(turnKey);
 
     this.turnInProgress = this.activeTurnIds.size > 0;
     if (!wasInProgress && this.turnInProgress) {
@@ -1423,11 +1631,101 @@ export class CodexAdapter extends EventEmitter {
   private markTurnCompleted(turnId?: string) {
     if (typeof turnId === "string" && turnId.length > 0) {
       this.activeTurnIds.delete(turnId);
+      this.clearTurnWatchdog(turnId);
+      this.stalledTurnIds.delete(turnId);
     } else {
       this.activeTurnIds.clear();
+      this.clearAllTurnWatchdogs();
+      this.stalledTurnIds.clear();
     }
 
     this.turnInProgress = this.activeTurnIds.size > 0;
+  }
+
+  /** Inactivity timeout for a turn (env-overridable; default 5 minutes). */
+  private turnWatchdogMs(): number {
+    const v = Number(process.env.AGENTBRIDGE_TURN_WATCHDOG_MS);
+    return Number.isFinite(v) && v > 0 ? v : 300_000;
+  }
+
+  /** (Re)arm the inactivity watchdog for a turn. Replaces any existing timer. */
+  private scheduleTurnWatchdog(turnKey: string) {
+    this.clearTurnWatchdog(turnKey);
+    const timer = setTimeout(() => {
+      if (!this.activeTurnIds.has(turnKey)) return;
+      this.log(
+        `WARNING: turn ${turnKey} watchdog fired after ${this.turnWatchdogMs()}ms of inactivity — ` +
+        `marking stalled but keeping Codex busy until a real completion or reconnect`,
+      );
+      this.markTurnStalled(turnKey);
+    }, this.turnWatchdogMs());
+    // Never keep the process/test runner alive on account of a watchdog.
+    timer.unref?.();
+    this.turnWatchdogs.set(turnKey, timer);
+  }
+
+  private clearTurnWatchdog(turnKey: string) {
+    const timer = this.turnWatchdogs.get(turnKey);
+    if (timer) {
+      clearTimeout(timer);
+      this.turnWatchdogs.delete(turnKey);
+    }
+  }
+
+  private clearAllTurnWatchdogs() {
+    for (const timer of this.turnWatchdogs.values()) clearTimeout(timer);
+    this.turnWatchdogs.clear();
+  }
+
+  /**
+   * Refresh every active turn's watchdog — called on any app-server notification
+   * so the watchdog measures INACTIVITY, not total turn duration (a genuinely
+   * long but active turn keeps streaming events and is never marked stalled).
+   */
+  private refreshTurnWatchdogs() {
+    if (this.turnWatchdogs.size === 0) return;
+    for (const turnKey of [...this.turnWatchdogs.keys()]) {
+      this.scheduleTurnWatchdog(turnKey);
+    }
+  }
+
+  /** Mark a turn stalled without clearing busy state (watchdog expiry path). */
+  private markTurnStalled(turnKey: string) {
+    if (!this.activeTurnIds.has(turnKey)) return;
+    this.turnInProgress = true;
+    // Emit at most once per turn: a stalled turn keeps its watchdog armed, so
+    // later notifications can re-fire it. Suppress repeats for the same turnId.
+    if (this.stalledTurnIds.has(turnKey)) return;
+    this.stalledTurnIds.add(turnKey);
+    this.emit("turnStalled", {
+      turnId: turnKey,
+      inactivityMs: this.turnWatchdogMs(),
+    });
+  }
+
+  /**
+   * Clear all turn state (active ids + watchdogs) and recompute busy. Single
+   * source of truth used by app-server close / disconnect / stop so no path
+   * clears the ids without also clearing the watchdog timers.
+   */
+  private resetTurnState(reason: string, emitCompleted = false) {
+    const wasInProgress = this.turnInProgress;
+    this.activeTurnIds.clear();
+    this.clearAllTurnWatchdogs();
+    this.stalledTurnIds.clear();
+    this.turnInProgress = false;
+    if (wasInProgress) {
+      if (emitCompleted) {
+        this.emit("turnCompleted");
+      } else {
+        // The turn ended WITHOUT a normal completion (app-server close / reconnect
+        // / stop). Signal an abort so daemon-level per-turn state (e.g. the
+        // require_reply tracker) can be cleared instead of stranded onto a later
+        // turn — turnCompleted is the ONLY other reset signal the daemon gets.
+        this.emit("turnAborted", reason);
+      }
+      this.log(`Turn state reset (${reason})`);
+    }
   }
 
   private requestKey(id: unknown): string | null {
@@ -1643,6 +1941,6 @@ export class CodexAdapter extends EventEmitter {
   private log(msg: string) {
     const line = `[${new Date().toISOString()}] [CodexAdapter] ${msg}\n`;
     process.stderr.write(line);
-    try { appendFileSync(this.logFile, line); } catch {}
+    try { appendRotatingLog(this.logFile, line); } catch {}
   }
 }

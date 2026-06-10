@@ -1,7 +1,16 @@
 import { describe, expect, test } from "bun:test";
 import { compareVersions } from "../cli/init";
 import { checkOwnedFlagConflicts } from "../cli/claude";
-import { buildCodexArgs } from "../cli/codex";
+import {
+  buildCodexArgs,
+  parseAgentBridgeCodexArgs,
+  resolveCodexResumeArgs,
+} from "../cli/codex";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { StateDirResolver } from "../state-dir";
+import { promoteCurrentThreadIfRolloutExists } from "../thread-state";
 
 describe("CLI: version comparison", () => {
   test("equal versions return 0", () => {
@@ -242,5 +251,77 @@ describe("CLI: buildCodexArgs", () => {
     const r = buildCodexArgs(["a"], PROXY);
     expect(r.fullArgs).toEqual(["a"]);
     expect(r.injectedBridgeFlags).toBe(false);
+  });
+});
+
+describe("CLI: AgentBridge Codex resume args", () => {
+  function makePair(root: string) {
+    return {
+      pairId: "main-12345678",
+      slot: 0,
+      ports: { appPort: 4500, proxyPort: 4501, controlPort: 4502 },
+      stateDir: new StateDirResolver(join(root, "pair-state")),
+      name: "main",
+      manual: false,
+    };
+  }
+
+  test("--new is consumed by AgentBridge and disables auto-resume", () => {
+    const parsed = parseAgentBridgeCodexArgs(["--new", "--model", "o3"]);
+    expect(parsed).toEqual({ rest: ["--model", "o3"], forceNew: true, resumeCurrent: false });
+
+    const root = mkdtempSync(join(tmpdir(), "agentbridge-cli-resume-"));
+    try {
+      const result = resolveCodexResumeArgs(parsed, makePair(root));
+      expect(result).toEqual({ rest: ["--model", "o3"], mode: "new" });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("bare codex auto-resumes only a rollout-backed current thread", () => {
+    const root = mkdtempSync(join(tmpdir(), "agentbridge-cli-resume-"));
+    const codexHome = mkdtempSync(join(tmpdir(), "agentbridge-codex-home-"));
+    const previousCwd = process.cwd();
+    try {
+      process.chdir(root);
+      const pair = makePair(root);
+      const cwd = process.cwd();
+      const sessionsDir = join(codexHome, "sessions", "2026", "06", "02");
+      mkdirSync(sessionsDir, { recursive: true });
+      writeFileSync(join(sessionsDir, "rollout-thread-abc.jsonl"), "{}\n", "utf-8");
+      promoteCurrentThreadIfRolloutExists(
+        { stateDir: pair.stateDir, pairId: pair.pairId, pairName: pair.name, cwd },
+        "thread-abc",
+        "test",
+        { CODEX_HOME: codexHome } as NodeJS.ProcessEnv,
+      );
+
+      const result = resolveCodexResumeArgs(
+        parseAgentBridgeCodexArgs([]),
+        pair,
+        { CODEX_HOME: codexHome } as NodeJS.ProcessEnv,
+      );
+      expect(result.mode).toBe("auto-resume");
+      expect(result.rest).toEqual(["resume", "thread-abc"]);
+    } finally {
+      process.chdir(previousCwd);
+      rmSync(root, { recursive: true, force: true });
+      rmSync(codexHome, { recursive: true, force: true });
+    }
+  });
+
+  test("resume-current errors when no verified current thread exists", () => {
+    const root = mkdtempSync(join(tmpdir(), "agentbridge-cli-resume-"));
+    const previousCwd = process.cwd();
+    try {
+      process.chdir(root);
+      const result = resolveCodexResumeArgs(parseAgentBridgeCodexArgs(["resume-current"]), makePair(root));
+      expect(result.mode).toBe("resume-current");
+      expect(result.error).toContain("No verified current Codex thread");
+    } finally {
+      process.chdir(previousCwd);
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });

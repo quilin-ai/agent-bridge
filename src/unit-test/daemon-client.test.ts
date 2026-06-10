@@ -153,7 +153,7 @@ describe("DaemonClient", () => {
     expect(disconnectEmitted).toBe(false);
   });
 
-  test("attachClaudeAndWaitForStatus resolves true when the daemon confirms attachment", async () => {
+  test("attachClaudeAndWaitForStatus resolves daemon status when the daemon confirms attachment", async () => {
     onServerMessage = (ws, raw) => {
       const message = JSON.parse(raw.toString());
       if (message.type === "claude_connect") {
@@ -173,10 +173,12 @@ describe("DaemonClient", () => {
     };
 
     await client.connect();
-    await expect(client.attachClaudeAndWaitForStatus(250)).resolves.toBe(true);
+    const status = await client.attachClaudeAndWaitForStatus(250);
+    expect(status?.pid).toBe(12345);
+    expect(status?.bridgeReady).toBe(true);
   });
 
-  test("attachClaudeAndWaitForStatus resolves false when the daemon rejects the attach", async () => {
+  test("attachClaudeAndWaitForStatus resolves null when the daemon rejects the attach", async () => {
     onServerMessage = (ws, raw) => {
       const message = JSON.parse(raw.toString());
       if (message.type === "claude_connect") {
@@ -185,10 +187,10 @@ describe("DaemonClient", () => {
     };
 
     await client.connect();
-    await expect(client.attachClaudeAndWaitForStatus(250)).resolves.toBe(false);
+    await expect(client.attachClaudeAndWaitForStatus(250)).resolves.toBeNull();
   });
 
-  test("attachClaudeAndWaitForStatus resolves false on timeout when daemon never responds", async () => {
+  test("attachClaudeAndWaitForStatus resolves null on timeout when daemon never responds", async () => {
     // Server intentionally swallows claude_connect — no status, no close, no anything.
     // Critical path for the recovery poller: a hung daemon must let the caller proceed.
     onServerMessage = () => {};
@@ -198,7 +200,7 @@ describe("DaemonClient", () => {
     const result = await client.attachClaudeAndWaitForStatus(150);
     const elapsed = Date.now() - start;
 
-    expect(result).toBe(false);
+    expect(result).toBeNull();
     // Must actually wait for the timeout, not resolve instantly.
     expect(elapsed).toBeGreaterThanOrEqual(140);
     // Sanity check on upper bound to catch event-listener leaks that delay GC.
@@ -380,5 +382,29 @@ describe("DaemonClient", () => {
 
     const msg = await received;
     expect(msg.type).toBe("claude_connect");
+  });
+
+  test("attachClaude includes client identity when configured", async () => {
+    const identity = {
+      pairId: "main-12345678",
+      pairName: "main",
+      cwd: "/tmp/project",
+      baseDir: "/tmp/agentbridge-base",
+      stateDir: "/tmp/agentbridge-base/pairs/main-12345678",
+      clientPid: 1234,
+      contractVersion: 1,
+    };
+    client = new DaemonClient(`ws://127.0.0.1:${serverPort}/ws`, { identity });
+    const received = new Promise<any>((resolve) => {
+      onServerMessage = (_ws: any, raw: any) => {
+        resolve(JSON.parse(typeof raw === "string" ? raw : raw.toString()));
+      };
+    });
+
+    await client.connect();
+    client.attachClaude();
+
+    const msg = await received;
+    expect(msg).toEqual({ type: "claude_connect", identity });
   });
 });

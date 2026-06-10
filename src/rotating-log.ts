@@ -1,0 +1,36 @@
+import { appendFileSync, existsSync, mkdirSync, renameSync, statSync, unlinkSync } from "node:fs";
+import { dirname } from "node:path";
+
+const DEFAULT_MAX_BYTES = 5 * 1024 * 1024;
+const DEFAULT_KEEP = 3;
+
+export function appendRotatingLog(
+  path: string,
+  content: string,
+  options: { maxBytes?: number; keep?: number } = {},
+): void {
+  const maxBytes = options.maxBytes ?? Number(process.env.AGENTBRIDGE_LOG_MAX_BYTES || DEFAULT_MAX_BYTES);
+  const keep = options.keep ?? Number(process.env.AGENTBRIDGE_LOG_ROTATE_KEEP || DEFAULT_KEEP);
+  mkdirSync(dirname(path), { recursive: true });
+  rotateIfNeeded(path, Buffer.byteLength(content), maxBytes, keep);
+  appendFileSync(path, content, "utf-8");
+}
+
+function rotateIfNeeded(path: string, incomingBytes: number, maxBytes: number, keep: number): void {
+  if (!Number.isFinite(maxBytes) || maxBytes <= 0 || keep <= 0) return;
+  if (!existsSync(path)) return;
+  const size = statSync(path).size;
+  if (size + incomingBytes <= maxBytes) return;
+
+  for (let index = keep; index >= 1; index--) {
+    const current = `${path}.${index}`;
+    const next = `${path}.${index + 1}`;
+    if (!existsSync(current)) continue;
+    if (index === keep) {
+      unlinkSync(current);
+    } else {
+      renameSync(current, next);
+    }
+  }
+  renameSync(path, `${path}.1`);
+}

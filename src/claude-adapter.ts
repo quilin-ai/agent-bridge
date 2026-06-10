@@ -20,7 +20,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { EventEmitter } from "node:events";
 import { randomUUID } from "node:crypto";
-import { appendFileSync } from "node:fs";
+import { appendRotatingLog } from "./rotating-log";
 import { StateDirResolver } from "./state-dir";
 import type { BridgeMessage } from "./types";
 
@@ -344,7 +344,7 @@ export class ClaudeAdapter extends EventEmitter {
     const line = `[${new Date().toISOString()}] [ClaudeAdapter] ${msg}\n`;
     process.stderr.write(line);
     try {
-      appendFileSync(this.logFile, line);
+      appendRotatingLog(this.logFile, line);
     } catch {}
   }
 }

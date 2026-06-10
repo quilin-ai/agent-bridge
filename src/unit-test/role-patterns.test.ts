@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { ClaudeAdapter, CLAUDE_INSTRUCTIONS } from "../claude-adapter";
-import { BRIDGE_CONTRACT_REMINDER } from "../message-filter";
+import { AGENTS_MD_SECTION } from "../collaboration-content";
 
 describe("role-aware collaboration guidance", () => {
   test("claude instructions include role keywords and thinking patterns", () => {
@@ -21,25 +21,32 @@ describe("role-aware collaboration guidance", () => {
     expect(CLAUDE_INSTRUCTIONS).toContain("busy error");
   });
 
-  test("bridge contract reminder includes codex role guidance", () => {
-    expect(BRIDGE_CONTRACT_REMINDER).toContain("Your default role: Implementer, Executor, Verifier");
-    expect(BRIDGE_CONTRACT_REMINDER).toContain("Independent Analysis & Convergence");
-    expect(BRIDGE_CONTRACT_REMINDER).toContain("Architect -> Builder -> Critic");
-    expect(BRIDGE_CONTRACT_REMINDER).toContain("Hypothesis -> Experiment -> Interpretation");
-    expect(BRIDGE_CONTRACT_REMINDER).toContain("Do not blindly follow Claude");
-    expect(BRIDGE_CONTRACT_REMINDER).toContain("My independent view is:");
+  // The Codex-side bridge contract (message markers / git-forbidden / role
+  // guidance) now lives in AGENTS.md (injected once by `abg init`), instead of
+  // being appended to every claude→codex message. These assertions guard that the
+  // contract semantics survive that move — Codex still learns them on startup.
+  test("AGENTS.md collaboration section carries codex role guidance", () => {
+    expect(AGENTS_MD_SECTION).toContain("Implementer, Executor, Verifier");
+    expect(AGENTS_MD_SECTION).toContain("Independent Analysis & Convergence");
+    expect(AGENTS_MD_SECTION).toContain("Architect → Builder → Critic");
+    expect(AGENTS_MD_SECTION).toContain("Hypothesis → Experiment → Interpretation");
+    expect(AGENTS_MD_SECTION).toContain("Do not blindly follow Claude");
+    expect(AGENTS_MD_SECTION).toContain("My independent view is:");
   });
 
-  test("bridge contract reminder specifies marker must be at start", () => {
-    expect(BRIDGE_CONTRACT_REMINDER).toContain("at the very start");
-    expect(BRIDGE_CONTRACT_REMINDER).toContain("MUST be the first text");
+  test("AGENTS.md collaboration section requires the marker at the very start", () => {
+    expect(AGENTS_MD_SECTION).toContain("very start");
+    expect(AGENTS_MD_SECTION).toContain("must be the first text");
+    expect(AGENTS_MD_SECTION).toContain("[IMPORTANT]");
+    expect(AGENTS_MD_SECTION).toContain("[STATUS]");
+    expect(AGENTS_MD_SECTION).toContain("[FYI]");
   });
 
-  test("bridge contract reminder forbids git write operations", () => {
-    expect(BRIDGE_CONTRACT_REMINDER).toContain("Git Operations — FORBIDDEN");
-    expect(BRIDGE_CONTRACT_REMINDER).toContain("MUST NOT execute any git write commands");
-    expect(BRIDGE_CONTRACT_REMINDER).toContain("hang indefinitely");
-    expect(BRIDGE_CONTRACT_REMINDER).toContain("delegated to Claude Code");
+  test("AGENTS.md collaboration section forbids git write operations", () => {
+    expect(AGENTS_MD_SECTION).toContain("Git operations — FORBIDDEN");
+    expect(AGENTS_MD_SECTION).toContain("MUST NOT run git **write** commands");
+    expect(AGENTS_MD_SECTION).toContain("hang your session");
+    expect(AGENTS_MD_SECTION).toContain("Delegate **all** git writes to Claude");
   });
 
   test("CLAUDE_INSTRUCTIONS is wired into MCP Server", () => {
