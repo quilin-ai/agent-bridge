@@ -783,6 +783,318 @@ describe("E2E: CLI surface", () => {
       expect(codexRun?.args[3]).toBe(`ws://127.0.0.1:${harness.proxyPort}`);
     });
   }, 30000);
+
+  test("agentbridge pairs rm deletes the pair's state directory and registry entry (B1)", async () => {
+    await withHarness(async (harness) => {
+      const pairName = "work";
+      const pairId = derivePairId(harness.projectDir, pairName);
+      const pairsRoot = join(harness.baseDir, "pairs");
+      const pairStateDir = join(pairsRoot, pairId);
+      mkdirSync(pairStateDir, { recursive: true });
+      writeFileSync(join(pairStateDir, "agentbridge.log"), "x\n", "utf-8");
+      writeFileSync(
+        join(pairsRoot, "registry.json"),
+        JSON.stringify(
+          {
+            version: 1,
+            pairs: [
+              {
+                pairId,
+                slot: 3,
+                cwd: harness.projectDir,
+                name: pairName,
+                source: "flag",
+                createdAt: new Date().toISOString(),
+              },
+            ],
+          },
+          null,
+          2,
+        ) + "\n",
+        "utf-8",
+      );
+
+      const result = await harness.runCliWithEnv(["pairs", "rm", pairName], {
+        AGENTBRIDGE_BASE_DIR: harness.baseDir,
+      });
+
+      expect(result.code).toBe(0);
+      expect(result.stdout).toContain(`Removed pair ${pairId}`);
+      expect(result.stdout).toContain("State directory deleted.");
+      expect(existsSync(pairStateDir)).toBe(false);
+      const registry = JSON.parse(readFileSync(join(pairsRoot, "registry.json"), "utf-8"));
+      expect(registry.pairs.some((p: { pairId: string }) => p.pairId === pairId)).toBe(false);
+    });
+  }, 20000);
+
+  test("agentbridge pairs prune removes orphan dirs but keeps registered and live ones (B1)", async () => {
+    await withHarness(async (harness) => {
+      const pairsRoot = join(harness.baseDir, "pairs");
+      mkdirSync(pairsRoot, { recursive: true });
+
+      // Orphan with no daemon.pid → prunable.
+      const orphanNoPid = join(pairsRoot, "main-aaaa0001");
+      mkdirSync(orphanNoPid, { recursive: true });
+
+      // Orphan with a dead daemon.pid → prunable.
+      const orphanDead = join(pairsRoot, "main-bbbb0002");
+      mkdirSync(orphanDead, { recursive: true });
+      writeFileSync(join(orphanDead, "daemon.pid"), "2147483646\n", "utf-8");
+
+      // Orphan with a LIVE daemon.pid → must be kept. Use a throwaway child
+      // process, NOT process.pid: harness cleanup SIGKILLs every daemon.pid it
+      // finds under rootDir, so writing the test runner's own pid would kill the
+      // whole suite.
+      const liveChild = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], {
+        stdio: "ignore",
+      });
+      const orphanLive = join(pairsRoot, "main-cccc0003");
+      mkdirSync(orphanLive, { recursive: true });
+      writeFileSync(join(orphanLive, "daemon.pid"), `${liveChild.pid}\n`, "utf-8");
+
+      // Registered pair → must be kept (use `pairs rm`, not prune).
+      const regId = derivePairId(harness.projectDir, "work");
+      const regDir = join(pairsRoot, regId);
+      mkdirSync(regDir, { recursive: true });
+      writeFileSync(
+        join(pairsRoot, "registry.json"),
+        JSON.stringify(
+          {
+            version: 1,
+            pairs: [
+              {
+                pairId: regId,
+                slot: 2,
+                cwd: harness.projectDir,
+                name: "work",
+                source: "flag",
+                createdAt: new Date().toISOString(),
+              },
+            ],
+          },
+          null,
+          2,
+        ) + "\n",
+        "utf-8",
+      );
+
+      try {
+        const baseEnv = { AGENTBRIDGE_BASE_DIR: harness.baseDir };
+
+        // Dry run lists the orphans but deletes nothing.
+        const dry = await harness.runCliWithEnv(["pairs", "prune", "--dry-run"], baseEnv);
+        expect(dry.code).toBe(0);
+        expect(dry.stdout).toContain("main-aaaa0001");
+        expect(dry.stdout).toContain("main-bbbb0002");
+        expect(dry.stdout).toContain("dry run");
+        expect(existsSync(orphanNoPid)).toBe(true);
+        expect(existsSync(orphanDead)).toBe(true);
+
+        // Real prune deletes only the dead orphans.
+        const run = await harness.runCliWithEnv(["pairs", "prune"], baseEnv);
+        expect(run.code).toBe(0);
+        expect(existsSync(orphanNoPid)).toBe(false);
+        expect(existsSync(orphanDead)).toBe(false);
+        expect(existsSync(orphanLive)).toBe(true);
+        expect(existsSync(regDir)).toBe(true);
+      } finally {
+        try {
+          liveChild.kill("SIGKILL");
+        } catch {}
+      }
+    });
+  }, 20000);
+
+  test("agentbridge kill (no args) stops only the current directory's pairs (F1)", async () => {
+    await withHarness(async (harness) => {
+      const pairsRoot = join(harness.baseDir, "pairs");
+      mkdirSync(pairsRoot, { recursive: true });
+      const otherDir = mkdtempSync(join(tmpdir(), "abg-othercwd-"));
+
+      const idHere = derivePairId(harness.projectDir, "main");
+      const idAway = derivePairId(otherDir, "main");
+      mkdirSync(join(pairsRoot, idHere), { recursive: true });
+      mkdirSync(join(pairsRoot, idAway), { recursive: true });
+      writeFileSync(
+        join(pairsRoot, "registry.json"),
+        JSON.stringify(
+          {
+            version: 1,
+            pairs: [
+              { pairId: idHere, slot: 4, cwd: harness.projectDir, name: "main", source: "cwd", createdAt: new Date().toISOString() },
+              { pairId: idAway, slot: 5, cwd: otherDir, name: "main", source: "cwd", createdAt: new Date().toISOString() },
+            ],
+          },
+          null,
+          2,
+        ) + "\n",
+        "utf-8",
+      );
+
+      try {
+        const result = await harness.runCliWithEnv(["kill"], { AGENTBRIDGE_BASE_DIR: harness.baseDir });
+        expect(result.code).toBe(0);
+        // Current-dir pair stopped (killed sentinel written); the foreign-cwd pair untouched.
+        expect(existsSync(join(pairsRoot, idHere, "killed"))).toBe(true);
+        expect(existsSync(join(pairsRoot, idAway, "killed"))).toBe(false);
+        expect(result.stdout).toContain(idHere);
+        expect(result.stdout).not.toContain(idAway);
+      } finally {
+        rmSync(otherDir, { recursive: true, force: true });
+      }
+    });
+  }, 20000);
+
+  test("agentbridge kill all stops pairs from every directory (F1)", async () => {
+    await withHarness(async (harness) => {
+      const pairsRoot = join(harness.baseDir, "pairs");
+      mkdirSync(pairsRoot, { recursive: true });
+      const otherDir = mkdtempSync(join(tmpdir(), "abg-othercwd-"));
+
+      const idHere = derivePairId(harness.projectDir, "main");
+      const idAway = derivePairId(otherDir, "main");
+      mkdirSync(join(pairsRoot, idHere), { recursive: true });
+      mkdirSync(join(pairsRoot, idAway), { recursive: true });
+      writeFileSync(
+        join(pairsRoot, "registry.json"),
+        JSON.stringify(
+          {
+            version: 1,
+            pairs: [
+              { pairId: idHere, slot: 4, cwd: harness.projectDir, name: "main", source: "cwd", createdAt: new Date().toISOString() },
+              { pairId: idAway, slot: 5, cwd: otherDir, name: "main", source: "cwd", createdAt: new Date().toISOString() },
+            ],
+          },
+          null,
+          2,
+        ) + "\n",
+        "utf-8",
+      );
+
+      try {
+        const result = await harness.runCliWithEnv(["kill", "all"], { AGENTBRIDGE_BASE_DIR: harness.baseDir });
+        expect(result.code).toBe(0);
+        expect(existsSync(join(pairsRoot, idHere, "killed"))).toBe(true);
+        expect(existsSync(join(pairsRoot, idAway, "killed"))).toBe(true);
+      } finally {
+        rmSync(otherDir, { recursive: true, force: true });
+      }
+    });
+  }, 20000);
+
+  test("agentbridge kill with no current-directory pairs prints a hint and touches nothing (F1)", async () => {
+    await withHarness(async (harness) => {
+      const pairsRoot = join(harness.baseDir, "pairs");
+      mkdirSync(pairsRoot, { recursive: true });
+      const otherDir = mkdtempSync(join(tmpdir(), "abg-othercwd-"));
+
+      const idAway = derivePairId(otherDir, "main");
+      mkdirSync(join(pairsRoot, idAway), { recursive: true });
+      writeFileSync(
+        join(pairsRoot, "registry.json"),
+        JSON.stringify(
+          {
+            version: 1,
+            pairs: [
+              { pairId: idAway, slot: 5, cwd: otherDir, name: "main", source: "cwd", createdAt: new Date().toISOString() },
+            ],
+          },
+          null,
+          2,
+        ) + "\n",
+        "utf-8",
+      );
+
+      try {
+        const result = await harness.runCliWithEnv(["kill"], { AGENTBRIDGE_BASE_DIR: harness.baseDir });
+        expect(result.code).toBe(0);
+        expect(result.stdout).toContain("No AgentBridge pairs registered for current directory");
+        expect(result.stdout).toContain("abg kill all");
+        expect(existsSync(join(pairsRoot, idAway, "killed"))).toBe(false);
+      } finally {
+        rmSync(otherDir, { recursive: true, force: true });
+      }
+    });
+  }, 20000);
+
+  test("agentbridge kill rejects --pair together with all/--all (F1)", async () => {
+    await withHarness(async (harness) => {
+      for (const args of [
+        ["kill", "--pair", "x", "--all"],
+        ["kill", "--pair", "x", "all"],
+      ]) {
+        const result = await harness.runCli(args);
+        expect(result.code).not.toBe(0);
+        expect(result.stderr).toContain("use either");
+      }
+    });
+  }, 20000);
+
+  test("agentbridge pairs prune skips non-canonical (whitespace) directory names (B1)", async () => {
+    await withHarness(async (harness) => {
+      const pairsRoot = join(harness.baseDir, "pairs");
+      mkdirSync(pairsRoot, { recursive: true });
+      // Leading space → validatePairId would trim to "main"; prune must NOT act
+      // on it via the trimmed alias, and must keep the literal dir.
+      const weird = join(pairsRoot, " main");
+      mkdirSync(weird, { recursive: true });
+      writeFileSync(join(pairsRoot, "registry.json"), JSON.stringify({ version: 1, pairs: [] }) + "\n", "utf-8");
+
+      const result = await harness.runCliWithEnv(["pairs", "prune"], {
+        AGENTBRIDGE_BASE_DIR: harness.baseDir,
+      });
+      expect(result.code).toBe(0);
+      expect(existsSync(weird)).toBe(true); // never deleted via a trimmed alias
+      expect(result.stdout).toContain("canonical");
+    });
+  }, 20000);
+
+  test("agentbridge pairs rm aborts (keeps registry + dir) when the pair cannot be stopped (B1)", async () => {
+    await withHarness(async (harness) => {
+      const pairName = "stuck";
+      const pairId = derivePairId(harness.projectDir, pairName);
+      const pairsRoot = join(harness.baseDir, "pairs");
+      const pairStateDir = join(pairsRoot, pairId);
+      mkdirSync(pairStateDir, { recursive: true });
+      writeFileSync(
+        join(pairsRoot, "registry.json"),
+        JSON.stringify(
+          {
+            version: 1,
+            pairs: [
+              {
+                pairId,
+                slot: 3,
+                cwd: harness.projectDir,
+                name: pairName,
+                source: "flag",
+                createdAt: new Date().toISOString(),
+              },
+            ],
+          },
+          null,
+          2,
+        ) + "\n",
+        "utf-8",
+      );
+      // Make the pair's state dir read-only so markKilled (writing the `killed`
+      // sentinel) throws → stopPairEntry returns {error} → rm must abort without
+      // removing the registry entry or the dir.
+      chmodSync(pairStateDir, 0o500);
+      try {
+        const result = await harness.runCliWithEnv(["pairs", "rm", pairName], {
+          AGENTBRIDGE_BASE_DIR: harness.baseDir,
+        });
+        expect(result.code).not.toBe(0);
+        expect(result.stderr).toContain("failed to stop");
+        const registry = JSON.parse(readFileSync(join(pairsRoot, "registry.json"), "utf-8"));
+        expect(registry.pairs.some((p: { pairId: string }) => p.pairId === pairId)).toBe(true);
+        expect(existsSync(pairStateDir)).toBe(true);
+      } finally {
+        chmodSync(pairStateDir, 0o700); // restore so harness cleanup can remove it
+      }
+    });
+  }, 20000);
 });
 
 async function withHarness(

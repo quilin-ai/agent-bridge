@@ -133,10 +133,12 @@ Commands:
   dev                Register local marketplace + install plugin (for local dev)
   claude [args...]   Start Claude Code with push channel enabled
   codex [args...]    Start Codex TUI connected to AgentBridge daemon
-  pairs [rm <name|id>]  List running Claude+Codex pairs (or remove one)
+  pairs [rm <name|id> | prune [--dry-run]]
+                     List pairs; remove one (rm), or delete orphan state dirs (prune)
   doctor [--json]    Diagnose env, daemon, build drift, logs, and current thread
   doctor resume-pollution [--apply]  Find/fix old AgentBridge kickoff metadata
-  kill [--pair <name|id>]  Stop all pairs, or just one with --pair (alias: --all)
+  kill [all | --all | --pair <name|id>]
+                     Stop this directory's pairs (default), every pair (all/--all), or one (--pair)
 
 Options:
   --pair <name>      Run claude/codex/kill in a named pair. The name is scoped to
@@ -164,8 +166,11 @@ Examples:
   abg doctor --json            # Emit a structured diagnostics report
   abg pairs rm work            # Stop this directory's "work" pair and free its slot
   abg pairs rm work-1a2b3c4d   # ...or by its full id (from that pair's directory)
+  abg pairs prune --dry-run    # Preview orphan pair dirs (no registry entry, not live)
+  abg pairs prune              # ...delete those orphan state directories
   abg --pair work kill         # Stop only this directory's "work" pair
-  abg kill                     # Stop ALL pairs
+  abg kill                     # Stop this directory's pairs (+ any legacy-root daemon)
+  abg kill all                 # Stop every pair in every directory (+ legacy-root)
 `.trim());
 }
 
