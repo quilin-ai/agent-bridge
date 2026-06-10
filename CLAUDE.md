@@ -25,7 +25,8 @@ Runtime is **Bun** — do not change the local Bun version.
 | Build plugin bundle | `bun run build:plugin` → `plugins/agentbridge/server/{bridge-server,daemon}.js` |
 | Verify plugin sync | `bun run verify:plugin-sync` |
 | Validate plugin manifest | `bun run validate:plugin` (requires `claude` CLI) |
-| Local dev link | `bun link` then `agentbridge dev` (registers local marketplace + installs plugin) |
+| Local dev link | `bun link` then `agentbridge dev` (registers local marketplace + installs plugin; repo checkout only) |
+| Update global CLI + plugin | `bun run install:global` (one command: rebuild, replace global install, sync plugin; `--skip-plugin` to opt out) |
 | Start session | `agentbridge claude` (one terminal) + `agentbridge codex` (another) |
 | Show quota snapshot | `agentbridge budget [--json]` (both agents' 5h/weekly usage, drift, pause state) |
 | Stop everything | `agentbridge kill` |

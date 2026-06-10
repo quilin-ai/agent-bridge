@@ -32,14 +32,18 @@ const packageName = pkg.name;
 
 const args = process.argv.slice(2);
 const dryRun = args.includes("--dry-run");
+const skipPlugin = args.includes("--skip-plugin");
 const mode = args.find((arg) => !arg.startsWith("-"));
 
 function usage() {
-  process.stderr.write(`Usage: node scripts/install-global.mjs <local|npm> [--dry-run]
+  process.stderr.write(`Usage: node scripts/install-global.mjs <local|npm> [--dry-run] [--skip-plugin]
 
 Examples:
-  bun run install:global:local   # build this checkout, then fully replace the global install
+  bun run install:global:local   # build this checkout, replace the global install, sync the Claude Code plugin
   bun run install:global:npm     # fully replace the global install with npm latest
+
+Options:
+  --skip-plugin   local mode only: skip the Claude Code plugin sync (\`dev\`) step
 `);
 }
 
@@ -148,6 +152,9 @@ function installLocal() {
     printDry("node", ["scripts/install-safety.cjs", "verify-tarball", "<packed-tarball>"]);
     printDry("npm", ["uninstall", "-g", packageName], "  # ignored if not installed");
     printDry("npm", ["install", "-g", "--force", "<packed-tarball>"]);
+    if (!skipPlugin) {
+      printDry("bun", ["src/cli.ts", "dev", "--skip-build"], "  # sync Claude Code plugin (skip with --skip-plugin)");
+    }
     return;
   }
 
@@ -169,6 +176,26 @@ function installLocal() {
   } finally {
     if (packDir) rmSync(packDir, { recursive: true, force: true });
   }
+
+  // Sync the Claude Code plugin from this checkout so one command updates both
+  // deployables (terminal CLI + plugin bundles). Non-fatal: the global CLI is
+  // already installed at this point, so a plugin-sync failure (e.g. missing
+  // `claude` CLI) must not report the whole install as failed.
+  if (!skipPlugin) {
+    process.stdout.write("# syncing Claude Code plugin from this checkout (skip with --skip-plugin)\n");
+    const dev = run("bun", ["src/cli.ts", "dev", "--skip-build"], { allowFailure: true });
+    if (dev.status !== 0) {
+      process.stderr.write(
+        "install-global: global CLI installed, but the Claude Code plugin sync failed — run `bun src/cli.ts dev` in this checkout manually.\n",
+      );
+    }
+  }
+
+  // Running daemons/sessions were stopped at the start of the install — make
+  // the required restart explicit instead of leaving it implied.
+  process.stdout.write(
+    "# note: running AgentBridge sessions were stopped — start fresh with `agentbridge claude` / `agentbridge codex`\n",
+  );
 }
 
 function installNpm() {

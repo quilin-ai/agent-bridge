@@ -6,8 +6,8 @@ import { installPrefixFromBinPath, resolveInstallPrefix } from "../../scripts/in
 const SCRIPT = join(process.cwd(), "scripts/install-global.mjs");
 const PACKAGE_NAME = "@raysonmeng/agentbridge";
 
-function runDry(mode: string): { status: number | null; stdout: string; stderr: string } {
-  const res = Bun.spawnSync(["node", SCRIPT, mode, "--dry-run"], {
+function runDry(mode: string, extraArgs: string[] = []): { status: number | null; stdout: string; stderr: string } {
+  const res = Bun.spawnSync(["node", SCRIPT, mode, "--dry-run", ...extraArgs], {
     env: process.env,
   });
   return {
@@ -17,8 +17,8 @@ function runDry(mode: string): { status: number | null; stdout: string; stderr: 
   };
 }
 
-function dryRunCommands(mode: string): string[] {
-  const res = runDry(mode);
+function dryRunCommands(mode: string, extraArgs: string[] = []): string[] {
+  const res = runDry(mode, extraArgs);
   expect(res.status).toBe(0);
   return res.stdout
     .split("\n")
@@ -27,7 +27,7 @@ function dryRunCommands(mode: string): string[] {
 }
 
 describe("scripts/install-global.mjs", () => {
-  test("local mode builds and packs before replacing the global install", () => {
+  test("local mode builds, packs, replaces the global install, then syncs the plugin", () => {
     const commands = dryRunCommands("local");
     expect(commands).toEqual([
       "$ node scripts/install-safety.cjs stop-running --dry-run",
@@ -37,7 +37,14 @@ describe("scripts/install-global.mjs", () => {
       "$ node scripts/install-safety.cjs verify-tarball <packed-tarball>",
       `$ npm uninstall -g ${PACKAGE_NAME}  # ignored if not installed`,
       "$ npm install -g --force <packed-tarball>",
+      "$ bun src/cli.ts dev --skip-build  # sync Claude Code plugin (skip with --skip-plugin)",
     ]);
+  });
+
+  test("local mode --skip-plugin omits the plugin sync step", () => {
+    const commands = dryRunCommands("local", ["--skip-plugin"]);
+    expect(commands.some((line) => line.includes("dev --skip-build"))).toBe(false);
+    expect(commands[commands.length - 1]).toBe("$ npm install -g --force <packed-tarball>");
   });
 
   test("npm mode verifies the registry package before replacing the global install", () => {

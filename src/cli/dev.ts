@@ -5,37 +5,60 @@ import { homedir } from "node:os";
 import { MARKETPLACE_NAME, PLUGIN_NAME } from "../cli";
 import { findPackageRoot, registerMarketplace } from "./pkg-root";
 
-export async function runDev() {
+export async function runDev(args: string[] = []) {
   console.log("AgentBridge Dev Setup\n");
+
+  // Used by install-global.mjs, which has already run the full prepublishOnly build.
+  const skipBuild = args.includes("--skip-build");
 
   const projectRoot = findPackageRoot();
   const marketplacePath = resolve(projectRoot, ".claude-plugin", "marketplace.json");
   const pluginDir = resolve(projectRoot, "plugins", "agentbridge");
   const pluginManifest = resolve(pluginDir, ".claude-plugin", "plugin.json");
 
-  // Step 0a: Build CLI from source
-  console.log("Building CLI from source...");
-  const cliBuild = spawnSync("bun", ["run", "build:cli"], {
-    cwd: projectRoot,
-    stdio: "inherit",
-  });
-  if (cliBuild.status !== 0) {
-    console.error("  ERROR: CLI build failed. Fix build errors and try again.");
+  // Guard: `dev` only works inside a repository checkout. When invoked from a
+  // globally installed package, findPackageRoot() resolves to the published
+  // package directory, which does not ship the build scripts — fail with
+  // guidance instead of a raw MODULE_NOT_FOUND from the build step.
+  const buildScript = resolve(projectRoot, "scripts", "build-bundles.mjs");
+  if (!existsSync(buildScript)) {
+    console.error("  ERROR: 'agentbridge dev' must run inside an AgentBridge repository checkout —");
+    console.error("  the published package does not ship the build scripts.");
+    console.error("");
+    console.error("    cd <agent_bridge repo> && bun src/cli.ts dev");
+    console.error("");
+    console.error("  Tip: from the repo, `bun run install:global` updates the global CLI");
+    console.error("  AND syncs the Claude Code plugin in one step.");
     process.exit(1);
   }
-  console.log("  ✓ CLI built successfully\n");
 
-  // Step 0b: Build plugin bundles from source
-  console.log("Building plugin from source...");
-  const buildResult = spawnSync("bun", ["run", "build:plugin"], {
-    cwd: projectRoot,
-    stdio: "inherit",
-  });
-  if (buildResult.status !== 0) {
-    console.error("  ERROR: Plugin build failed. Fix build errors and try again.");
-    process.exit(1);
+  if (skipBuild) {
+    console.log("Skipping builds (--skip-build: caller already built CLI + plugin)\n");
+  } else {
+    // Step 0a: Build CLI from source
+    console.log("Building CLI from source...");
+    const cliBuild = spawnSync("bun", ["run", "build:cli"], {
+      cwd: projectRoot,
+      stdio: "inherit",
+    });
+    if (cliBuild.status !== 0) {
+      console.error("  ERROR: CLI build failed. Fix build errors and try again.");
+      process.exit(1);
+    }
+    console.log("  ✓ CLI built successfully\n");
+
+    // Step 0b: Build plugin bundles from source
+    console.log("Building plugin from source...");
+    const buildResult = spawnSync("bun", ["run", "build:plugin"], {
+      cwd: projectRoot,
+      stdio: "inherit",
+    });
+    if (buildResult.status !== 0) {
+      console.error("  ERROR: Plugin build failed. Fix build errors and try again.");
+      process.exit(1);
+    }
+    console.log("  ✓ Plugin built successfully\n");
   }
-  console.log("  ✓ Plugin built successfully\n");
 
   // Step 1: Validate local plugin exists
   if (!existsSync(pluginManifest)) {

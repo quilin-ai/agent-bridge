@@ -82,7 +82,7 @@ async function main(command: string | undefined, restArgs: string[]) {
       break;
     case "dev":
       const { runDev } = await import("./cli/dev");
-      await runDev();
+      await runDev(restArgs);
       break;
     case "claude":
       const { runClaude } = await import("./cli/claude");
