@@ -28,3 +28,28 @@ jobs:
 
       - name: Release smoke (npm pack completeness)
         run: bun run smoke:pack
+
+  # Windows is not a fully supported platform yet, but the pre-flight port
+  # cleanup (issue #76) has a dedicated win32 path that no maintainer can
+  # exercise locally — this job runs its unit tests plus a LIVE check of the
+  # real PowerShell commands (Get-NetTCPConnection / Win32_Process) against
+  # an actual listener on the runner.
+  windows-port-cleanup:
+    runs-on: windows-latest
+    # Advisory while the platform job proves itself stable (per the repo's own
+    # audit guidance on new platform jobs); flip to a hard gate after a streak
+    # of green runs.
+    continue-on-error: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.11"
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Port-cleanup unit + live platform tests
+        run: bun test src/unit-test/port-cleanup.test.ts src/unit-test/port-cleanup-live.test.ts

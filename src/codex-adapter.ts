@@ -9,10 +9,11 @@
  * disconnect), because TUI rapidly reconnects between bootstrap phases.
  */
 
-import { spawn, execSync, type ChildProcess } from "node:child_process";
+import { spawn, execFileSync, type ChildProcess } from "node:child_process";
 import { createInterface } from "node:readline";
 import { EventEmitter } from "node:events";
 import { StateDirResolver } from "./state-dir";
+import { cleanupPorts, portPidsCommand } from "./port-cleanup";
 import { createProcessLogger, type ProcessLogger } from "./process-log";
 import type { BridgeMessage } from "./types";
 import type { ServerWebSocket } from "bun";
@@ -1934,85 +1935,37 @@ export class CodexAdapter extends EventEmitter {
 
   /**
    * Build the lsof command used to find LISTENing processes on a TCP port.
+   * Kept as the POSIX single source of truth (delegates to port-cleanup.ts);
+   * see portPidsCommand for why the LISTEN restriction matters.
    *
-   * Restricting to `-sTCP:LISTEN` is critical: a bare `lsof -ti :PORT` also
-   * returns processes that merely have an outbound (client) FD to that port,
-   * including stale CLOSED connections from crashed clients. Those false
-   * positives caused `abg claude` to refuse startup whenever a previous
-   * Codex TUI process lingered with a half-closed connection to port 4501.
+   * Platform is hardcoded to "linux" on purpose: this method exists only for
+   * the POSIX lsof test fixture (string-equality asserted in tests). The
+   * production path is checkPorts(), which uses process.platform.
    */
   static buildPortListenLsofCommand(port: number): string {
-    return `lsof -ti tcp:${port} -sTCP:LISTEN`;
+    const { cmd, args } = portPidsCommand(port, "linux");
+    return [cmd, ...args].join(" ");
   }
 
   /**
    * Clean up stale ports before starting.
    * Only kills `codex app-server` processes (our own spawns). If the port is
    * occupied by something else, throws with a clear message.
+   *
+   * Platform-aware (issue #76): POSIX uses lsof/ps/kill, win32 uses
+   * PowerShell — previously the lsof failure on Windows was swallowed and the
+   * spawn ran straight into "os error 10048".
    */
   private async checkPorts() {
-    for (const port of [this.appPort, this.proxyPort]) {
-      try {
-        const pids = execSync(CodexAdapter.buildPortListenLsofCommand(port), {
-          encoding: "utf-8",
-        }).trim();
-        if (!pids) continue;
-
-        // Check if the occupying process is a codex app-server (our own stale spawn)
-        const pidList = pids.split("\n").map((p) => p.trim()).filter(Boolean);
-        const staleCodexPids: string[] = [];
-        const foreignPids: string[] = [];
-
-        for (const pid of pidList) {
-          try {
-            const cmdline = execSync(`ps -p ${pid} -o args=`, { encoding: "utf-8" }).trim();
-            if (cmdline.includes("codex") && cmdline.includes("app-server")) {
-              staleCodexPids.push(pid);
-            } else {
-              foreignPids.push(pid);
-            }
-          } catch {
-            // Process already gone
-          }
-        }
-
-        // Kill stale codex app-server processes (our own previous spawns)
-        if (staleCodexPids.length > 0) {
-          this.log(`Cleaning up stale codex app-server on port ${port}: PID(s) ${staleCodexPids.join(", ")}`);
-          for (const pid of staleCodexPids) {
-            try { execSync(`kill ${pid}`, { encoding: "utf-8" }); } catch {}
-          }
-          await new Promise((r) => setTimeout(r, 500));
-        }
-
-        // If foreign processes still occupy the port, fail with a clear message
-        if (foreignPids.length > 0) {
-          throw new Error(
-            `Port ${port} is already in use by non-Codex process(es): PID(s) ${foreignPids.join(", ")}. ` +
-            `Please stop the process or set a different port via ${port === this.appPort ? "CODEX_WS_PORT" : "CODEX_PROXY_PORT"} env var.`
-          );
-        }
-
-        // Verify port is now free
-        try {
-          const remaining = execSync(CodexAdapter.buildPortListenLsofCommand(port), {
-            encoding: "utf-8",
-          }).trim();
-          if (remaining) {
-            throw new Error(
-              `Port ${port} is still occupied (PID(s): ${remaining.replace(/\n/g, ", ")}) after cleanup. ` +
-              `Please stop the process or set a different port via ${port === this.appPort ? "CODEX_WS_PORT" : "CODEX_PROXY_PORT"} env var.`
-            );
-          }
-        } catch (err: any) {
-          if (err.message?.includes("Port")) throw err;
-          // lsof exit 1 = port free, good
-        }
-      } catch (err: any) {
-        // lsof returns exit code 1 if no match — port is free
-        if (err.message?.includes("Port") || err.message?.includes("non-Codex")) throw err;
-      }
-    }
+    await cleanupPorts({
+      ports: [
+        { port: this.appPort, envVar: "CODEX_WS_PORT" },
+        { port: this.proxyPort, envVar: "CODEX_PROXY_PORT" },
+      ],
+      run: ({ cmd, args }) => execFileSync(cmd, args, { encoding: "utf-8" }),
+      log: (message) => this.log(message),
+      sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+    });
   }
 
   private log(msg: string) {

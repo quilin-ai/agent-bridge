@@ -15,7 +15,7 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.6", "0.0.0-source"),
-  commit: defineString("18adc83", "source"),
+  commit: defineString("830d8a3", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, 1)
 });
@@ -39,7 +39,7 @@ function formatBuildInfo(build) {
 }
 
 // src/codex-adapter.ts
-import { spawn, execSync } from "child_process";
+import { spawn, execFileSync } from "child_process";
 import { createInterface } from "readline";
 import { EventEmitter } from "events";
 
@@ -98,6 +98,106 @@ class StateDirResolver {
   }
   get updateCheckFile() {
     return join(this.stateDir, "update-check.json");
+  }
+}
+
+// src/port-cleanup.ts
+function portPidsCommand(port, platform2 = process.platform) {
+  if (platform2 === "win32") {
+    return {
+      cmd: "powershell.exe",
+      args: [
+        "-NoProfile",
+        "-Command",
+        `Get-NetTCPConnection -LocalPort ${port} -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique`
+      ]
+    };
+  }
+  return { cmd: "lsof", args: ["-ti", `tcp:${port}`, "-sTCP:LISTEN"] };
+}
+function processCommandLineCommand(pid, platform2 = process.platform) {
+  if (platform2 === "win32") {
+    return {
+      cmd: "powershell.exe",
+      args: [
+        "-NoProfile",
+        "-Command",
+        `$p = Get-CimInstance Win32_Process -Filter "ProcessId = ${pid}" -ErrorAction SilentlyContinue; if ($p -and $p.CommandLine) { $p.CommandLine }`
+      ]
+    };
+  }
+  return { cmd: "ps", args: ["-p", pid, "-o", "args="] };
+}
+function killPidCommand(pid, platform2 = process.platform) {
+  if (platform2 === "win32") {
+    return {
+      cmd: "powershell.exe",
+      args: ["-NoProfile", "-Command", `Stop-Process -Id ${pid} -Force -ErrorAction Stop`]
+    };
+  }
+  return { cmd: "kill", args: [pid] };
+}
+function parsePids(output) {
+  const seen = new Set;
+  const pids = [];
+  for (const line of output.split(/\r?\n/)) {
+    const pid = line.trim();
+    if (!/^\d+$/.test(pid))
+      continue;
+    if (pid === "0")
+      continue;
+    if (seen.has(pid))
+      continue;
+    seen.add(pid);
+    pids.push(pid);
+  }
+  return pids;
+}
+function isCodexAppServerCommandLine(cmdline, platform2 = process.platform) {
+  const s = platform2 === "win32" ? cmdline.toLowerCase() : cmdline;
+  return s.includes("codex") && s.includes("app-server");
+}
+async function cleanupPorts(options) {
+  const platform2 = options.platform ?? process.platform;
+  const listPids = (port) => {
+    try {
+      return parsePids(options.run(portPidsCommand(port, platform2)));
+    } catch {
+      return [];
+    }
+  };
+  for (const { port, envVar } of options.ports) {
+    const pidList = listPids(port);
+    if (pidList.length === 0)
+      continue;
+    const staleCodexPids = [];
+    const foreignPids = [];
+    for (const pid of pidList) {
+      try {
+        const cmdline = options.run(processCommandLineCommand(pid, platform2)).trim();
+        if (isCodexAppServerCommandLine(cmdline, platform2)) {
+          staleCodexPids.push(pid);
+        } else {
+          foreignPids.push(pid);
+        }
+      } catch {}
+    }
+    if (staleCodexPids.length > 0) {
+      options.log(`Cleaning up stale codex app-server on port ${port}: PID(s) ${staleCodexPids.join(", ")}`);
+      for (const pid of staleCodexPids) {
+        try {
+          options.run(killPidCommand(pid, platform2));
+        } catch {}
+      }
+      await options.sleep(500);
+    }
+    if (foreignPids.length > 0) {
+      throw new Error(`Port ${port} is already in use by non-Codex process(es): PID(s) ${foreignPids.join(", ")}. ` + `Please stop the process or set a different port via ${envVar} env var.`);
+    }
+    const remaining = listPids(port);
+    if (remaining.length > 0) {
+      throw new Error(`Port ${port} is still occupied (PID(s): ${remaining.join(", ")}) after cleanup. ` + `Please stop the process or set a different port via ${envVar} env var.`);
+    }
   }
 }
 
@@ -1795,58 +1895,19 @@ class CodexAdapter extends EventEmitter {
     this.pendingServerResponses.clear();
   }
   static buildPortListenLsofCommand(port) {
-    return `lsof -ti tcp:${port} -sTCP:LISTEN`;
+    const { cmd, args } = portPidsCommand(port, "linux");
+    return [cmd, ...args].join(" ");
   }
   async checkPorts() {
-    for (const port of [this.appPort, this.proxyPort]) {
-      try {
-        const pids = execSync(CodexAdapter.buildPortListenLsofCommand(port), {
-          encoding: "utf-8"
-        }).trim();
-        if (!pids)
-          continue;
-        const pidList = pids.split(`
-`).map((p) => p.trim()).filter(Boolean);
-        const staleCodexPids = [];
-        const foreignPids = [];
-        for (const pid of pidList) {
-          try {
-            const cmdline = execSync(`ps -p ${pid} -o args=`, { encoding: "utf-8" }).trim();
-            if (cmdline.includes("codex") && cmdline.includes("app-server")) {
-              staleCodexPids.push(pid);
-            } else {
-              foreignPids.push(pid);
-            }
-          } catch {}
-        }
-        if (staleCodexPids.length > 0) {
-          this.log(`Cleaning up stale codex app-server on port ${port}: PID(s) ${staleCodexPids.join(", ")}`);
-          for (const pid of staleCodexPids) {
-            try {
-              execSync(`kill ${pid}`, { encoding: "utf-8" });
-            } catch {}
-          }
-          await new Promise((r) => setTimeout(r, 500));
-        }
-        if (foreignPids.length > 0) {
-          throw new Error(`Port ${port} is already in use by non-Codex process(es): PID(s) ${foreignPids.join(", ")}. ` + `Please stop the process or set a different port via ${port === this.appPort ? "CODEX_WS_PORT" : "CODEX_PROXY_PORT"} env var.`);
-        }
-        try {
-          const remaining = execSync(CodexAdapter.buildPortListenLsofCommand(port), {
-            encoding: "utf-8"
-          }).trim();
-          if (remaining) {
-            throw new Error(`Port ${port} is still occupied (PID(s): ${remaining.replace(/\n/g, ", ")}) after cleanup. ` + `Please stop the process or set a different port via ${port === this.appPort ? "CODEX_WS_PORT" : "CODEX_PROXY_PORT"} env var.`);
-          }
-        } catch (err) {
-          if (err.message?.includes("Port"))
-            throw err;
-        }
-      } catch (err) {
-        if (err.message?.includes("Port") || err.message?.includes("non-Codex"))
-          throw err;
-      }
-    }
+    await cleanupPorts({
+      ports: [
+        { port: this.appPort, envVar: "CODEX_WS_PORT" },
+        { port: this.proxyPort, envVar: "CODEX_PROXY_PORT" }
+      ],
+      run: ({ cmd, args }) => execFileSync(cmd, args, { encoding: "utf-8" }),
+      log: (message) => this.log(message),
+      sleep: (ms) => new Promise((r) => setTimeout(r, ms))
+    });
   }
   log(msg) {
     this.logger.log(msg);
@@ -2064,7 +2125,7 @@ class TuiConnectionState {
 }
 
 // src/daemon-lifecycle.ts
-import { spawn as spawn2, execFileSync } from "child_process";
+import { spawn as spawn2, execFileSync as execFileSync2 } from "child_process";
 import { existsSync as existsSync3, readFileSync, statSync as statSync2, unlinkSync as unlinkSync2, writeFileSync, openSync, closeSync, constants } from "fs";
 import { fileURLToPath } from "url";
 
@@ -2414,7 +2475,7 @@ class DaemonLifecycle {
   }
   isAgentBridgeProcess(pid) {
     try {
-      const cmd = execFileSync("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf-8" }).trim();
+      const cmd = execFileSync2("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf-8" }).trim();
       return cmd.includes("agentbridge") || cmd.includes("agent_bridge");
     } catch {
       return false;
@@ -2467,7 +2528,7 @@ class DaemonLifecycle {
   }
   isDaemonProcess(pid) {
     try {
-      const cmd = execFileSync("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf-8" }).trim();
+      const cmd = execFileSync2("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf-8" }).trim();
       const hasDaemonEntry = /(?:^|[\s/\\])[\w.-]*-?daemon\.(?:ts|js)(?:\s|$)/.test(cmd);
       const hasAgentbridge = cmd.includes("agentbridge") || cmd.includes("agent_bridge");
       return hasDaemonEntry && hasAgentbridge;
