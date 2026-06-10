@@ -15,12 +15,12 @@
 export const MARKETPLACE_NAME = "agentbridge";
 export const PLUGIN_NAME = "agentbridge";
 
-/** Commands that print an update notice. claude/codex also trigger the daily refresh. */
-const REFRESH_COMMANDS = new Set(["claude", "codex"]);
-const NOTIFY_COMMANDS = new Set(["claude", "codex", "init", "dev"]);
+/** Commands that print an update notice. claude/codex/resume also trigger the daily refresh. */
+const REFRESH_COMMANDS = new Set(["claude", "codex", "resume"]);
+const NOTIFY_COMMANDS = new Set(["claude", "codex", "init", "dev", "resume"]);
 
 /** Subcommands that accept a `--pair <name>` selector. */
-const PAIR_AWARE_COMMANDS = new Set(["claude", "codex", "kill", "doctor", "budget"]);
+const PAIR_AWARE_COMMANDS = new Set(["claude", "codex", "kill", "doctor", "budget", "resume"]);
 
 /**
  * Split argv into the subcommand and its args, allowing a leading `--pair <name>`
@@ -92,6 +92,10 @@ async function main(command: string | undefined, restArgs: string[]) {
       const { runCodex } = await import("./cli/codex");
       await runCodex(restArgs);
       break;
+    case "resume":
+      const { runResume } = await import("./cli/resume");
+      await runResume(restArgs);
+      break;
     case "kill":
       const { runKill } = await import("./cli/kill");
       await runKill(restArgs);
@@ -138,6 +142,10 @@ Commands:
   claude [args...]   Start Claude Code with push channel enabled
   codex [args...]    Start Codex TUI connected to AgentBridge daemon
                      (bare command auto-resumes the last thread; --new starts fresh)
+  resume [claude|codex]
+                     No target: print resume commands for this directory's last
+                     Claude session + this pair's current Codex thread.
+                     With target: resume that side directly.
   pairs [rm <name|id> | prune [--dry-run]]
                      List pairs; remove one (rm), or delete orphan state dirs (prune)
   doctor [--json]    Diagnose env, daemon, build drift, logs, and current thread
@@ -147,10 +155,17 @@ Commands:
                      Stop this directory's pairs (default), every pair (all/--all), or one (--pair)
 
 Options:
-  --pair <name>      Run claude/codex/kill in a named pair. The name is scoped to
+  --pair <name>      Run claude/codex/resume/kill/doctor/budget in a named pair. The name is scoped to
                      the current directory, so the same name in another directory
                      is a separate pair. Goes BEFORE the command. Without it, the
                      pair name defaults to "main" for the current directory.
+  --safe             Disable the max-permission defaults for this launch.
+                     Goes AFTER the command (abg claude --safe); also auto-
+                     suppressed when you pass any explicit permission flag
+                     (-a/--sandbox for codex, --permission-mode for claude).
+                     (abg claude runs with --dangerously-skip-permissions and
+                     abg codex with --yolo by default; AGENTBRIDGE_SAFE=1 also
+                     disables both.)
   --help, -h         Show this help message
   --version, -v      Show version
 
@@ -164,6 +179,10 @@ Examples:
   abg init                     # First-time setup
   abg claude                   # Start the "main" pair for this directory
   abg codex                    # Connect Codex to this directory's "main" pair
+  abg resume                   # Print resume commands for both sides
+  abg resume claude            # Resume the last Claude Code session here
+  abg resume codex             # Resume this pair's current Codex thread
+  abg claude --safe            # One launch without the max-permission default
   abg --pair work claude       # Start a named pair "work" (this directory)
   abg --pair work codex        # Connect Codex to the "work" pair
   abg --pair review claude     # A second, parallel pair

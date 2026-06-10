@@ -7,6 +7,11 @@ import { guardAgentBridgeEnv, normalizeEnvGuardMode } from "../env-guard";
 import { parsePositiveIntEnv } from "../env-utils";
 import { applyPairEnv, parsePairFlag, type PairResolution } from "../pair-resolver";
 import { appendTraceEvent, pickRelevantEnv } from "../trace-log";
+import {
+  CLAUDE_MAX_PERMISSION_SUPPRESSORS,
+  CLAUDE_MAX_PERMISSION_FLAG,
+  planMaxPermissions,
+} from "./max-permissions";
 
 /** Flags that AgentBridge owns and will inject automatically. */
 const OWNED_FLAGS = ["--channels", "--dangerously-load-development-channels"];
@@ -22,7 +27,13 @@ export async function runClaude(args: string[]) {
   });
 
   // Strip `--pair <name>` before anything else; the rest flows through to claude.
-  const { pairFlag, rest } = parsePairFlag(args);
+  const { pairFlag, rest: pairRest } = parsePairFlag(args);
+
+  // Max-permission default (user request): `abg claude` runs Claude Code with
+  // --dangerously-skip-permissions unless --safe / AGENTBRIDGE_SAFE=1 / the
+  // user already passed it. `--safe` is wrapper-owned and stripped here.
+  const permissionPlan = planMaxPermissions(pairRest, CLAUDE_MAX_PERMISSION_SUPPRESSORS);
+  const rest = permissionPlan.args;
 
   // Check for owned flag conflicts (on the real claude args, not the pair flag).
   checkOwnedFlagConflicts(rest, "agentbridge claude", OWNED_FLAGS);
@@ -76,8 +87,12 @@ export async function runClaude(args: string[]) {
   // --channels checks the approved allowlist (Anthropic-curated) and fails
   // for custom plugins. The dev flag bypasses this per-entry.
   // Once published to the official marketplace, switch to --channels.
+  if (permissionPlan.inject) {
+    console.error(`[agentbridge] running with ${CLAUDE_MAX_PERMISSION_FLAG} (default; opt out with --safe or AGENTBRIDGE_SAFE=1)`);
+  }
   const fullArgs = [
     "--dangerously-load-development-channels", channelEntry,
+    ...(permissionPlan.inject ? [CLAUDE_MAX_PERMISSION_FLAG] : []),
     ...rest,
   ];
 

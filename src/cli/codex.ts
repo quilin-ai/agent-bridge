@@ -38,6 +38,11 @@ import {
   isProcessAlive,
 } from "../process-lifecycle";
 import { checkOwnedFlagConflicts } from "./claude";
+import {
+  CODEX_MAX_PERMISSION_SUPPRESSORS,
+  CODEX_MAX_PERMISSION_FLAG,
+  planMaxPermissions,
+} from "./max-permissions";
 
 /**
  * Write a timestamped entry to the codex wrapper log.
@@ -209,9 +214,21 @@ export function resolveCodexResumeArgs(
  *   through unchanged; those do not launch a TUI and must not receive `--remote`.
  * - Unknown first token → treat as a bare prompt (TUI mode). Safer than
  *   silently dropping bridge flags for an unrecognized subcommand.
+ *
+ * `yolo` rides along with the bridge flags (same per-subcommand clap
+ * positioning; `--yolo` is accepted on root and resume/fork — verified on
+ * codex 0.139). Non-TUI subcommands never get it: silently changing the
+ * sandboxing of a manual `abg codex exec …` would be a footgun.
  */
-export function buildCodexArgs(userArgs: string[], proxyUrl: string): BuildArgsResult {
-  const bridgeFlags = ["--enable", "tui_app_server", "--remote", proxyUrl];
+export function buildCodexArgs(
+  userArgs: string[],
+  proxyUrl: string,
+  opts: { yolo?: boolean } = {},
+): BuildArgsResult {
+  const bridgeFlags = [
+    "--enable", "tui_app_server", "--remote", proxyUrl,
+    ...(opts.yolo ? [CODEX_MAX_PERMISSION_FLAG] : []),
+  ];
   const first = userArgs[0];
 
   if (!first || first.startsWith("-")) {
@@ -244,7 +261,12 @@ export async function runCodex(args: string[]) {
 
   // Strip `--pair <name>` first; the rest flows through to codex.
   const { pairFlag, rest } = parsePairFlag(args);
-  const wrapperArgs = parseAgentBridgeCodexArgs(rest);
+
+  // Max-permission default (user request): TUI launches get --yolo unless
+  // --safe / AGENTBRIDGE_SAFE=1 / an explicit alias is already present.
+  // `--safe` is wrapper-owned and stripped here, before codex arg parsing.
+  const permissionPlan = planMaxPermissions(rest, CODEX_MAX_PERMISSION_SUPPRESSORS);
+  const wrapperArgs = parseAgentBridgeCodexArgs(permissionPlan.args);
 
   // AGENTS.md is managed exclusively by `abg init`. Startup never writes or
   // blocks on it — only nudge once on stderr if the contract is missing/stale.
@@ -403,7 +425,12 @@ export async function runCodex(args: string[]) {
     console.error(`[agentbridge] Resuming current Codex thread ${resumeArgs.thread!.threadId}`);
   }
 
-  const { fullArgs } = buildCodexArgs(resumeArgs.rest, proxyUrl);
+  const { fullArgs, injectedBridgeFlags } = buildCodexArgs(resumeArgs.rest, proxyUrl, {
+    yolo: permissionPlan.inject,
+  });
+  if (permissionPlan.inject && injectedBridgeFlags) {
+    console.error(`[agentbridge] running with ${CODEX_MAX_PERMISSION_FLAG} (default; opt out with --safe or AGENTBRIDGE_SAFE=1)`);
+  }
 
   // Capture the last 64KB of child stderr so the "ERROR: ..." line from
   // codex-rs on ExitReason::Fatal survives even when stdio is inherited by

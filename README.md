@@ -155,8 +155,9 @@ After modifying AgentBridge source code, re-run `agentbridge dev` to sync change
 | Command | Description |
 |---------|-------------|
 | `abg init` | Install plugin, check dependencies (bun/claude/codex), generate `.agentbridge/config.json` |
-| `abg claude [args...]` | Start Claude Code with push channel enabled. Clears any killed sentinel from a previous `kill`. Pass-through args are forwarded to `claude` |
-| `abg codex [args...]` | Start Codex TUI connected to AgentBridge daemon. **Bare `abg codex` auto-resumes the pair's last thread; use `abg codex --new` for a fresh thread.** Manages TUI process lifecycle (pid tracking, cleanup). Pass-through args forwarded to `codex` |
+| `abg claude [args...]` | Start Claude Code with push channel enabled. **Runs with `--dangerously-skip-permissions` by default** (opt out: `--safe` or `AGENTBRIDGE_SAFE=1`). Clears any killed sentinel from a previous `kill`. Pass-through args are forwarded to `claude` |
+| `abg codex [args...]` | Start Codex TUI connected to AgentBridge daemon. **Bare `abg codex` auto-resumes the pair's last thread; use `abg codex --new` for a fresh thread. TUI launches run with `--yolo` by default** (opt out: `--safe` or `AGENTBRIDGE_SAFE=1`; non-TUI subcommands like `exec` are never touched). Manages TUI process lifecycle (pid tracking, cleanup). Pass-through args forwarded to `codex` |
+| `abg resume [claude\|codex]` | No target: print the resume commands for this directory's last Claude Code session and this pair's current Codex thread. With a target: resume that side directly (delegates to `abg claude --resume <id>` / `abg codex resume-current`) |
 | `abg pairs` | List registered pairs; `abg pairs rm <name\|id>` removes one, `abg pairs prune` deletes orphan state dirs |
 | `abg doctor [--json]` | Read-only diagnosis: env, daemon health/readiness, build drift, artifact alignment, TUI attachment, logs |
 | `abg budget [--json]` | Both agents' subscription quota snapshot (5h/weekly windows, drift, pause state) |
@@ -165,7 +166,7 @@ After modifying AgentBridge source code, re-run `agentbridge dev` to sync change
 | `abg --help` | Show help |
 | `abg --version` | Show version |
 
-The pair-aware commands (`claude`, `codex`, `kill`, `doctor`, `budget`) accept `--pair <name>` to target a specific pair — one pair per project directory by default, with ports allocated per pair in +10 strides from 4500.
+The pair-aware commands (`claude`, `codex`, `resume`, `kill`, `doctor`, `budget`) accept `--pair <name>` to target a specific pair — one pair per project directory by default, with ports allocated per pair in +10 strides from 4500.
 
 ### Owned flags
 
@@ -173,6 +174,7 @@ Some flags are automatically injected and cannot be manually specified:
 
 - `agentbridge claude` owns: `--channels`, `--dangerously-load-development-channels`
 - `agentbridge codex` owns: `--remote`, `--enable tui_app_server`
+- Both launchers consume the wrapper flag `--safe` (it is never forwarded): it disables the max-permission defaults for that launch. The defaults are also auto-suppressed when you pass any explicit permission flag yourself (`-a`/`--ask-for-approval`/`-s`/`--sandbox` for codex; `--permission-mode`/`--allow-dangerously-skip-permissions` for claude) — injecting `--yolo` next to an explicit approval policy is a hard codex CLI conflict.
 
 Passing these flags manually will result in a hard error with guidance to use the native command directly.
 

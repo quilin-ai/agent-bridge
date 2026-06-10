@@ -325,3 +325,97 @@ describe("CLI: AgentBridge Codex resume args", () => {
     }
   });
 });
+
+describe("CLI: buildCodexArgs --yolo positioning (max-permission default)", () => {
+  const PROXY = "ws://127.0.0.1:4501";
+  const BRIDGE_YOLO = ["--enable", "tui_app_server", "--remote", PROXY, "--yolo"];
+
+  test("bare codex: --yolo rides with the bridge flags at front", () => {
+    const r = buildCodexArgs([], PROXY, { yolo: true });
+    expect(r.fullArgs).toEqual(BRIDGE_YOLO);
+  });
+
+  test("resume subcommand: --yolo lands after 'resume' with the bridge flags", () => {
+    const r = buildCodexArgs(["resume", "thread-1"], PROXY, { yolo: true });
+    expect(r.fullArgs).toEqual(["resume", ...BRIDGE_YOLO, "thread-1"]);
+  });
+
+  test("non-TUI subcommand never gets --yolo (exec sandboxing untouched)", () => {
+    const r = buildCodexArgs(["exec", "ls"], PROXY, { yolo: true });
+    expect(r.fullArgs).toEqual(["exec", "ls"]);
+    expect(r.injectedBridgeFlags).toBe(false);
+  });
+
+  test("yolo:false matches the legacy two-arg shape exactly", () => {
+    const withOpt = buildCodexArgs(["resume", "t"], PROXY, { yolo: false });
+    const legacy = buildCodexArgs(["resume", "t"], PROXY);
+    expect(withOpt).toEqual(legacy);
+  });
+});
+
+describe("CLI: resolveResumeTargets (abg resume)", () => {
+  test("returns both sides' ids from the claude transcript dir and the pair thread state", async () => {
+    const { resolveResumeTargets } = await import("../cli/resume");
+    const { encodeClaudeProjectDir } = await import("../claude-session");
+    const { derivePairId } = await import("../pair-registry");
+
+    const root = mkdtempSync(join(tmpdir(), "abg-resume-targets-"));
+    const previousBase = process.env.AGENTBRIDGE_BASE_DIR;
+    process.env.AGENTBRIDGE_BASE_DIR = join(root, "base");
+    try {
+      const cwd = process.cwd();
+
+      // Claude side: one uuid transcript for this cwd.
+      const claudeHome = join(root, "claude-home");
+      const projectDir = join(claudeHome, "projects", encodeClaudeProjectDir(cwd));
+      mkdirSync(projectDir, { recursive: true });
+      const sessionId = "12345678-1234-1234-1234-123456789abc";
+      writeFileSync(join(projectDir, `${sessionId}.jsonl`), "{}\n");
+
+      // Codex side: a verified current-thread file for the derived "main" pair.
+      const pairId = derivePairId(cwd, "main");
+      const pairDir = join(root, "base", "pairs", pairId);
+      mkdirSync(pairDir, { recursive: true });
+      const rolloutPath = join(root, "rollout.jsonl");
+      writeFileSync(rolloutPath, "{}\n");
+      writeFileSync(
+        join(pairDir, "current-thread.json"),
+        JSON.stringify({
+          version: 1,
+          status: "current",
+          pairId,
+          pairName: "main",
+          cwd,
+          threadId: "thread-resume-test",
+          updatedAt: new Date().toISOString(),
+          rolloutPath,
+        }),
+      );
+
+      const targets = resolveResumeTargets({ claudeHome });
+      expect(targets.claudeSessionId).toBe(sessionId);
+      expect(targets.codexThreadId).toBe("thread-resume-test");
+      expect(targets.pairName).toBe("main");
+    } finally {
+      if (previousBase === undefined) delete process.env.AGENTBRIDGE_BASE_DIR;
+      else process.env.AGENTBRIDGE_BASE_DIR = previousBase;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("returns nulls when nothing exists to resume", async () => {
+    const { resolveResumeTargets } = await import("../cli/resume");
+    const root = mkdtempSync(join(tmpdir(), "abg-resume-empty-"));
+    const previousBase = process.env.AGENTBRIDGE_BASE_DIR;
+    process.env.AGENTBRIDGE_BASE_DIR = join(root, "base");
+    try {
+      const targets = resolveResumeTargets({ claudeHome: join(root, "claude-home") });
+      expect(targets.claudeSessionId).toBeNull();
+      expect(targets.codexThreadId).toBeNull();
+    } finally {
+      if (previousBase === undefined) delete process.env.AGENTBRIDGE_BASE_DIR;
+      else process.env.AGENTBRIDGE_BASE_DIR = previousBase;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});

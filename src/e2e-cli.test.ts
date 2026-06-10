@@ -147,6 +147,9 @@ class CliE2EHarness {
       AGENTBRIDGE_BASE_DIR: undefined,
       AGENTBRIDGE_PAIR_ID: undefined,
       AGENTBRIDGE_PAIR_NAME: undefined,
+      // The persistent max-permission opt-out must not leak in from the
+      // developer's shell — the argv assertions expect the injected defaults.
+      AGENTBRIDGE_SAFE: undefined,
       AGENTBRIDGE_MANUAL: "1",
       AGENTBRIDGE_STATE_DIR: stateDir,
       AGENTBRIDGE_CONTROL_PORT: String(controlPort),
@@ -432,6 +435,8 @@ describe("E2E: CLI surface", () => {
       expect(invocations[0]?.args).toEqual([
         "--dangerously-load-development-channels",
         "plugin:agentbridge@agentbridge",
+        // Max-permission default (opt out: --safe / AGENTBRIDGE_SAFE=1).
+        "--dangerously-skip-permissions",
         "--resume",
       ]);
     });
@@ -479,6 +484,8 @@ describe("E2E: CLI surface", () => {
         "tui_app_server",
         "--remote",
         `ws://127.0.0.1:${harness.proxyPort}`,
+        // Max-permission default (opt out: --safe / AGENTBRIDGE_SAFE=1).
+        "--yolo",
         "--model",
         "o3",
       ]);
@@ -522,6 +529,8 @@ describe("E2E: CLI surface", () => {
         "tui_app_server",
         "--remote",
         `ws://127.0.0.1:${harness.proxyPort}`,
+        // Max-permission default (opt out: --safe / AGENTBRIDGE_SAFE=1).
+        "--yolo",
         "--profile",
         "default",
       ]);
