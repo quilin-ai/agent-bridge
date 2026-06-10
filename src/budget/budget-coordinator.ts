@@ -211,6 +211,23 @@ export class BudgetCoordinator {
       return;
     }
 
+    // Drift/parallel advice compares the two sides — against a non-decision-
+    // grade record the comparison is a phantom. Observed live: a transient
+    // empty Claude probe record (gate=0%, no windows) inflated drift 54%→58%
+    // and emitted a directive on each side of the blip. Hold the previous
+    // directive state and KEEP the fingerprint — whether the phantom inflated
+    // drift (directive present) or deflated it away (directive null), the
+    // recovery to the same real state must re-emit nothing. This sits BEFORE
+    // the null-directive branch so a blip cannot reset the fingerprint.
+    // (Pause entry/exit above has its own decision-grade guards in
+    // shouldEnter/canAgentResume.)
+    if (
+      !isDecisionGrade(state.perAgent.claude, state.now) ||
+      !isDecisionGrade(state.perAgent.codex, state.now)
+    ) {
+      return;
+    }
+
     if (!state.directiveToClaude) {
       this.lastDirectiveFingerprint = null;
       return;

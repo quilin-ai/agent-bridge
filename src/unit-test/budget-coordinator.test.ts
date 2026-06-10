@@ -125,6 +125,64 @@ describe("BudgetCoordinator", () => {
     expect(emitted[0].content).toContain("用量比例漂移");
   });
 
+  test("holds balance directive across a non-decision-grade blip (observed live: phantom 0% record flipped the heavier side)", async () => {
+    // A transient empty probe record (gate=0, no windows) must not flap the
+    // balance directive: during the blip the heavier side flips to a phantom,
+    // and on recovery the unchanged real state must re-emit nothing.
+    const drifted = {
+      claude: usage({ gateUtil: 35, warnUtil: 45 }),
+      codex: usage({ gateUtil: 20, warnUtil: 20 }),
+    };
+    const source = new FakeSource([
+      drifted,
+      {
+        claude: usage({ gateUtil: 0, warnUtil: 0, fiveHour: null, weekly: null }),
+        codex: usage({ gateUtil: 20, warnUtil: 20 }),
+      },
+      drifted,
+    ]);
+    const { coordinator, emitted } = makeCoordinator(source);
+
+    await coordinator.start();
+    await waitFor(() => source.calls >= 3);
+    coordinator.stop();
+
+    expect(
+      emitted.filter((event) => event.id.startsWith("system_budget_balance") || event.id.startsWith("system_budget_parallel")),
+    ).toHaveLength(1);
+  });
+
+  test("a blip that deflates drift below threshold must not reset the dedup fingerprint", async () => {
+    // Ordering regression guard: the decision-grade hold must run BEFORE the
+    // null-directive branch — a phantom that makes the drift directive
+    // disappear would otherwise clear the fingerprint and re-emit the same
+    // directive when the data recovers.
+    // Note the gate condition is the blip's fiveHour/weekly being null (no
+    // fresh window → not decision-grade), NOT the drift magnitude — a blip
+    // with valid windows would legitimately update the directive.
+    const drifted = {
+      claude: usage({ gateUtil: 15, warnUtil: 15 }),
+      codex: usage({ gateUtil: 2, warnUtil: 2 }),
+    };
+    const source = new FakeSource([
+      drifted,
+      {
+        claude: usage({ gateUtil: 0, warnUtil: 0, fiveHour: null, weekly: null }),
+        codex: usage({ gateUtil: 2, warnUtil: 2 }),
+      },
+      drifted,
+    ]);
+    const { coordinator, emitted } = makeCoordinator(source);
+
+    await coordinator.start();
+    await waitFor(() => source.calls >= 3);
+    coordinator.stop();
+
+    expect(
+      emitted.filter((event) => event.id.startsWith("system_budget_balance") || event.id.startsWith("system_budget_parallel")),
+    ).toHaveLength(1);
+  });
+
   test("does not re-emit balance directive on probe reset-epoch jitter (observed live: ±1s per poll)", async () => {
     // The probe's reset_epoch wobbles by a second between polls. A raw epoch
     // in the directive fingerprint re-emitted the same balance directive

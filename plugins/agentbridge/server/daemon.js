@@ -15,7 +15,7 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.6", "0.0.0-source"),
-  commit: defineString("72d5902", "source"),
+  commit: defineString("18adc83", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, 1)
 });
@@ -3062,6 +3062,9 @@ class BudgetCoordinator {
       this.lastDirectiveFingerprint = null;
       this.onPauseChange(false);
       this.emitDirective(this.recoveryPrefix(previousSide), this.recoveryDirective(state, previousSide));
+      return;
+    }
+    if (!isDecisionGrade(state.perAgent.claude, state.now) || !isDecisionGrade(state.perAgent.codex, state.now)) {
       return;
     }
     if (!state.directiveToClaude) {
