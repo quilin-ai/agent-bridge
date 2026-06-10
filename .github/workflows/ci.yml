@@ -7,8 +7,26 @@ on:
     branches: [master]
 
 jobs:
+  # AgentBridge's PRIMARY real runtime is macOS (default state dir is
+  # ~/Library/Application Support/AgentBridge — see CLAUDE.md). Platform-sensitive
+  # surfaces — state-dir resolution, `ps`-output column matching, SIGTERM/SIGKILL
+  # process-group semantics, and Bun.serve socket behavior (prior permessage-deflate
+  # platform bug) — were previously validated ONLY on ubuntu, a platform no
+  # maintainer runs. This matrix runs the IDENTICAL full gate on both OSes so macOS
+  # regressions are caught in CI, not by accident on a dev machine.
+  #
+  # Cost/coverage trade-off: macOS runners bill ~10x ubuntu minutes, but the full
+  # suite is ~60s (743 tests + trivial smokes), so running the whole gate on every
+  # PR + push is cheap enough to justify against the alternative of macOS bugs
+  # escaping CI entirely. Both legs run the same steps/commands; only `runs-on`
+  # differs. `fail-fast: false` so a macOS-only failure doesn't mask the ubuntu
+  # result (and vice versa).
   check:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
 
     steps:
       - uses: actions/checkout@v4
