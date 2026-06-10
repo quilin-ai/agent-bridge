@@ -1,6 +1,9 @@
 #!/usr/bin/env bun
 // @bun
 
+// src/contract-version.ts
+var CONTRACT_VERSION = 1;
+
 // src/build-info.ts
 function defineString(value, fallback) {
   return typeof value === "string" && value.length > 0 ? value : fallback;
@@ -17,7 +20,7 @@ var BUILD_INFO = Object.freeze({
   version: defineString("0.1.6", "0.0.0-source"),
   commit: defineString("e3322d0", "source"),
   bundle: defineBundle("plugin"),
-  contractVersion: defineNumber(1, 1)
+  contractVersion: defineNumber(1, CONTRACT_VERSION)
 });
 function daemonStatusBuildInfo() {
   return { ...BUILD_INFO };
