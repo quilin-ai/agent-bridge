@@ -342,6 +342,9 @@ export class BudgetCoordinator {
       // not floor — because real reset times sit ON round boundaries, so a
       // floor bucket edge would keep flapping. A genuine window reset jumps
       // hours and still lands in a different bucket.
+      // Domain assumption: jitter tolerance holds because reset epochs sit
+      // near bucket-aligned times. An ARBITRARY epoch at a half-bucket point
+      // (k*600+300) would still flap under ±1s — not a shape the probe emits.
       Math.round(reset / RESET_FINGERPRINT_BUCKET_SEC),
     ].join("|");
   }
