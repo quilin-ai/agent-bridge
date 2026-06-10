@@ -26,6 +26,8 @@ export interface QuotaSourceOptions {
   timeoutMs?: number;
   runner?: ProbeRunner;
   log?: (message: string) => void;
+  /** Unix-seconds clock, injectable for tests (degradation freshness checks). */
+  now?: () => number;
 }
 
 interface ProbeCandidate {
@@ -128,7 +130,12 @@ function normalizeTopLevelBucket(record: Record<string, unknown>, util: number, 
   if (resetEpoch <= 0 && resetAfter !== null && fetchedAt > 0) {
     resetEpoch = fetchedAt + resetAfter;
   }
-  if (resetEpoch <= 0 && resetAfter === null) return null;
+  // Unknown reset (claude's non-resettable bucket shape emits reset_epoch:null,
+  // see agent-bridge#103) is still a DISPLAYABLE reading: keep the window with
+  // resetEpoch=0 — render shows 重置 未知, and isDecisionGrade() rejects it for
+  // interventions (no fresh window), so the degraded record is display-only.
+  // The information floor against fabricated readings lives in the caller: a
+  // record with no actual util field never reaches this point.
   return {
     id: "top_level",
     util: clamp(util, 0, 100),
@@ -193,13 +200,19 @@ export function normalizeProbeResult(raw: unknown): AgentUsage | null {
   if (!record) return null;
 
   const fetchedAt = numberOr(record.fetched_at ?? record.fetchedAt ?? record.now_epoch ?? record.nowEpoch, 0);
+  // Information floor: a record that carries no actual util reading at all
+  // (e.g. a transient `{ok:true}` shell) must stay a probe miss — its
+  // defaulted 0% would be a fabricated reading, not a degraded one.
+  const hasFiniteUtil =
+    asFiniteNumber(record.util ?? record.hard_util ?? record.hardUtil) !== null ||
+    asFiniteNumber(record.warn_util ?? record.warnUtil) !== null;
   const gateUtil = clamp(numberOr(record.util ?? record.hard_util ?? record.hardUtil, 0), 0, 100);
   const warnUtil = clamp(numberOr(record.warn_util ?? record.warnUtil, gateUtil), 0, 100);
   const rawBuckets = Array.isArray(record.buckets) ? record.buckets : [];
   const buckets = rawBuckets
     .map((bucket) => normalizeBucket(bucket, fetchedAt))
     .filter((bucket): bucket is RawBucket => bucket !== null);
-  if (buckets.length === 0) {
+  if (buckets.length === 0 && hasFiniteUtil) {
     const topLevelBucket = normalizeTopLevelBucket(record, gateUtil, fetchedAt);
     if (topLevelBucket) buckets.push(topLevelBucket);
   }
@@ -212,9 +225,12 @@ export function normalizeProbeResult(raw: unknown): AgentUsage | null {
   if (!ok && rateLimitedUntil <= 0 && buckets.length === 0) return null;
 
   const { fiveHour, weekly } = identifyWindows(buckets);
-  // A successful response with no resettable windows is not actionable budget
-  // data. Treat it like a transient probe miss instead of trusting fake 0% util.
-  if (!fiveHour && !weekly && rateLimitedUntil === 0) return null;
+  // Truly unusable = no windows, no rate-limit gate AND no actual util
+  // reading. Degraded-but-usable records (stale cache during a 429 gate,
+  // unknown-reset buckets) flow through for DISPLAY — the decision layer
+  // (isDecisionGrade) independently rejects anything without a fresh window,
+  // so accepting them here cannot flip interventions. (agent-bridge#103)
+  if (!fiveHour && !weekly && rateLimitedUntil === 0 && !hasFiniteUtil) return null;
 
   return {
     ok,
@@ -239,12 +255,29 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
   });
 }
 
+/**
+ * Is this usage record degraded (usable for display, not for decisions)?
+ * Freshness uses `resetEpoch > now` — the same standard as isDecisionGrade —
+ * so an expired-window record cannot log a premature "recovered" transition.
+ */
+export function isDegradedUsage(usage: AgentUsage, now: number = Math.floor(Date.now() / 1000)): boolean {
+  if (usage.stale || !usage.ok) return true;
+  const hasFreshWindow =
+    (usage.fiveHour !== null && usage.fiveHour.resetEpoch > now) ||
+    (usage.weekly !== null && usage.weekly.resetEpoch > now);
+  return !hasFreshWindow;
+}
+
 export class QuotaSource {
   private readonly env: Record<string, string | undefined>;
   private readonly homeDir: string;
   private readonly timeoutMs: number;
   private readonly runner: ProbeRunner;
   private readonly log: (message: string) => void;
+  private readonly now: () => number;
+  /** Last degraded-state per agent — degradation is logged on TRANSITIONS only
+   *  (a stale period spans many 60s polls; per-poll lines are log spam). */
+  private readonly degradedLogged = new Map<AgentName, boolean>();
 
   constructor(options: QuotaSourceOptions = {}) {
     this.env = options.env ?? process.env;
@@ -252,6 +285,7 @@ export class QuotaSource {
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     this.runner = options.runner ?? defaultRunner;
     this.log = options.log ?? (() => {});
+    this.now = options.now ?? (() => Math.floor(Date.now() / 1000));
   }
 
   async fetchBoth(): Promise<{ claude: AgentUsage | null; codex: AgentUsage | null } | null> {
@@ -304,14 +338,44 @@ export class QuotaSource {
         );
         const text = String(result.stdout).trim();
         if (!text) continue;
-        const usage = normalizeProbeResult(JSON.parse(text));
-        if (usage) return usage;
-        this.log(`budget probe returned no usable data for ${agent}: ${candidate.command}`);
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(text);
+        } catch {
+          // Unparseable output gets the same triage snippet as unusable data —
+          // the outer catch only sees the parse error message otherwise.
+          this.log(`budget probe output unparseable for ${agent}: ${candidate.command} — raw: ${text.slice(0, 200)}`);
+          continue;
+        }
+        const usage = normalizeProbeResult(parsed);
+        if (usage) {
+          this.noteDegradation(agent, usage);
+          return usage;
+        }
+        // Genuinely unusable (no windows, no rate-limit gate, no util reading)
+        // — include a raw snippet so the next triage doesn't have to guess
+        // which output shape the daemon actually saw. Degraded-but-usable
+        // records no longer land here; they return above. (agent-bridge#103)
+        this.log(
+          `budget probe returned no usable data for ${agent}: ${candidate.command} — raw: ${text.slice(0, 200)}`,
+        );
       } catch (error) {
         this.log(`budget probe failed for ${agent}: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
     return null;
+  }
+
+  private noteDegradation(agent: AgentName, usage: AgentUsage): void {
+    const degraded = isDegradedUsage(usage, this.now());
+    const wasDegraded = this.degradedLogged.get(agent) === true;
+    if (degraded && !wasDegraded) {
+      const gate = usage.rateLimitedUntil > 0 ? `, rate-limit gated until ${usage.rateLimitedUntil}` : "";
+      this.log(`budget probe degraded data accepted for ${agent} (stale=${usage.stale}, ok=${usage.ok}${gate}) — display only, decisions hold`);
+    } else if (!degraded && wasDegraded) {
+      this.log(`budget probe recovered to fresh data for ${agent}`);
+    }
+    this.degradedLogged.set(agent, degraded);
   }
 }
 

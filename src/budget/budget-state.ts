@@ -204,15 +204,21 @@ function parallelDirective(
   ].join("\n");
 }
 
-function codexTierFor(codex: AgentUsage | null): CodexTier {
-  if (!codex) return "full";
+// Tier/advice are decision OUTPUTS (they queue turn overrides and inject
+// advice), so they require decision-grade data exactly like pause/advice
+// directives — a degraded display-only record (stale cache, unknown-reset
+// window, see agent-bridge#103) must not flip the Codex tier. Non-decision-
+// grade falls back to the same outputs a probe miss produces.
+function codexTierFor(codex: AgentUsage | null, now: number): CodexTier {
+  if (!codex || !isDecisionGrade(codex, now)) return "full";
   if (codex.warnUtil >= CODEX_ECO_WARN_UTIL) return "eco";
   if (codex.warnUtil >= CODEX_BALANCED_WARN_UTIL) return "balanced";
   return "full";
 }
 
-function claudeAdviceFor(claude: AgentUsage | null): string | null {
-  if (!claude || claude.warnUtil < CLAUDE_ADVICE_WARN_UTIL) return null;
+function claudeAdviceFor(claude: AgentUsage | null, now: number): string | null {
+  if (!claude || !isDecisionGrade(claude, now)) return null;
+  if (claude.warnUtil < CLAUDE_ADVICE_WARN_UTIL) return null;
   return `Claude warnUtil ${pct(claude.warnUtil)} 已偏高；后续可拆分 subagent 建议降档到 haiku/sonnet，并保留高难度主线给当前会话。`;
 }
 
@@ -276,7 +282,7 @@ export function computeBudgetState(
       resetEpochs,
     },
     parallel,
-    effort: { claudeAdvice: claudeAdviceFor(claude), codexTier: codexTierFor(codex) },
+    effort: { claudeAdvice: claudeAdviceFor(claude, now), codexTier: codexTierFor(codex, now) },
     directiveToClaude,
   };
 }

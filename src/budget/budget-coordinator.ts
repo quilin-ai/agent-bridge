@@ -409,7 +409,12 @@ export class BudgetCoordinator {
     return (["claude", "codex"] as const).some((agent) => {
       if (!this.activeSides.has(agent)) return false;
       const usage = state.perAgent[agent];
-      return usage === null || usage.rateLimitedUntil > state.now;
+      // Non-decision-grade covers every degraded shape (#103 lets stale /
+      // unknown-reset records through as display data): mid-pause they must
+      // hold the directive fingerprint, not recompute it against a phantom
+      // reset bucket — recomputing re-emitted the pause directive on each
+      // data-quality flap, the exact regression e7a66fc guarded against.
+      return usage === null || usage.rateLimitedUntil > state.now || !isDecisionGrade(usage, state.now);
     });
   }
 

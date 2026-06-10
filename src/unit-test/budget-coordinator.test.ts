@@ -211,6 +211,68 @@ describe("BudgetCoordinator", () => {
     expect(emitted.filter((event) => event.id.startsWith("system_budget_balance"))).toHaveLength(1);
   });
 
+  test("degraded display-only record must not queue a codex tier override (#103)", async () => {
+    // warnUtil 85 would select "eco" — but the record's only window has an
+    // unknown reset (resetEpoch 0, the #103 degraded shape), so the tier
+    // decision must fall back to "full" / no override, exactly like a probe
+    // miss. Display-layer acceptance must never reach the override queue.
+    const tierConfig = { ...CONFIG, codexTierControl: true };
+
+    // Positive control first: the same warnUtil on DECISION-GRADE data does
+    // queue the eco override — proving the mechanism is live, so the degraded
+    // case below blocks specifically on data quality, not on configuration.
+    const freshSource = new FakeSource([
+      { claude: usage(), codex: usage({ gateUtil: 85, warnUtil: 85 }) },
+    ]);
+    const fresh = makeCoordinator(freshSource, tierConfig);
+    await fresh.coordinator.start();
+    await waitFor(() => freshSource.calls >= 1);
+    fresh.coordinator.stop();
+    expect(fresh.coordinator.getCodexTurnOverrides()).toEqual({ effort: "low" });
+
+    const source = new FakeSource([
+      {
+        claude: usage(),
+        codex: usage({ gateUtil: 85, warnUtil: 85, stale: true, fiveHour: { util: 85, resetEpoch: 0 }, weekly: null }),
+      },
+    ]);
+    const { coordinator } = makeCoordinator(source, tierConfig);
+
+    await coordinator.start();
+    await waitFor(() => source.calls >= 1);
+    coordinator.stop();
+
+    expect(coordinator.getCodexTurnOverrides()).toBeNull();
+    expect(coordinator.getSnapshot()?.codexTier).toBe("full");
+  });
+
+  test("mid-pause degraded record holds the pause directive fingerprint (#103)", async () => {
+    // Pause entered on decision-grade data; the next poll returns a degraded
+    // stale windowless record WITHOUT a rate-limit gate (the shape that
+    // previously normalized to null and was held by the probe-uncertain
+    // check). It must still hold — not recompute the fingerprint against a
+    // phantom reset bucket and re-emit the pause directive.
+    const source = new FakeSource([
+      { claude: usage(), codex: usage({ gateUtil: 91, warnUtil: 91, remaining: 9 }) },
+      {
+        claude: usage(),
+        codex: usage({ gateUtil: 0, warnUtil: 0, stale: true, fiveHour: { util: 0, resetEpoch: 0 }, weekly: null }),
+      },
+      {
+        claude: usage(),
+        codex: usage({ gateUtil: 0, warnUtil: 0, stale: true, fiveHour: { util: 0, resetEpoch: 0 }, weekly: null }),
+      },
+    ]);
+    const { coordinator, emitted } = makeCoordinator(source);
+
+    await coordinator.start();
+    await waitFor(() => source.calls >= 3);
+    coordinator.stop();
+
+    expect(coordinator.isPaused()).toBe(true);
+    expect(emitted.filter((event) => event.id.startsWith("system_budget_pause"))).toHaveLength(1);
+  });
+
   test("re-emits balance directive when the lighter side enters a new five-hour window", async () => {
     const source = new FakeSource([
       {

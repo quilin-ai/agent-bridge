@@ -18,7 +18,7 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.6", "0.0.0-source"),
-  commit: defineString("1650804", "source"),
+  commit: defineString("7f27707", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION)
 });
@@ -2910,8 +2910,8 @@ function parallelDirective(claude, codex, parallel) {
   ].join(`
 `);
 }
-function codexTierFor(codex) {
-  if (!codex)
+function codexTierFor(codex, now) {
+  if (!codex || !isDecisionGrade(codex, now))
     return "full";
   if (codex.warnUtil >= CODEX_ECO_WARN_UTIL)
     return "eco";
@@ -2919,8 +2919,10 @@ function codexTierFor(codex) {
     return "balanced";
   return "full";
 }
-function claudeAdviceFor(claude) {
-  if (!claude || claude.warnUtil < CLAUDE_ADVICE_WARN_UTIL)
+function claudeAdviceFor(claude, now) {
+  if (!claude || !isDecisionGrade(claude, now))
+    return null;
+  if (claude.warnUtil < CLAUDE_ADVICE_WARN_UTIL)
     return null;
   return `Claude warnUtil ${pct(claude.warnUtil)} \u5DF2\u504F\u9AD8\uFF1B\u540E\u7EED\u53EF\u62C6\u5206 subagent \u5EFA\u8BAE\u964D\u6863\u5230 haiku/sonnet\uFF0C\u5E76\u4FDD\u7559\u9AD8\u96BE\u5EA6\u4E3B\u7EBF\u7ED9\u5F53\u524D\u4F1A\u8BDD\u3002`;
 }
@@ -2967,7 +2969,7 @@ function computeBudgetState(claude, codex, cfg, now) {
       resetEpochs
     },
     parallel,
-    effort: { claudeAdvice: claudeAdviceFor(claude), codexTier: codexTierFor(codex) },
+    effort: { claudeAdvice: claudeAdviceFor(claude, now), codexTier: codexTierFor(codex, now) },
     directiveToClaude
   };
 }
@@ -3268,7 +3270,7 @@ class BudgetCoordinator {
       if (!this.activeSides.has(agent))
         return false;
       const usage = state.perAgent[agent];
-      return usage === null || usage.rateLimitedUntil > state.now;
+      return usage === null || usage.rateLimitedUntil > state.now || !isDecisionGrade(usage, state.now);
     });
   }
   activeSideReason(agent, usage, now) {
@@ -3407,8 +3409,6 @@ function normalizeTopLevelBucket(record, util, fetchedAt) {
   if (resetEpoch <= 0 && resetAfter !== null && fetchedAt > 0) {
     resetEpoch = fetchedAt + resetAfter;
   }
-  if (resetEpoch <= 0 && resetAfter === null)
-    return null;
   return {
     id: "top_level",
     util: clamp(util, 0, 100),
@@ -3462,11 +3462,12 @@ function normalizeProbeResult(raw) {
   if (!record)
     return null;
   const fetchedAt = numberOr(record.fetched_at ?? record.fetchedAt ?? record.now_epoch ?? record.nowEpoch, 0);
+  const hasFiniteUtil = asFiniteNumber(record.util ?? record.hard_util ?? record.hardUtil) !== null || asFiniteNumber(record.warn_util ?? record.warnUtil) !== null;
   const gateUtil = clamp(numberOr(record.util ?? record.hard_util ?? record.hardUtil, 0), 0, 100);
   const warnUtil = clamp(numberOr(record.warn_util ?? record.warnUtil, gateUtil), 0, 100);
   const rawBuckets = Array.isArray(record.buckets) ? record.buckets : [];
   const buckets = rawBuckets.map((bucket) => normalizeBucket(bucket, fetchedAt)).filter((bucket) => bucket !== null);
-  if (buckets.length === 0) {
+  if (buckets.length === 0 && hasFiniteUtil) {
     const topLevelBucket = normalizeTopLevelBucket(record, gateUtil, fetchedAt);
     if (topLevelBucket)
       buckets.push(topLevelBucket);
@@ -3476,7 +3477,7 @@ function normalizeProbeResult(raw) {
   if (!ok && rateLimitedUntil <= 0 && buckets.length === 0)
     return null;
   const { fiveHour, weekly } = identifyWindows(buckets);
-  if (!fiveHour && !weekly && rateLimitedUntil === 0)
+  if (!fiveHour && !weekly && rateLimitedUntil === 0 && !hasFiniteUtil)
     return null;
   return {
     ok,
@@ -3500,6 +3501,12 @@ function withTimeout(promise, timeoutMs) {
       clearTimeout(timer);
   });
 }
+function isDegradedUsage(usage, now = Math.floor(Date.now() / 1000)) {
+  if (usage.stale || !usage.ok)
+    return true;
+  const hasFreshWindow = usage.fiveHour !== null && usage.fiveHour.resetEpoch > now || usage.weekly !== null && usage.weekly.resetEpoch > now;
+  return !hasFreshWindow;
+}
 
 class QuotaSource {
   env;
@@ -3507,12 +3514,15 @@ class QuotaSource {
   timeoutMs;
   runner;
   log;
+  now;
+  degradedLogged = new Map;
   constructor(options = {}) {
     this.env = options.env ?? process.env;
     this.homeDir = options.homeDir ?? homedir2();
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     this.runner = options.runner ?? defaultRunner;
     this.log = options.log ?? (() => {});
+    this.now = options.now ?? (() => Math.floor(Date.now() / 1000));
   }
   async fetchBoth() {
     const candidates = this.findProbeCandidates();
@@ -3560,15 +3570,35 @@ class QuotaSource {
         const text = String(result.stdout).trim();
         if (!text)
           continue;
-        const usage = normalizeProbeResult(JSON.parse(text));
-        if (usage)
+        let parsed;
+        try {
+          parsed = JSON.parse(text);
+        } catch {
+          this.log(`budget probe output unparseable for ${agent}: ${candidate.command} \u2014 raw: ${text.slice(0, 200)}`);
+          continue;
+        }
+        const usage = normalizeProbeResult(parsed);
+        if (usage) {
+          this.noteDegradation(agent, usage);
           return usage;
-        this.log(`budget probe returned no usable data for ${agent}: ${candidate.command}`);
+        }
+        this.log(`budget probe returned no usable data for ${agent}: ${candidate.command} \u2014 raw: ${text.slice(0, 200)}`);
       } catch (error) {
         this.log(`budget probe failed for ${agent}: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
     return null;
+  }
+  noteDegradation(agent, usage) {
+    const degraded = isDegradedUsage(usage, this.now());
+    const wasDegraded = this.degradedLogged.get(agent) === true;
+    if (degraded && !wasDegraded) {
+      const gate = usage.rateLimitedUntil > 0 ? `, rate-limit gated until ${usage.rateLimitedUntil}` : "";
+      this.log(`budget probe degraded data accepted for ${agent} (stale=${usage.stale}, ok=${usage.ok}${gate}) \u2014 display only, decisions hold`);
+    } else if (!degraded && wasDegraded) {
+      this.log(`budget probe recovered to fresh data for ${agent}`);
+    }
+    this.degradedLogged.set(agent, degraded);
   }
 }
 function createQuotaSource(options) {

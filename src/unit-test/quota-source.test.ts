@@ -2,7 +2,8 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { QuotaSource, normalizeProbeResult } from "../budget/quota-source";
+import { QuotaSource, isDegradedUsage, normalizeProbeResult } from "../budget/quota-source";
+import { isDecisionGrade } from "../budget/budget-state";
 
 const NOW = 1_700_000_000;
 
@@ -64,19 +65,66 @@ describe("quota-source normalization", () => {
     expect(usage).not.toBeNull();
     expect(usage!.ok).toBe(false);
     expect(usage!.gateUtil).toBe(0);
-    expect(usage!.fiveHour).toBeNull();
+    // util:0 is an actual (finite) reading — it surfaces as a display-only
+    // window with unknown reset (resetEpoch 0 is rejected by isDecisionGrade).
+    expect(usage!.fiveHour).toEqual({ util: 0, resetEpoch: 0 });
     expect(usage!.weekly).toBeNull();
     expect(usage!.rateLimitedUntil).toBe(NOW + 900);
   });
 
-  test("returns null for empty successful probe responses with no windows or rate limit", () => {
-    expect(normalizeProbeResult({
+  test("accepts windowless util readings as display-only degraded data (#103)", () => {
+    // Layered consumption: the display layer accepts any finite util reading;
+    // the decision layer (isDecisionGrade) independently rejects records
+    // without a fresh window, so this cannot flip interventions.
+    const usage = normalizeProbeResult({
       ok: true,
       util: 0,
       warn_util: 0,
       fetched_at: NOW,
       buckets: [],
+    });
+    expect(usage).not.toBeNull();
+    expect(usage!.fiveHour).toEqual({ util: 0, resetEpoch: 0 });
+    expect(isDecisionGrade(usage, NOW)).toBe(false);
+  });
+
+  test("returns null when the record carries no util reading at all (information floor)", () => {
+    expect(normalizeProbeResult({
+      ok: true,
+      fetched_at: NOW,
+      buckets: [],
     })).toBeNull();
+  });
+
+  test("keeps reset_epoch:null buckets as unknown-reset windows (#103)", () => {
+    const usage = normalizeProbeResult({
+      ok: true,
+      util: 55,
+      warn_util: 55,
+      fetched_at: NOW,
+      buckets: [{ id: "seven_day", util: 55, reset_epoch: null }],
+    });
+    expect(usage).not.toBeNull();
+    expect(usage!.weekly).toEqual({ util: 55, resetEpoch: 0 });
+    expect(isDecisionGrade(usage, NOW)).toBe(false);
+  });
+
+  test("accepts the live 429-gate stale cache shape from agent-bridge#103", () => {
+    const usage = normalizeProbeResult({
+      ok: true,
+      agent: "claude",
+      util: 0,
+      warn_util: 0,
+      hard_util: 0,
+      source: "cache",
+      stale: true,
+      fetched_at: NOW - 120,
+      rate_limited_until: NOW + 300,
+    });
+    expect(usage).not.toBeNull();
+    expect(usage!.stale).toBe(true);
+    expect(usage!.rateLimitedUntil).toBe(NOW + 300);
+    expect(isDegradedUsage(usage!, NOW)).toBe(true);
   });
 
   test("keeps cache fallback results when bucket windows are still present", () => {
@@ -191,6 +239,85 @@ describe("QuotaSource", () => {
       { command: "/tmp/fake-budget-probe", args: ["--agent", "claude"] },
       { command: "/tmp/fake-budget-probe", args: ["--agent", "codex"] },
     ]);
+  });
+
+  test("unusable probe output is logged with a raw snippet for triage (#103)", async () => {
+    const logs: string[] = [];
+    const source = new QuotaSource({
+      env: { AGENTBRIDGE_QUOTA_PROBE: "/tmp/fake-budget-probe" },
+      homeDir: "/unused",
+      log: (m) => logs.push(m),
+      runner: async () => ({
+        stdout: JSON.stringify({ ok: true, source: "cache", note: "no util fields at all" }),
+      }),
+    });
+
+    await source.fetchBoth();
+    const line = logs.find((l) => l.includes("no usable data"));
+    expect(line).toBeDefined();
+    expect(line).toContain("raw: ");
+    expect(line).toContain("no util fields at all");
+  });
+
+  test("unparseable probe output is logged with a raw snippet (#103 MEDIUM)", async () => {
+    const logs: string[] = [];
+    const source = new QuotaSource({
+      env: { AGENTBRIDGE_QUOTA_PROBE: "/tmp/fake-budget-probe" },
+      homeDir: "/unused",
+      log: (m) => logs.push(m),
+      runner: async () => ({ stdout: "Error: keychain locked\npartial{json" }),
+    });
+
+    await source.fetchBoth();
+    const line = logs.find((l) => l.includes("unparseable"));
+    expect(line).toBeDefined();
+    expect(line).toContain("raw: Error: keychain locked");
+  });
+
+  test("expired-window records stay degraded — no premature recovery log", () => {
+    const expired = normalizeProbeResult({
+      ok: true,
+      util: 30,
+      warn_util: 30,
+      fetched_at: NOW,
+      buckets: [{ id: "five_hour", util: 30, reset_epoch: NOW - 100 }],
+    });
+    expect(expired).not.toBeNull();
+    // resetEpoch > 0 but in the past: fresh by the OLD (>0) standard, degraded
+    // by the isDecisionGrade-aligned (>now) standard.
+    expect(isDegradedUsage(expired!, NOW)).toBe(true);
+  });
+
+  test("degraded acceptance is logged on transitions only, with recovery (#103)", async () => {
+    const logs: string[] = [];
+    let stale = true;
+    const source = new QuotaSource({
+      env: { AGENTBRIDGE_QUOTA_PROBE: "/tmp/fake-budget-probe" },
+      homeDir: "/unused",
+      log: (m) => logs.push(m),
+      now: () => NOW,
+      runner: async () => ({
+        stdout: JSON.stringify({
+          ok: true,
+          util: 30,
+          warn_util: 30,
+          stale,
+          fetched_at: NOW,
+          buckets: [{ id: "five_hour", util: 30, reset_epoch: NOW + 3600 }],
+        }),
+      }),
+    });
+
+    await source.fetchBoth(); // degraded (stale) — logs once per agent
+    await source.fetchBoth(); // still degraded — no new logs
+    const degradedLines = logs.filter((l) => l.includes("degraded data accepted"));
+    expect(degradedLines.length).toBe(2); // one per agent (claude + codex)
+
+    stale = false;
+    await source.fetchBoth(); // recovery — logs once per agent
+    const recoveredLines = logs.filter((l) => l.includes("recovered to fresh data"));
+    expect(recoveredLines.length).toBe(2);
+    expect(logs.filter((l) => l.includes("degraded data accepted")).length).toBe(2);
   });
 
   test("uses installed budget-probe when env probes are unset", async () => {
