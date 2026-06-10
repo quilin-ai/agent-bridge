@@ -1,5 +1,11 @@
 import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 import { MARKETPLACE_NAME, PLUGIN_NAME } from "../cli";
+import {
+  MARKETPLACE_STEPS,
+  pluginCacheRoot,
+  shouldWarnMissingPluginCache,
+} from "./plugin-cache";
 import { DaemonClient } from "../daemon-client";
 import { DaemonLifecycle } from "../daemon-lifecycle";
 import { BUILD_INFO } from "../build-info";
@@ -78,6 +84,12 @@ export async function runClaude(args: string[]) {
 
   lifecycle.clearKilled();
 
+  // Cheap fail-open preflight: if the plugin was never installed, the channel
+  // flag below loads nothing and the bridge stays silent. Warn (stderr) so the
+  // user knows to run `abg init`, but never block the launch — matching the
+  // fail-open style of the guards above.
+  warnIfPluginCacheMissing();
+
   // Channel entry format: "server:<mcp-server-name>" for MCP-based channels,
   // or "plugin:<plugin>@<marketplace>" for plugin-based channels.
   // AgentBridge is installed as a plugin, so use the plugin channel format.
@@ -114,6 +126,32 @@ export async function runClaude(args: string[]) {
     console.error(`Error starting Claude Code: ${err.message}`);
     process.exit(1);
   });
+}
+
+/**
+ * Fail-open preflight: warn (but never block) when the AgentBridge plugin cache
+ * dir is missing — that means the plugin was never installed, so the channel
+ * flag will load nothing. Resolves the cache path via the SAME pluginCacheRoot()
+ * doctor uses (single source of truth). Any error is swallowed (fail-open).
+ *
+ * `cacheRoot` and `log` are injectable for tests; returns whether it warned.
+ */
+export function warnIfPluginCacheMissing(
+  cacheRoot: string = pluginCacheRoot(),
+  log: (msg: string) => void = (msg) => console.error(msg),
+): boolean {
+  let cacheExists: boolean;
+  try {
+    cacheExists = existsSync(cacheRoot);
+  } catch {
+    return false; // can't tell → don't warn, never block
+  }
+  if (!shouldWarnMissingPluginCache(cacheExists)) return false;
+  log(
+    "[agentbridge] ⚠️  Plugin not installed (no plugin cache found). Run `abg init`, " +
+      `or in Claude Code: ${MARKETPLACE_STEPS.join(" → ")}. Launching anyway…`,
+  );
+  return true;
 }
 
 function traceCliStart(

@@ -1,6 +1,6 @@
 import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
+import { pluginCacheRoot } from "./plugin-cache";
 import { BUILD_INFO, formatBuildInfo, sameRuntimeContract } from "../build-info";
 import { fetchDaemonStatus } from "../daemon-status";
 import { inspectAgentBridgeEnv } from "../env-guard";
@@ -359,7 +359,7 @@ function artifactAlignmentCheck(): DoctorCheck {
       if (commit) stamps.push({ label: "global-cli", commit });
     } catch {}
   }
-  const cacheRoot = join(homedir(), ".claude", "plugins", "cache", "agentbridge", "agentbridge");
+  const cacheRoot = pluginCacheRoot();
   try {
     for (const version of readdirSync(cacheRoot)) {
       const commit = extractBundleCommit(join(cacheRoot, version, "server", "daemon.js"));

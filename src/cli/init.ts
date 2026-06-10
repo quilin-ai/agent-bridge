@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { ConfigService } from "../config-service";
 import { MARKETPLACE_NAME, PLUGIN_NAME } from "../cli";
 import { findPackageRoot, registerMarketplace } from "./pkg-root";
+import { isInsideRepoCheckout, MARKETPLACE_STEPS } from "./plugin-cache";
 import { upsertMarkedSection } from "../marker-section";
 import { compareVersions } from "../version-utils";
 import {
@@ -49,25 +50,72 @@ export async function runInit() {
 
   // Step 4: Register marketplace + install plugin (best-effort)
   console.log("Installing AgentBridge plugin...");
+  let pluginInstalled = false;
   try {
-    registerMarketplace(findPackageRoot());
+    const packageRoot = findPackageRoot();
+    registerMarketplace(packageRoot);
     execFileSync("claude", ["plugin", "install", `${PLUGIN_NAME}@${MARKETPLACE_NAME}`], {
       stdio: "inherit",
     });
     console.log("  Plugin installed successfully.");
+    pluginInstalled = true;
   } catch {
+    // Context-aware fallback: a global npm install (no repo build scripts)
+    // cannot use `abg dev`, so point those users at the documented marketplace
+    // steps instead. Only inside a repo checkout is `abg dev` the right path.
+    // Detect context independently here so a findPackageRoot() failure above
+    // (no package.json) is still treated as "not a repo" → marketplace steps.
     console.log("  Plugin install skipped (marketplace registration or install failed).");
-    console.log("  You can install it later with:");
-    console.log(`    abg dev   # registers marketplace and installs plugin`);
+    for (const line of pluginInstallFallbackGuidance(detectRepoCheckout())) {
+      console.log(line);
+    }
   }
   console.log("");
 
-  // Step 5: Done
-  console.log("Setup complete!\n");
+  // Step 5: Done — be honest about a failed plugin install instead of faking
+  // success, and surface it to the shell via a non-zero exit code.
+  if (pluginInstalled) {
+    console.log("Setup complete!\n");
+  } else {
+    console.log("Setup incomplete — plugin not installed.\n");
+    process.exitCode = 1;
+  }
   console.log("Next steps:");
   console.log("  1. If Claude Code is already running, execute /reload-plugins in your session");
   console.log("  2. Start Claude Code:  agentbridge claude");
   console.log("  3. Start Codex TUI:    agentbridge codex");
+}
+
+/**
+ * Best-effort repo-vs-npm-global detection for the failure fallback. If the
+ * package root cannot be resolved at all (no package.json), treat it as a
+ * non-repo install so the user gets the recoverable marketplace steps.
+ */
+function detectRepoCheckout(): boolean {
+  try {
+    return isInsideRepoCheckout(findPackageRoot());
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Guidance lines printed when step-4 plugin install fails. Repo checkouts can
+ * recover with `abg dev`; global npm installs cannot (the published package
+ * ships no build scripts), so those users get the README marketplace steps.
+ * Pure + exported for unit testing.
+ */
+export function pluginInstallFallbackGuidance(insideRepo: boolean): string[] {
+  if (insideRepo) {
+    return [
+      "  You can install it later with:",
+      "    abg dev   # registers marketplace and installs plugin",
+    ];
+  }
+  return [
+    "  Install the plugin from Claude Code with these steps:",
+    ...MARKETPLACE_STEPS.map((step) => `    ${step}`),
+  ];
 }
 
 function checkBun() {

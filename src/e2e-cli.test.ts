@@ -422,6 +422,25 @@ describe("E2E: CLI surface", () => {
     });
   }, 20000);
 
+  test("agentbridge init reports incomplete and exits non-zero when plugin install fails", async () => {
+    await withHarness(async (harness) => {
+      rmSync(join(harness.projectDir, ".agentbridge"), { recursive: true, force: true });
+
+      const result = await harness.runCliWithEnv(["init"], {
+        AGENTBRIDGE_SHIM_CLAUDE_PLUGIN_INSTALL_FAIL: "1",
+      });
+
+      // Honest failure: non-zero exit, "incomplete" not "complete".
+      expect(result.code).toBe(1);
+      expect(result.stdout).toContain("Setup incomplete — plugin not installed");
+      expect(result.stdout).not.toContain("Setup complete!");
+      // The CLI runs from the repo checkout here, so guidance points at `abg dev`.
+      expect(result.stdout).toContain("abg dev");
+      // Config still gets generated even though the plugin step failed.
+      expect(existsSync(join(harness.projectDir, ".agentbridge", "config.json"))).toBe(true);
+    });
+  }, 20000);
+
   test("agentbridge claude injects channel flags", async () => {
     await withHarness(async (harness) => {
       const result = await harness.runCli(["claude", "--resume"]);
@@ -1359,6 +1378,12 @@ if (args[0] === "--version") {
 }
 
 if ("${commandName}" === "claude" && args[0] === "plugin" && args[1] === "install") {
+  // Test hook: force plugin install to fail so init's failure journey can be
+  // exercised end-to-end (exit code + context-aware guidance).
+  if (process.env.AGENTBRIDGE_SHIM_CLAUDE_PLUGIN_INSTALL_FAIL === "1") {
+    console.error("simulated plugin install failure");
+    process.exit(1);
+  }
   process.exit(0);
 }
 

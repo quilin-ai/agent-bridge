@@ -1,9 +1,9 @@
 import { execFileSync, spawnSync } from "node:child_process";
 import { resolve } from "node:path";
 import { existsSync, cpSync, rmSync } from "node:fs";
-import { homedir } from "node:os";
 import { MARKETPLACE_NAME, PLUGIN_NAME } from "../cli";
 import { findPackageRoot, registerMarketplace } from "./pkg-root";
+import { isInsideRepoCheckout, pluginCacheRoot } from "./plugin-cache";
 
 export async function runDev(args: string[] = []) {
   console.log("AgentBridge Dev Setup\n");
@@ -19,9 +19,9 @@ export async function runDev(args: string[] = []) {
   // Guard: `dev` only works inside a repository checkout. When invoked from a
   // globally installed package, findPackageRoot() resolves to the published
   // package directory, which does not ship the build scripts — fail with
-  // guidance instead of a raw MODULE_NOT_FOUND from the build step.
-  const buildScript = resolve(projectRoot, "scripts", "build-bundles.mjs");
-  if (!existsSync(buildScript)) {
+  // guidance instead of a raw MODULE_NOT_FOUND from the build step. The same
+  // repo-vs-npm-global signal is reused by init's plugin-install fallback.
+  if (!isInsideRepoCheckout(projectRoot)) {
     console.error("  ERROR: 'agentbridge dev' must run inside an AgentBridge repository checkout —");
     console.error("  the published package does not ship the build scripts.");
     console.error("");
@@ -98,7 +98,7 @@ export async function runDev(args: string[] = []) {
 
   // Step 4: Force-sync local plugin files to cache (bypasses version check)
   console.log("\nSyncing local plugin to cache...");
-  const cacheDir = resolve(homedir(), ".claude", "plugins", "cache", MARKETPLACE_NAME, PLUGIN_NAME);
+  const cacheDir = pluginCacheRoot();
   if (existsSync(cacheDir)) {
     // Find the version directory (e.g., 0.1.0)
     const versionDirs = Bun.spawnSync(["ls", cacheDir]).stdout.toString().trim().split("\n").filter(Boolean);

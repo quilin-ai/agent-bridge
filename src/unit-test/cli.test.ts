@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { compareVersions } from "../cli/init";
-import { checkOwnedFlagConflicts } from "../cli/claude";
+import { checkOwnedFlagConflicts, warnIfPluginCacheMissing } from "../cli/claude";
 import {
   buildCodexArgs,
   parseAgentBridgeCodexArgs,
@@ -134,6 +134,32 @@ describe("CLI: owned flag conflict detection", () => {
     console.error = origError;
     expect(output).toContain("codex [your flags here]");
     expect(output).not.toContain("claude [your flags here]");
+  });
+});
+
+describe("CLI: claude plugin-cache preflight (fail-open)", () => {
+  test("missing cache dir → emits a warning pointing at `abg init`", () => {
+    const missing = join(mkdtempSync(join(tmpdir(), "agentbridge-preflight-")), "no-such-cache");
+    let warned = "";
+    const didWarn = warnIfPluginCacheMissing(missing, (msg) => {
+      warned += msg + "\n";
+    });
+    expect(didWarn).toBe(true);
+    expect(warned).toContain("abg init");
+    expect(warned).toContain("/plugin marketplace add raysonmeng/agent-bridge");
+    // Fail-open: this is only a warning; runClaude continues to spawn after it.
+    expect(warned).toContain("Launching anyway");
+  });
+
+  test("present cache dir → no warning", () => {
+    const present = mkdtempSync(join(tmpdir(), "agentbridge-preflight-present-"));
+    let warned = "";
+    const didWarn = warnIfPluginCacheMissing(present, (msg) => {
+      warned += msg + "\n";
+    });
+    expect(didWarn).toBe(false);
+    expect(warned).toBe("");
+    rmSync(present, { recursive: true, force: true });
   });
 });
 
