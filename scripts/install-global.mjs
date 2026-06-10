@@ -3,11 +3,16 @@
  * Install AgentBridge globally in a way that is convenient for local testing.
  *
  * Modes:
- *   local  build this checkout, pack it, uninstall the global package, install the tarball
- *   npm    verify npm latest exists, uninstall the global package, install latest
+ *   local  build + verify this checkout, pack it, install the tarball (`--force`),
+ *          THEN stop running daemons and sync the Claude Code plugin
+ *   npm    verify npm latest exists, install latest (`--force`), THEN stop daemons
  *
- * The uninstall step is intentionally ignored when the package is not installed:
- * the goal is a clean replacement, not a brittle precondition.
+ * Ordering invariant (downtime + failure safety):
+ *   - `npm install -g --force` is a full replace, so no separate `npm uninstall`
+ *     is needed — dropping it removes the window where no binary is on PATH.
+ *   - stop-running fires AFTER the install succeeds, so the old daemon keeps
+ *     serving until the new bytes are on disk and a FAILED install (red build,
+ *     unreachable registry, missing version) never kills the running daemon.
  *
  * PREFIX RESOLUTION: a plain `npm install -g` targets npm's configured global
  * prefix, which is NOT always where the user's `agentbridge` command resolves —
@@ -149,9 +154,8 @@ function installLocal() {
     printDry("node", ["scripts/install-safety.cjs", "verify-built"]);
     printDry("npm", ["pack", "--pack-destination", "<temp>"]);
     printDry("node", ["scripts/install-safety.cjs", "verify-tarball", "<packed-tarball>"]);
-    printDry("node", ["scripts/install-safety.cjs", "stop-running", "--dry-run"], "  # after build verifies — red builds no longer cause an outage");
-    printDry("npm", ["uninstall", "-g", packageName], "  # ignored if not installed");
     printDry("npm", ["install", "-g", "--force", "<packed-tarball>"]);
+    printDry("node", ["scripts/install-safety.cjs", "stop-running", "--dry-run"], "  # after install succeeds — the old daemon keeps serving until the new bytes are on disk");
     if (!skipPlugin) {
       printDry("bun", ["src/cli.ts", "dev", "--skip-build"], "  # sync Claude Code plugin (skip with --skip-plugin)");
     }
@@ -163,19 +167,24 @@ function installLocal() {
   const env = prefixEnv(target);
   let packDir = "";
   try {
-    // Build + verify FIRST, stop running daemons LAST: the old order killed
-    // every running pair before the build was even validated, so a red build
-    // meant a pointless machine-wide outage. Now the stop window shrinks to
-    // just the npm replacement.
+    // Ordering rationale (downtime-minimizing, failure-safe):
+    //   1. Build + verify FIRST so a red build aborts BEFORE anything is killed
+    //      (PR #101 — a broken build must never cause a machine-wide outage).
+    //   2. `npm install -g --force` is ALREADY a full replace, so the previous
+    //      `npm uninstall -g` step is redundant: it only widened the window in
+    //      which no `agentbridge` binary exists on PATH. Removed.
+    //   3. Stop running daemons AFTER the install succeeds, not before: the old
+    //      daemon keeps serving while the new bytes land, so the downtime window
+    //      shrinks to "stop -> user restart". A FAILED install (build/pack/verify
+    //      /npm install) returns before this line, leaving the daemon untouched.
     run("bun", ["run", "prepublishOnly"]);
     run("node", ["scripts/install-safety.cjs", "verify-built"]);
     packDir = mkdtempSync(join(tmpdir(), "agentbridge-pack-"));
     const packed = run("npm", ["pack", "--pack-destination", packDir], { captureStdout: true });
     const tarball = packedTarballFrom(packed.stdout ?? "", packDir);
     run("node", ["scripts/install-safety.cjs", "verify-tarball", tarball]);
-    run("node", ["scripts/install-safety.cjs", "stop-running"]);
-    run("npm", ["uninstall", "-g", packageName], { allowFailure: true, envExtra: env });
     run("npm", ["install", "-g", "--force", tarball], { envExtra: env });
+    run("node", ["scripts/install-safety.cjs", "stop-running"]);
     process.stdout.write(`install-global: installed ${packageName} globally from local source\n`);
   } finally {
     if (packDir) rmSync(packDir, { recursive: true, force: true });
@@ -195,7 +204,7 @@ function installLocal() {
     }
   }
 
-  // Running daemons/sessions were stopped before the npm replacement — make
+  // Running daemons/sessions were stopped after the new bytes landed — make
   // the required restart explicit instead of leaving it implied.
   process.stdout.write(
     "# note: running AgentBridge sessions were stopped — start fresh with `agentbridge claude` / `agentbridge codex`\n",
@@ -239,20 +248,24 @@ function installNpm() {
   const prefix = dryRun ? resolveInstallPrefix() : null;
   if (dryRun) {
     reportPrefix(prefix);
-    printDry("node", ["scripts/install-safety.cjs", "stop-running", "--dry-run"]);
     printDry("npm", ["view", spec, "version"]);
-    printDry("npm", ["uninstall", "-g", packageName], "  # ignored if not installed");
     printDry("npm", ["install", "-g", "--force", spec]);
+    printDry("node", ["scripts/install-safety.cjs", "stop-running", "--dry-run"], "  # after install succeeds — a failed `npm view` / install leaves the running daemon untouched");
     return;
   }
 
   const target = resolveInstallPrefix();
   reportPrefix(target);
   const env = prefixEnv(target);
-  run("node", ["scripts/install-safety.cjs", "stop-running"]);
+  // Validate + install BEFORE stopping anything: the old order killed every
+  // running pair before `npm view` even confirmed the registry was reachable,
+  // so an unreachable registry or a missing version caused a pointless
+  // machine-wide outage. `--force` is a full replace (no separate uninstall
+  // needed). A failure on any line below returns before stop-running, leaving
+  // the running daemon untouched — zero downtime on the failure path.
   run("npm", ["view", spec, "version"]);
-  run("npm", ["uninstall", "-g", packageName], { allowFailure: true, envExtra: env });
   run("npm", ["install", "-g", "--force", spec], { envExtra: env });
+  run("node", ["scripts/install-safety.cjs", "stop-running"]);
   process.stdout.write(`install-global: installed ${packageName} globally from npm latest\n`);
 }
 
