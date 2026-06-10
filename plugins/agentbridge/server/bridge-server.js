@@ -14274,7 +14274,7 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.11", "0.0.0-source"),
-  commit: defineString("b0c8a46", "source"),
+  commit: defineString("5840cb3", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION)
 });
@@ -14611,6 +14611,48 @@ var REUSE_READY_RETRIES = parsePositiveIntEnv("AGENTBRIDGE_REUSE_READY_RETRIES",
 var REUSE_READY_DELAY_MS = 250;
 var HEALTH_FETCH_TIMEOUT_MS = 500;
 var LOCK_IDENTITY_GRACE_MS = parsePositiveIntEnv("AGENTBRIDGE_LOCK_IDENTITY_GRACE_MS", 120000);
+function isReuseVerdict(verdict) {
+  return verdict === "reuse" || verdict === "reuse-despite-drift";
+}
+function classifyDaemon(expectedPairId, status, buildInfo) {
+  if (!status) {
+    return { verdict: "unreachable", reason: "daemon status is unavailable or unparseable" };
+  }
+  const reportedPairId = status.pairId;
+  if (!expectedPairId && reportedPairId != null) {
+    return {
+      verdict: "manual-conflict",
+      reason: `manual mode must not adopt registered pair ${reportedPairId}`
+    };
+  }
+  if (expectedPairId) {
+    if (reportedPairId == null) {
+      return {
+        verdict: "replace-foreign",
+        reason: `pair ${expectedPairId} found daemon without pair identity`
+      };
+    }
+    if (reportedPairId !== expectedPairId) {
+      return {
+        verdict: "replace-foreign",
+        reason: `pair ${expectedPairId} found daemon for pair ${reportedPairId}`
+      };
+    }
+  }
+  if (!sameRuntimeContract(status.build, buildInfo)) {
+    if (compatibleContractVersion(status.build, buildInfo) && status.tuiConnected === true) {
+      return {
+        verdict: "reuse-despite-drift",
+        reason: "runtime build drift has a compatible contract and a live Codex TUI is attached"
+      };
+    }
+    return {
+      verdict: "replace-drifted",
+      reason: `runtime build ${formatBuildInfo(status.build)} does not match launcher ${formatBuildInfo(buildInfo)}`
+    };
+  }
+  return { verdict: "reuse", reason: "daemon pair and runtime contract match" };
+}
 
 class DaemonLifecycle {
   stateDir;
@@ -14643,52 +14685,37 @@ class DaemonLifecycle {
       return null;
     }
   }
-  isForeignDaemon(status) {
-    const expected = this.expectedPairId;
-    if (!expected)
-      return false;
-    if (!status)
-      return false;
-    const reported = status.pairId;
-    if (reported == null)
-      return true;
-    return reported !== expected;
+  classifyDaemon(status) {
+    const classification = classifyDaemon(this.expectedPairId, status, BUILD_INFO);
+    if (process.env.AGENTBRIDGE_ALLOW_BUILD_DRIFT === "1" && (classification.verdict === "replace-drifted" || classification.verdict === "unreachable")) {
+      return { verdict: "reuse", reason: "build drift replacement disabled by AGENTBRIDGE_ALLOW_BUILD_DRIFT" };
+    }
+    return classification;
   }
-  isRegisteredPairDaemonInManualMode(status) {
-    return !this.expectedPairId && status?.pairId != null;
-  }
-  isBuildDrifted(status) {
-    if (process.env.AGENTBRIDGE_ALLOW_BUILD_DRIFT === "1")
-      return false;
-    const runtime = status?.build;
-    if (!runtime)
-      return true;
-    return !sameRuntimeContract(runtime, BUILD_INFO);
-  }
-  canReuseDespiteDrift(status) {
-    if (!compatibleContractVersion(status?.build, BUILD_INFO))
-      return false;
-    return status?.tuiConnected === true;
+  manualConflictError(status) {
+    return new Error(`Control port ${this.controlPort} is owned by registered pair ${status?.pairId}. ` + `This session has no pair identity (manual mode) and will not reuse or replace it \u2014 ` + `start with \`agentbridge claude\` from that pair's directory, or set AGENTBRIDGE_CONTROL_PORT to a free port.`);
   }
   async ensureRunning() {
     if (await this.isHealthy()) {
       const status = await this.fetchStatus();
-      if (this.isRegisteredPairDaemonInManualMode(status)) {
-        throw new Error(`Control port ${this.controlPort} is owned by registered pair ${status?.pairId}. ` + `This session has no pair identity (manual mode) and will not reuse or replace it \u2014 ` + `start with \`agentbridge claude\` from that pair's directory, or set AGENTBRIDGE_CONTROL_PORT to a free port.`);
-      }
-      if (this.isForeignDaemon(status)) {
-        this.log(`Control port ${this.controlPort} held by a daemon for pair ${status?.pairId ?? "<none>"}, ` + `but this pair is ${this.expectedPairId} \u2014 replacing foreign daemon`);
-        await this.replaceUnhealthyDaemon(status?.pid);
-        return;
-      }
-      if (this.isBuildDrifted(status)) {
-        if (this.canReuseDespiteDrift(status)) {
-          this.log(`Daemon on control port ${this.controlPort} is running build ${formatBuildInfo(status?.build)} ` + `(launcher ${formatBuildInfo(BUILD_INFO)}) but a live Codex TUI is attached \u2014 reusing instead of ` + `replacing; the new build is picked up at the next restart (abg kill, then relaunch)`);
-        } else {
+      const classification = this.classifyDaemon(status);
+      switch (classification.verdict) {
+        case "manual-conflict":
+          throw this.manualConflictError(status);
+        case "replace-foreign":
+          this.log(`Control port ${this.controlPort} held by a daemon for pair ${status?.pairId ?? "<none>"}, ` + `but this pair is ${this.expectedPairId} \u2014 replacing foreign daemon`);
+          await this.replaceUnhealthyDaemon(status?.pid);
+          return;
+        case "replace-drifted":
+        case "unreachable":
           this.log(`Daemon on control port ${this.controlPort} is running build ${formatBuildInfo(status?.build)} ` + `but launcher is ${formatBuildInfo(BUILD_INFO)} \u2014 replacing drifted daemon`);
           await this.replaceUnhealthyDaemon(status?.pid);
           return;
-        }
+        case "reuse-despite-drift":
+          this.log(`Daemon on control port ${this.controlPort} is running build ${formatBuildInfo(status?.build)} ` + `(launcher ${formatBuildInfo(BUILD_INFO)}) but a live Codex TUI is attached \u2014 reusing instead of ` + `replacing; the new build is picked up at the next restart (abg kill, then relaunch)`);
+          break;
+        case "reuse":
+          break;
       }
       try {
         await this.waitForReady(REUSE_READY_RETRIES, REUSE_READY_DELAY_MS);
@@ -14718,14 +14745,17 @@ class DaemonLifecycle {
     }
     await this.withStartupLockStrict(async (locked) => {
       if (!locked) {
-        this.log("Another process holds the startup lock, waiting for readiness+identity...");
-        await this.waitForReadyAndOurs();
+        await this.waitForContendedStartupLock();
         return;
       }
       if (await this.isHealthy()) {
         const status = await this.fetchStatus();
-        if (this.isForeignDaemon(status) || this.isBuildDrifted(status) && !this.canReuseDespiteDrift(status)) {
-          this.log(`Daemon on control port ${this.controlPort} is not reusable under startup lock ` + `(pair=${status?.pairId ?? "<none>"}, build=${formatBuildInfo(status?.build)}) \u2014 replacing`);
+        const classification = this.classifyDaemon(status);
+        if (classification.verdict === "manual-conflict") {
+          throw this.manualConflictError(status);
+        }
+        if (!isReuseVerdict(classification.verdict)) {
+          this.log(`Daemon on control port ${this.controlPort} is not reusable under startup lock ` + `(pair=${status?.pairId ?? "<none>"}, build=${formatBuildInfo(status?.build)}, ` + `reason=${classification.reason}) \u2014 replacing`);
           await this.kill(3000, status?.pid);
         } else {
           try {
@@ -14777,7 +14807,11 @@ class DaemonLifecycle {
     for (let attempt = 0;attempt < maxRetries; attempt++) {
       if (await this.isReady()) {
         const status = await this.fetchStatus();
-        if (!this.isForeignDaemon(status) && (!this.isBuildDrifted(status) || this.canReuseDespiteDrift(status))) {
+        const classification = this.classifyDaemon(status);
+        if (classification.verdict === "manual-conflict") {
+          throw this.manualConflictError(status);
+        }
+        if (isReuseVerdict(classification.verdict)) {
           return;
         }
       }
@@ -14859,13 +14893,16 @@ class DaemonLifecycle {
   async replaceUnhealthyDaemon(statusPid) {
     await this.withStartupLockStrict(async (locked) => {
       if (!locked) {
-        this.log("Another process holds the startup lock, waiting for readiness+identity...");
-        await this.waitForReadyAndOurs();
+        await this.waitForContendedStartupLock();
         return;
       }
       if (await this.isHealthy()) {
         const status = await this.fetchStatus();
-        if (!this.isForeignDaemon(status) && (!this.isBuildDrifted(status) || this.canReuseDespiteDrift(status))) {
+        const classification = this.classifyDaemon(status);
+        if (classification.verdict === "manual-conflict") {
+          throw this.manualConflictError(status);
+        }
+        if (isReuseVerdict(classification.verdict)) {
           try {
             await this.waitForReady(REUSE_READY_RETRIES, REUSE_READY_DELAY_MS);
             return;
@@ -14877,6 +14914,10 @@ class DaemonLifecycle {
       this.launch();
       await this.waitForReady();
     });
+  }
+  async waitForContendedStartupLock() {
+    this.log("Another process holds the startup lock, waiting for readiness+identity...");
+    await this.waitForReadyAndOurs();
   }
   async withStartupLockStrict(fn) {
     const locked = this.acquireLockStrict();

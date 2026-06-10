@@ -6,6 +6,7 @@ import { StateDirResolver } from "./state-dir";
 import { parsePositiveIntEnv } from "./env-utils";
 import { isAgentBridgeDaemon, isAgentBridgeProcess, isProcessAlive } from "./process-lifecycle";
 import type { DaemonStatus } from "./control-protocol";
+import type { AgentBridgeBuildInfo } from "./build-info";
 
 // In source/dev mode this module is loaded from src/*.ts and can launch the
 // sibling daemon.ts directly. In bundled CLI/plugin mode it is loaded from a
@@ -25,6 +26,71 @@ const HEALTH_FETCH_TIMEOUT_MS = 500;
 // 3s graceful kill during a replace). Only locks far older than that get the
 // pid-recycling identity check — see acquireLockStrict.
 const LOCK_IDENTITY_GRACE_MS = parsePositiveIntEnv("AGENTBRIDGE_LOCK_IDENTITY_GRACE_MS", 120_000);
+
+export type DaemonClassificationVerdict =
+  | "reuse"
+  | "reuse-despite-drift"
+  | "replace-foreign"
+  | "replace-drifted"
+  | "manual-conflict"
+  | "unreachable";
+
+export interface DaemonClassification {
+  verdict: DaemonClassificationVerdict;
+  reason: string;
+}
+
+function isReuseVerdict(verdict: DaemonClassificationVerdict): boolean {
+  return verdict === "reuse" || verdict === "reuse-despite-drift";
+}
+
+export function classifyDaemon(
+  expectedPairId: string | null,
+  status: DaemonStatus | null,
+  buildInfo: AgentBridgeBuildInfo,
+): DaemonClassification {
+  if (!status) {
+    return { verdict: "unreachable", reason: "daemon status is unavailable or unparseable" };
+  }
+
+  const reportedPairId = status.pairId;
+  if (!expectedPairId && reportedPairId != null) {
+    return {
+      verdict: "manual-conflict",
+      reason: `manual mode must not adopt registered pair ${reportedPairId}`,
+    };
+  }
+
+  if (expectedPairId) {
+    if (reportedPairId == null) {
+      return {
+        verdict: "replace-foreign",
+        reason: `pair ${expectedPairId} found daemon without pair identity`,
+      };
+    }
+    if (reportedPairId !== expectedPairId) {
+      return {
+        verdict: "replace-foreign",
+        reason: `pair ${expectedPairId} found daemon for pair ${reportedPairId}`,
+      };
+    }
+  }
+
+  if (!sameRuntimeContract(status.build, buildInfo)) {
+    if (compatibleContractVersion(status.build, buildInfo) && status.tuiConnected === true) {
+      return {
+        verdict: "reuse-despite-drift",
+        reason: "runtime build drift has a compatible contract and a live Codex TUI is attached",
+      };
+    }
+    return {
+      verdict: "replace-drifted",
+      reason: `runtime build ${formatBuildInfo(status.build)} does not match launcher ${formatBuildInfo(buildInfo)}`,
+    };
+  }
+
+  return { verdict: "reuse", reason: "daemon pair and runtime contract match" };
+}
 
 export interface DaemonLifecycleOptions {
   stateDir: StateDirResolver;
@@ -75,61 +141,23 @@ export class DaemonLifecycle {
     }
   }
 
-  /**
-   * True when this pair expects a specific pairId and the live daemon is NOT ours —
-   * a foreign daemon squatting our control port. In pair mode (expected pairId set),
-   * a missing/null reported pairId is ALSO foreign: an old daemon built before pairId
-   * shipped, or a manual daemon, must not be silently reused by a named pair — that is
-   * exactly the squatting the hardening exists to prevent. In manual/legacy mode
-   * (no expected pairId), any reported pairId is acceptable.
-   */
-  private isForeignDaemon(status: DaemonStatus | null): boolean {
-    const expected = this.expectedPairId;
-    if (!expected) return false; // manual/legacy — no enforcement
-    if (!status) return false; // unreachable/unparseable status — don't force-replace
-    const reported = status.pairId;
-    if (reported == null) return true; // pair-mode + no reported identity = foreign
-    return reported !== expected;
+  private classifyDaemon(status: DaemonStatus | null): DaemonClassification {
+    const classification = classifyDaemon(this.expectedPairId, status, BUILD_INFO);
+    if (
+      process.env.AGENTBRIDGE_ALLOW_BUILD_DRIFT === "1" &&
+      (classification.verdict === "replace-drifted" || classification.verdict === "unreachable")
+    ) {
+      return { verdict: "reuse", reason: "build drift replacement disabled by AGENTBRIDGE_ALLOW_BUILD_DRIFT" };
+    }
+    return classification;
   }
 
-  /**
-   * A MANUAL-mode launcher (no AGENTBRIDGE_PAIR_ID) found a daemon that belongs
-   * to a REGISTERED pair on its control port. Manual mode waives the foreign
-   * check above, but adopting (or worse, drift-replacing) a registered pair's
-   * daemon is squatting: an unwrapped `claude` session defaults to the root
-   * control port, which aliases registered slot 0. Neither reuse nor replace is
-   * acceptable here — the caller must abort with guidance.
-   */
-  private isRegisteredPairDaemonInManualMode(status: DaemonStatus | null): boolean {
-    return !this.expectedPairId && status?.pairId != null;
-  }
-
-  private isBuildDrifted(status: DaemonStatus | null): boolean {
-    if (process.env.AGENTBRIDGE_ALLOW_BUILD_DRIFT === "1") return false;
-    const runtime = status?.build;
-    if (!runtime) return true;
-    // Compare the runtime CONTRACT (version/commit/contractVersion), NOT `bundle`:
-    // the dist CLI and the Claude Code plugin launch co-equal daemons from the same
-    // source for the same pair, so a bundle-kind difference must not trigger a
-    // destructive replace (that would replace-war the two launchers).
-    return !sameRuntimeContract(runtime, BUILD_INFO);
-  }
-
-  /**
-   * Can a build-drifted daemon be REUSED instead of replaced? Replacing a daemon
-   * is destructive: SIGTERM tears down the codex app-server proxy, which severs
-   * any attached Codex TUI mid-session (observed live: the TUI dies with
-   * "WebSocket protocol error: Connection reset without closing handshake").
-   * Commit/version drift alone is an upgrade-hygiene concern, never worth that:
-   *  - contractVersion mismatch → NOT reusable (the frontend cannot speak to it);
-   *  - same contract + live Codex TUI attached → reusable (warn; the new build is
-   *    picked up at the next natural restart instead of by killing live work);
-   *  - same contract + no TUI → not reusable (replace in the safe window, keeping
-   *    the auto-upgrade behavior when it costs nothing).
-   */
-  private canReuseDespiteDrift(status: DaemonStatus | null): boolean {
-    if (!compatibleContractVersion(status?.build, BUILD_INFO)) return false;
-    return status?.tuiConnected === true;
+  private manualConflictError(status: DaemonStatus | null): Error {
+    return new Error(
+      `Control port ${this.controlPort} is owned by registered pair ${status?.pairId}. ` +
+        `This session has no pair identity (manual mode) and will not reuse or replace it — ` +
+        `start with \`agentbridge claude\` from that pair's directory, or set AGENTBRIDGE_CONTROL_PORT to a free port.`,
+    );
   }
 
   /** Ensure daemon is running: reuse a healthy one, replace a bad/foreign one, else launch. */
@@ -139,37 +167,34 @@ export class DaemonLifecycle {
     // daemon belongs to THIS pair. Distinguish reuse-able from replace-able:
     if (await this.isHealthy()) {
       const status = await this.fetchStatus();
-      if (this.isRegisteredPairDaemonInManualMode(status)) {
-        throw new Error(
-          `Control port ${this.controlPort} is owned by registered pair ${status?.pairId}. ` +
-            `This session has no pair identity (manual mode) and will not reuse or replace it — ` +
-            `start with \`agentbridge claude\` from that pair's directory, or set AGENTBRIDGE_CONTROL_PORT to a free port.`,
-        );
-      }
-      if (this.isForeignDaemon(status)) {
-        this.log(
-          `Control port ${this.controlPort} held by a daemon for pair ${status?.pairId ?? "<none>"}, ` +
-            `but this pair is ${this.expectedPairId} — replacing foreign daemon`,
-        );
-        await this.replaceUnhealthyDaemon(status?.pid);
-        return;
-      }
-      if (this.isBuildDrifted(status)) {
-        if (this.canReuseDespiteDrift(status)) {
+      const classification = this.classifyDaemon(status);
+      switch (classification.verdict) {
+        case "manual-conflict":
+          throw this.manualConflictError(status);
+        case "replace-foreign":
           this.log(
-            `Daemon on control port ${this.controlPort} is running build ${formatBuildInfo(status?.build)} ` +
-              `(launcher ${formatBuildInfo(BUILD_INFO)}) but a live Codex TUI is attached — reusing instead of ` +
-              `replacing; the new build is picked up at the next restart (abg kill, then relaunch)`,
+            `Control port ${this.controlPort} held by a daemon for pair ${status?.pairId ?? "<none>"}, ` +
+              `but this pair is ${this.expectedPairId} — replacing foreign daemon`,
           );
-          // fall through to the readiness check + reuse path below
-        } else {
+          await this.replaceUnhealthyDaemon(status?.pid);
+          return;
+        case "replace-drifted":
+        case "unreachable":
           this.log(
             `Daemon on control port ${this.controlPort} is running build ${formatBuildInfo(status?.build)} ` +
               `but launcher is ${formatBuildInfo(BUILD_INFO)} — replacing drifted daemon`,
           );
           await this.replaceUnhealthyDaemon(status?.pid);
           return;
-        }
+        case "reuse-despite-drift":
+          this.log(
+            `Daemon on control port ${this.controlPort} is running build ${formatBuildInfo(status?.build)} ` +
+              `(launcher ${formatBuildInfo(BUILD_INFO)}) but a live Codex TUI is attached — reusing instead of ` +
+              `replacing; the new build is picked up at the next restart (abg kill, then relaunch)`,
+          );
+          break;
+        case "reuse":
+          break;
       }
       try {
         // Short window: a sane daemon (or a legit slow boot) reports ready within ~3s.
@@ -212,23 +237,21 @@ export class DaemonLifecycle {
     // Nothing usable running — launch a fresh daemon under the strict lock.
     await this.withStartupLockStrict(async (locked) => {
       if (!locked) {
-        // Another process holds the lock and is launching/replacing — just wait.
-        this.log("Another process holds the startup lock, waiting for readiness+identity...");
-        // Contended branch: the lock holder is doing the fix-up. Wait for a daemon
-        // that is BOTH ready AND ours — a foreign daemon becoming ready behind the
-        // lock holder is the other pair repairing their own daemon; adopting it
-        // would squat the wrong pair. Manual mode is handled by waitForReadyAndOurs
-        // (it short-circuits the identity check).
-        await this.waitForReadyAndOurs();
+        await this.waitForContendedStartupLock();
         return;
       }
       // Re-check under the lock: a concurrent launcher may have just started one.
       if (await this.isHealthy()) {
         const status = await this.fetchStatus();
-        if (this.isForeignDaemon(status) || (this.isBuildDrifted(status) && !this.canReuseDespiteDrift(status))) {
+        const classification = this.classifyDaemon(status);
+        if (classification.verdict === "manual-conflict") {
+          throw this.manualConflictError(status);
+        }
+        if (!isReuseVerdict(classification.verdict)) {
           this.log(
             `Daemon on control port ${this.controlPort} is not reusable under startup lock ` +
-              `(pair=${status?.pairId ?? "<none>"}, build=${formatBuildInfo(status?.build)}) — replacing`,
+              `(pair=${status?.pairId ?? "<none>"}, build=${formatBuildInfo(status?.build)}, ` +
+              `reason=${classification.reason}) — replacing`,
           );
           await this.kill(3000, status?.pid);
         } else {
@@ -301,10 +324,11 @@ export class DaemonLifecycle {
         // policy keeps alive — same contract with a live TUI). Without the latter,
         // this loop spins to a 10s timeout against a perfectly usable daemon
         // (observed live as "Timed out waiting for readiness+identity").
-        if (
-          !this.isForeignDaemon(status) &&
-          (!this.isBuildDrifted(status) || this.canReuseDespiteDrift(status))
-        ) {
+        const classification = this.classifyDaemon(status);
+        if (classification.verdict === "manual-conflict") {
+          throw this.manualConflictError(status);
+        }
+        if (isReuseVerdict(classification.verdict)) {
           return;
         }
       }
@@ -414,23 +438,17 @@ export class DaemonLifecycle {
   private async replaceUnhealthyDaemon(statusPid?: number): Promise<void> {
     await this.withStartupLockStrict(async (locked) => {
       if (!locked) {
-        // Another launcher holds the lock and will replace/launch — just wait.
-        this.log("Another process holds the startup lock, waiting for readiness+identity...");
-        // Contended branch: the lock holder is doing the fix-up. Wait for a daemon
-        // that is BOTH ready AND ours — a foreign daemon becoming ready behind the
-        // lock holder is the other pair repairing their own daemon; adopting it
-        // would squat the wrong pair. Manual mode is handled by waitForReadyAndOurs
-        // (it short-circuits the identity check).
-        await this.waitForReadyAndOurs();
+        await this.waitForContendedStartupLock();
         return;
       }
       // Re-check under the lock: the daemon may have readied or been replaced already.
       if (await this.isHealthy()) {
         const status = await this.fetchStatus();
-        if (
-          !this.isForeignDaemon(status) &&
-          (!this.isBuildDrifted(status) || this.canReuseDespiteDrift(status))
-        ) {
+        const classification = this.classifyDaemon(status);
+        if (classification.verdict === "manual-conflict") {
+          throw this.manualConflictError(status);
+        }
+        if (isReuseVerdict(classification.verdict)) {
           try {
             await this.waitForReady(REUSE_READY_RETRIES, REUSE_READY_DELAY_MS);
             return; // someone else already fixed it — don't kill
@@ -444,6 +462,16 @@ export class DaemonLifecycle {
       this.launch();
       await this.waitForReady();
     });
+  }
+
+  private async waitForContendedStartupLock(): Promise<void> {
+    // Another launcher holds the lock and will replace/launch — just wait.
+    this.log("Another process holds the startup lock, waiting for readiness+identity...");
+    // Contended branch: the lock holder is doing the fix-up. Wait for a daemon
+    // that is BOTH ready AND ours — a foreign daemon becoming ready behind the
+    // lock holder is the other pair repairing their own daemon; adopting it
+    // would squat the wrong pair.
+    await this.waitForReadyAndOurs();
   }
 
   /**

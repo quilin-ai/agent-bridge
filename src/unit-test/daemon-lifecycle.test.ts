@@ -1,23 +1,170 @@
 import { describe, expect, test, beforeEach, afterEach } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync } from "node:fs";
+import { createServer } from "node:net";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { StateDirResolver } from "../state-dir";
-import { DaemonLifecycle, isProcessAlive } from "../daemon-lifecycle";
+import { classifyDaemon, DaemonLifecycle, isProcessAlive } from "../daemon-lifecycle";
+import { BUILD_INFO, type AgentBridgeBuildInfo } from "../build-info";
+import type { DaemonStatus } from "../control-protocol";
+
+function status(overrides: Partial<DaemonStatus> = {}): DaemonStatus {
+  return {
+    bridgeReady: true,
+    tuiConnected: false,
+    threadId: null,
+    queuedMessageCount: 0,
+    proxyUrl: "",
+    appServerUrl: "",
+    pid: 12345,
+    pairId: null,
+    build: BUILD_INFO,
+    ...overrides,
+  };
+}
+
+function build(overrides: Partial<AgentBridgeBuildInfo> = {}): AgentBridgeBuildInfo {
+  return { ...BUILD_INFO, ...overrides };
+}
+
+function freePort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const server = createServer();
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      const port = typeof address === "object" && address ? address.port : 0;
+      server.close(() => resolve(port));
+    });
+  });
+}
+
+describe("classifyDaemon", () => {
+  const sameBuild = BUILD_INFO;
+  const bundleOnlyDrift = build({ bundle: BUILD_INFO.bundle === "plugin" ? "dist" : "plugin" });
+  const compatibleCommitDrift = build({ commit: "old-build" });
+  const incompatibleContract = build({ commit: "old-build", contractVersion: BUILD_INFO.contractVersion + 1 });
+
+  const cases: Array<{
+    name: string;
+    expectedPairId: string | null;
+    status: DaemonStatus | null;
+    expectedVerdict:
+      | "reuse"
+      | "reuse-despite-drift"
+      | "replace-foreign"
+      | "replace-drifted"
+      | "manual-conflict"
+      | "unreachable";
+  }> = [
+    {
+      name: "unreachable status cannot be reused",
+      expectedPairId: "mine",
+      status: null,
+      expectedVerdict: "unreachable",
+    },
+    {
+      name: "manual mode reuses legacy manual daemon",
+      expectedPairId: null,
+      status: status({ pairId: null, build: sameBuild, tuiConnected: false }),
+      expectedVerdict: "reuse",
+    },
+    {
+      name: "manual mode refuses a registered pair daemon",
+      expectedPairId: null,
+      status: status({ pairId: "registered", build: sameBuild, tuiConnected: true }),
+      expectedVerdict: "manual-conflict",
+    },
+    {
+      name: "pair mode treats missing pairId as foreign",
+      expectedPairId: "mine",
+      status: status({ pairId: null, build: sameBuild, tuiConnected: false }),
+      expectedVerdict: "replace-foreign",
+    },
+    {
+      name: "pair mode replaces mismatched pairId",
+      expectedPairId: "mine",
+      status: status({ pairId: "other", build: sameBuild, tuiConnected: true }),
+      expectedVerdict: "replace-foreign",
+    },
+    {
+      name: "same pair and same runtime contract reuses",
+      expectedPairId: "mine",
+      status: status({ pairId: "mine", build: sameBuild, tuiConnected: false }),
+      expectedVerdict: "reuse",
+    },
+    {
+      name: "bundle-only drift reuses because runtime contract matches",
+      expectedPairId: "mine",
+      status: status({ pairId: "mine", build: bundleOnlyDrift, tuiConnected: false }),
+      expectedVerdict: "reuse",
+    },
+    {
+      name: "compatible commit drift without TUI is replaced in the safe window",
+      expectedPairId: "mine",
+      status: status({ pairId: "mine", build: compatibleCommitDrift, tuiConnected: false }),
+      expectedVerdict: "replace-drifted",
+    },
+    {
+      name: "compatible commit drift with live TUI is reused",
+      expectedPairId: "mine",
+      status: status({ pairId: "mine", build: compatibleCommitDrift, tuiConnected: true }),
+      expectedVerdict: "reuse-despite-drift",
+    },
+    {
+      name: "contract mismatch is replaced even with live TUI",
+      expectedPairId: "mine",
+      status: status({ pairId: "mine", build: incompatibleContract, tuiConnected: true }),
+      expectedVerdict: "replace-drifted",
+    },
+    {
+      name: "missing build info is drifted and replaced",
+      expectedPairId: "mine",
+      status: status({ pairId: "mine", build: undefined, tuiConnected: true }),
+      expectedVerdict: "replace-drifted",
+    },
+  ];
+
+  for (const testCase of cases) {
+    test(testCase.name, () => {
+      const result = classifyDaemon(testCase.expectedPairId, testCase.status, BUILD_INFO);
+      expect(result.verdict).toBe(testCase.expectedVerdict);
+      expect(result.reason.length).toBeGreaterThan(0);
+    });
+  }
+
+  test("matrix covers every daemon lifecycle verdict", () => {
+    expect(new Set(cases.map((testCase) => testCase.expectedVerdict))).toEqual(new Set([
+      "reuse",
+      "reuse-despite-drift",
+      "replace-foreign",
+      "replace-drifted",
+      "manual-conflict",
+      "unreachable",
+    ]));
+  });
+});
 
 describe("DaemonLifecycle", () => {
   let tempDir: string;
   let stateDir: StateDirResolver;
   let logs: string[];
+  let savedPairId: string | undefined;
+  const servers: Array<{ stop: () => void | Promise<void> }> = [];
 
   beforeEach(() => {
     tempDir = mkdtempSync(join(tmpdir(), "agentbridge-lifecycle-test-"));
     stateDir = new StateDirResolver(tempDir);
     stateDir.ensure();
     logs = [];
+    savedPairId = process.env.AGENTBRIDGE_PAIR_ID;
+    delete process.env.AGENTBRIDGE_PAIR_ID;
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    while (servers.length > 0) await servers.pop()!.stop();
+    if (savedPairId === undefined) delete process.env.AGENTBRIDGE_PAIR_ID;
+    else process.env.AGENTBRIDGE_PAIR_ID = savedPairId;
     rmSync(tempDir, { recursive: true, force: true });
   });
 
@@ -27,6 +174,35 @@ describe("DaemonLifecycle", () => {
       controlPort: port,
       log: (msg) => logs.push(msg),
     });
+  }
+
+  function fakeDaemon(
+    port: number,
+    state: { healthzStatus: number; readyzStatus: number; pairId: string | null; pid?: number },
+  ) {
+    const server = Bun.serve({
+      port,
+      hostname: "127.0.0.1",
+      fetch(req) {
+        const url = new URL(req.url);
+        const body = {
+          bridgeReady: state.readyzStatus >= 200 && state.readyzStatus < 300,
+          tuiConnected: false,
+          threadId: null,
+          queuedMessageCount: 0,
+          proxyUrl: "",
+          appServerUrl: "",
+          pid: state.pid ?? 99999,
+          pairId: state.pairId,
+          build: BUILD_INFO,
+        };
+        if (url.pathname === "/healthz") return Response.json(body, { status: state.healthzStatus });
+        if (url.pathname === "/readyz") return Response.json(body, { status: state.readyzStatus });
+        return new Response("ok");
+      },
+    });
+    servers.push(server);
+    return server;
   }
 
   test("healthUrl and controlWsUrl use correct port", () => {
@@ -127,4 +303,46 @@ describe("DaemonLifecycle", () => {
     const result = await lc.kill();
     expect(result).toBe(false);
   });
+
+  test("contended lock aborts immediately when manual mode sees a registered pair daemon", async () => {
+    delete process.env.AGENTBRIDGE_PAIR_ID;
+    const port = await freePort();
+    const daemonState = {
+      healthzStatus: 503,
+      readyzStatus: 503,
+      pairId: "registered-cccc2222",
+      pid: 99999,
+    };
+    fakeDaemon(port, daemonState);
+    writeFileSync(stateDir.lockFile, `${process.pid}\n`);
+    const lc = createLifecycle(port);
+    let killed = false;
+    let launched = false;
+    (lc as any).kill = async () => {
+      killed = true;
+      return true;
+    };
+    (lc as any).launch = () => {
+      launched = true;
+    };
+
+    setTimeout(() => {
+      daemonState.healthzStatus = 200;
+      daemonState.readyzStatus = 200;
+    }, 20);
+
+    const startedAt = Date.now();
+    let error: Error | null = null;
+    try {
+      await lc.ensureRunning();
+    } catch (err) {
+      error = err as Error;
+    }
+
+    expect(error).not.toBeNull();
+    expect(error!.message).toContain("registered pair registered-cccc2222");
+    expect(Date.now() - startedAt).toBeLessThan(1000);
+    expect(killed).toBe(false);
+    expect(launched).toBe(false);
+  }, 15000);
 });
