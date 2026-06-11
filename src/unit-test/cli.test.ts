@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { compareVersions } from "../cli/init";
-import { checkOwnedFlagConflicts, warnIfPluginCacheMissing } from "../cli/claude";
+import { checkOwnedFlagConflicts, warnIfPluginCacheMissing, mapChildExitCode } from "../cli/claude";
 import {
   buildCodexArgs,
   parseAgentBridgeCodexArgs,
@@ -443,5 +443,35 @@ describe("CLI: resolveResumeTargets (abg resume)", () => {
       else process.env.AGENTBRIDGE_BASE_DIR = previousBase;
       rmSync(root, { recursive: true, force: true });
     }
+  });
+});
+
+describe("CLI claude: child exit-code mapping (signal-aware, mirrors codex wrapper)", () => {
+  test("normal exit code passes through", () => {
+    expect(mapChildExitCode(0, null)).toBe(0);
+    expect(mapChildExitCode(1, null)).toBe(1);
+    expect(mapChildExitCode(42, null)).toBe(42);
+  });
+
+  test("null code with no signal maps to 0", () => {
+    expect(mapChildExitCode(null, null)).toBe(0);
+  });
+
+  test("a signal-killed child reports 128+N, NOT 0 (the bug)", () => {
+    // A signal-killed child is reaped with code=null + signal set; the old
+    // `code ?? 0` wrongly reported 0. The wrapper must surface a non-zero,
+    // conventional 128+signal exit so scripts see the failure.
+    expect(mapChildExitCode(null, "SIGINT")).toBe(130); // 128 + 2
+    expect(mapChildExitCode(null, "SIGTERM")).toBe(143); // 128 + 15
+    expect(mapChildExitCode(null, "SIGKILL")).toBe(137); // 128 + 9
+  });
+
+  test("signal takes precedence over a present code (signal-killed is a failure)", () => {
+    expect(mapChildExitCode(0, "SIGTERM")).toBe(143);
+  });
+
+  test("unknown signal name still yields a non-zero exit (128 + 0 fallback)", () => {
+    // os.constants.signals[unknown] is undefined → 128 + 0 = 128, still non-zero.
+    expect(mapChildExitCode(null, "SIGNOPE" as NodeJS.Signals)).toBe(128);
   });
 });

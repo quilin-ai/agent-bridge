@@ -348,24 +348,38 @@ function normalizeConfig(raw: unknown): AgentBridgeConfig | null {
   return {
     version: typeof config.version === "string" ? config.version : DEFAULT_CONFIG.version,
     codex: {
-      appPort: normalizeInteger(
+      // Ports must be a valid TCP port (1..65535); a coercible negative/zero/
+      // out-of-range value falls back to the default instead of passing through.
+      appPort: normalizeBoundedInteger(
         codex.appPort ?? daemon.port,
         DEFAULT_CONFIG.codex.appPort,
+        1,
+        65535,
       ),
-      proxyPort: normalizeInteger(
+      proxyPort: normalizeBoundedInteger(
         codex.proxyPort ?? daemon.proxyPort,
         DEFAULT_CONFIG.codex.proxyPort,
+        1,
+        65535,
       ),
     },
     turnCoordination: {
-      attentionWindowSeconds: normalizeInteger(
+      // 0 = no attention window is legitimate; negatives are not.
+      attentionWindowSeconds: normalizeBoundedInteger(
         turnCoordination.attentionWindowSeconds,
         DEFAULT_CONFIG.turnCoordination.attentionWindowSeconds,
+        0,
+        Number.MAX_SAFE_INTEGER,
       ),
     },
-    idleShutdownSeconds: normalizeInteger(
+    // A negative idleShutdownSeconds becomes a negative *1000 ms timeout, which
+    // setTimeout clamps to 0 → the daemon self-shuts ~immediately after boot,
+    // before the Claude client attaches (即起即死). Floor at 1 second.
+    idleShutdownSeconds: normalizeBoundedInteger(
       config.idleShutdownSeconds,
       DEFAULT_CONFIG.idleShutdownSeconds,
+      1,
+      Number.MAX_SAFE_INTEGER,
     ),
     budget: normalizeBudgetConfig(config.budget),
   };

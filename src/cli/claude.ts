@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
+import { constants as osConstants } from "node:os";
 import { MARKETPLACE_NAME, PLUGIN_NAME } from "../cli";
 import {
   MARKETPLACE_STEPS,
@@ -113,8 +114,8 @@ export async function runClaude(args: string[]) {
     env: process.env,
   });
 
-  child.on("exit", (code) => {
-    process.exit(code ?? 0);
+  child.on("exit", (code, signal) => {
+    process.exit(mapChildExitCode(code, signal));
   });
 
   child.on("error", (err) => {
@@ -126,6 +127,28 @@ export async function runClaude(args: string[]) {
     console.error(`Error starting Claude Code: ${err.message}`);
     process.exit(1);
   });
+}
+
+/**
+ * Map a reaped child's (code, signal) to the wrapper's own exit code.
+ *
+ * A signal-killed child is reaped with `code=null` and `signal` set, so a naive
+ * `code ?? 0` reports SUCCESS (0) for a signal-killed Claude — breaking
+ * scriptability and diverging from the codex wrapper. When a signal is present
+ * we exit with the conventional 128+N code (mirroring `src/cli/codex.ts`, which
+ * maps SIGINT→130 / SIGTERM→143 etc.). An unknown signal name still yields a
+ * non-zero 128 so a kill is never silently reported as success.
+ *
+ * Pure + exported so the mapping is unit-testable without spawning a process.
+ */
+export function mapChildExitCode(
+  code: number | null,
+  signal: NodeJS.Signals | null,
+): number {
+  if (signal) {
+    return 128 + (osConstants.signals[signal] ?? 0);
+  }
+  return code ?? 0;
 }
 
 /**
