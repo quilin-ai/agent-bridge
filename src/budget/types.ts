@@ -22,6 +22,29 @@ export interface BudgetWindow {
   util: number;
   /** Unix seconds when this window resets; 0 if unknown. */
   resetEpoch: number;
+  /**
+   * v3 layered amendment (§3.3): decision-grade burn fields produced by
+ * agent-quota-guard's probe and passed through verbatim. AgentBridge NEVER
+ * computes burn rates itself — these are consume-only. The group is absent
+ * when the guard omitted them (old probe / not enough samples) or when any
+ * of them failed strict validation (the whole group is dropped together).
+   */
+  /** Guard EWMA burn rate (probe `burn_rate_pct_per_hour`), pct/h, ≥0. */
+  burnRate?: number;
+  /** Guard confidence gate (probe `burn_confident`). */
+  burnConfident?: boolean;
+  /**
+   * Guard runway in seconds (probe `runway_seconds`), neutral semantics:
+   * time to 100% util, truncated at the window reset.
+   */
+  runwaySeconds?: number;
+  /** Unix seconds when the guard projects depletion (probe `depleted_at_epoch`). */
+  depletedAtEpoch?: number;
+  /**
+   * Guard weekly-window projection (probe `five_hour_windows_left`): how many
+   * 5h windows the weekly runway can cover at the current burn rate.
+   */
+  fiveHourWindowsLeft?: number;
 }
 
 /** How confidently AgentBridge mapped raw probe buckets to known quota windows. */
@@ -68,6 +91,51 @@ export type BudgetPhase = "normal" | "balance" | "parallel" | "paused";
 
 export type CodexTier = "full" | "balanced" | "eco";
 
+/**
+ * Budget strategy selector (v3). P1 parses and validates this key but the
+ * decision path is hard-wired to conserve behavior — `maximize` is consumed
+ * ONLY by `abg doctor` (Q7 guard-hardline warning) until P2 lands.
+ */
+export type BudgetStrategy = "conserve" | "maximize";
+
+/** Identifies one of the two quota windows tracked per agent. */
+export type BudgetWindowKey = "fiveHour" | "weekly";
+
+/**
+ * Burn rate for one agent × window (v3 §3.3, layered amendment): a pure
+ * CONSUMPTION shape over the guard's probe fields. Collection / EWMA /
+ * confidence all live in agent-quota-guard; the bridge never recomputes.
+ * Percentage points of quota consumed per hour, account-wide.
+ */
+export interface BurnRate {
+  /** Guard burn rate (probe `burn_rate_pct_per_hour`). */
+  pctPerHour: number;
+  /** Guard confidence gate (probe `burn_confident`); false/absent → 采样中. */
+  confident: boolean;
+}
+
+/** Per-agent burn rates, one slot per identifiable window. */
+export interface AgentBurnRates {
+  fiveHour: BurnRate | null;
+  weekly: BurnRate | null;
+}
+
+/**
+ * "How long can this agent keep working" estimate (v3 §3.3, layered
+ * amendment): selected — not computed — from the guard's `runway_seconds`
+ * fields: the minimum across decision-grade windows with a confident rate.
+ * Neutral semantics inherited from the guard: time to 100%, truncated at
+ * the window reset.
+ */
+export interface RunwayEstimate {
+  /** Guard `runway_seconds` of the binding window, passed through verbatim. */
+  seconds: number;
+  /** Which window produced the binding (shortest) runway. */
+  basis: BudgetWindowKey;
+  /** Guard `depleted_at_epoch` of the binding window; null when omitted. */
+  depletedAtEpoch: number | null;
+}
+
 /** Budget section of AgentBridgeConfig (defaults in config-service.ts). */
 export interface BudgetConfig {
   enabled: boolean;
@@ -89,6 +157,15 @@ export interface BudgetConfig {
   codexTierControl: boolean;
   /** Tier → override mapping; `full` must be configured for tier control to activate. */
   codexTiers: CodexTierMap;
+  /**
+   * v3 strategy selector. P1: parse-and-validate only — behavior is always
+   * conserve; the value is consumed solely by the doctor Q7 check.
+   *
+   * NOTE (layered amendment): burn-rate collection moved to agent-quota-guard;
+   * the former `burnRate.{enabled,sampleCap}` config keys are gone. Display
+   * follows probe field presence — no toggle needed.
+   */
+  strategy: BudgetStrategy;
 }
 
 /** Pure-function output of computeBudgetState(). */
@@ -144,6 +221,18 @@ export interface BudgetSnapshot {
   codexTier: CodexTier;
   /** Advisory for Claude-side subagent model tiering when its budget is tight; null when none. */
   claudeAdvice: string | null;
+  /**
+   * v3 P1 (optional — absent on legacy daemons and when the guard probe does
+   * not provide burn fields, so old consumers deserialize unchanged):
+   * per-agent per-window burn rates passed through from the guard probe.
+   */
+  burnRate?: { claude: AgentBurnRates; codex: AgentBurnRates };
+  /**
+   * v3 P1 (optional, same compatibility contract as burnRate): guard-provided
+   * remaining work time per agent; null until the guard reports a confident
+   * rate on at least one decision-grade window.
+   */
+  runway?: { claude: RunwayEstimate | null; codex: RunwayEstimate | null };
 }
 
 /** Optional per-turn overrides injected into Codex turn/start (sticky on the thread). */

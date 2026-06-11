@@ -20,6 +20,7 @@ const CONFIG: BudgetConfig = {
     balanced: { effort: "medium" },
     eco: { effort: "low" },
   },
+  strategy: "conserve",
 };
 
 type FetchResult = { claude: AgentUsage | null; codex: AgentUsage | null } | null;
@@ -975,5 +976,126 @@ describe("decision-grade data guards (stale cache / expired windows)", () => {
     await (coordinator as any).pollOnce();
     coordinator.stop();
     expect(coordinator.getCodexTurnOverrides()).toEqual({ effort: "low" });
+  });
+});
+
+describe("BudgetCoordinator — guard burn-field passthrough (v3 P1, layered amendment)", () => {
+  // The bridge is a pure consumer: rates/runway come verbatim from the guard's
+  // probe fields on each window; the coordinator only selects the minimum
+  // runway across decision-grade confident windows.
+
+  test("snapshot passes guard burn fields through and selects the binding runway", async () => {
+    const claude = usage({
+      fiveHour: {
+        util: 20,
+        resetEpoch: NOW + 3600,
+        burnRate: 1.2,
+        burnConfident: true,
+        runwaySeconds: 1800,
+        depletedAtEpoch: NOW + 1800,
+      },
+      weekly: {
+        util: 20,
+        resetEpoch: NOW + 500_000,
+        burnRate: 0.5,
+        burnConfident: true,
+        runwaySeconds: 7200,
+        depletedAtEpoch: NOW + 7200,
+      },
+    });
+    const source = new FakeSource([{ claude, codex: usage() }]);
+    const { coordinator } = makeCoordinator(source, longPollConfig());
+    await coordinator.start();
+    coordinator.stop();
+
+    const snapshot = coordinator.getSnapshot();
+    expect(snapshot).not.toBeNull();
+    expect(snapshot!.burnRate?.claude.fiveHour).toEqual({ pctPerHour: 1.2, confident: true });
+    expect(snapshot!.burnRate?.claude.weekly).toEqual({ pctPerHour: 0.5, confident: true });
+    expect(snapshot!.burnRate?.codex).toEqual({ fiveHour: null, weekly: null });
+    // Minimum across windows: 1800s (fiveHour) < 7200s (weekly).
+    expect(snapshot!.runway?.claude).toEqual({
+      seconds: 1800,
+      basis: "fiveHour",
+      depletedAtEpoch: NOW + 1800,
+    });
+    expect(snapshot!.runway?.codex).toBeNull();
+  });
+
+  test("legacy probe output without burn fields keeps the legacy snapshot shape", async () => {
+    const source = new FakeSource([{ claude: usage(), codex: usage() }]);
+    const { coordinator } = makeCoordinator(source, longPollConfig());
+    await coordinator.start();
+    coordinator.stop();
+
+    const snapshot = coordinator.getSnapshot();
+    expect(snapshot).not.toBeNull();
+    expect(snapshot!.burnRate).toBeUndefined();
+    expect(snapshot!.runway).toBeUndefined();
+  });
+
+  test("non-confident window passes the rate through but never yields a runway (conserve)", async () => {
+    const claude = usage({
+      fiveHour: {
+        util: 20,
+        resetEpoch: NOW + 3600,
+        burnRate: 1.2,
+        burnConfident: false,
+        runwaySeconds: 1800,
+      },
+    });
+    const source = new FakeSource([{ claude, codex: usage() }]);
+    const { coordinator } = makeCoordinator(source, longPollConfig());
+    await coordinator.start();
+    coordinator.stop();
+
+    const snapshot = coordinator.getSnapshot();
+    expect(snapshot!.burnRate?.claude.fiveHour).toEqual({ pctPerHour: 1.2, confident: false });
+    expect(snapshot!.runway?.claude).toBeNull();
+  });
+
+  test("stale records never yield a runway even with confident guard fields (conserve)", async () => {
+    const claude = usage({
+      stale: true,
+      // fetchedAt far in the past → fails isDecisionGrade's freshness check.
+      fetchedAt: NOW - 100_000,
+      fiveHour: {
+        util: 20,
+        resetEpoch: NOW + 3600,
+        burnRate: 1.2,
+        burnConfident: true,
+        runwaySeconds: 1800,
+        depletedAtEpoch: NOW + 1800,
+      },
+    });
+    const source = new FakeSource([{ claude, codex: usage() }]);
+    const { coordinator } = makeCoordinator(source, longPollConfig());
+    await coordinator.start();
+    coordinator.stop();
+
+    const snapshot = coordinator.getSnapshot();
+    // Rate is display-grade (like stale util itself); runway is decision-adjacent → dropped.
+    expect(snapshot!.burnRate?.claude.fiveHour).toEqual({ pctPerHour: 1.2, confident: true });
+    expect(snapshot!.runway?.claude).toBeNull();
+  });
+
+  test("reset-unknown window (resetEpoch 0) never yields a runway (conserve)", async () => {
+    const claude = usage({
+      fiveHour: {
+        util: 20,
+        resetEpoch: 0,
+        burnRate: 1.2,
+        burnConfident: true,
+        runwaySeconds: 1800,
+      },
+    });
+    const source = new FakeSource([{ claude, codex: usage() }]);
+    const { coordinator } = makeCoordinator(source, longPollConfig());
+    await coordinator.start();
+    coordinator.stop();
+
+    const snapshot = coordinator.getSnapshot();
+    expect(snapshot!.burnRate?.claude.fiveHour).toEqual({ pctPerHour: 1.2, confident: true });
+    expect(snapshot!.runway?.claude).toBeNull();
   });
 });

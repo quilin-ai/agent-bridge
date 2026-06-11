@@ -6,6 +6,7 @@ import {
   ConfigService,
   DEFAULT_CONFIG,
   applyBudgetEnvOverrides,
+  normalizeBoundedNumber,
   type AgentBridgeConfig,
 } from "../config-service";
 
@@ -390,6 +391,7 @@ describe("ConfigService — budget section", () => {
         balanced: { effort: "medium" },
         eco: { effort: "low" },
       },
+      strategy: "conserve",
     });
   });
 
@@ -429,6 +431,8 @@ describe("ConfigService — budget section", () => {
         balanced: { effort: "medium" }, // unspecified tier keeps the default
         eco: { effort: "minimal" },
       },
+      // v3 P1 keys absent in the raw file normalize to defaults.
+      strategy: "conserve",
     });
   });
 
@@ -590,6 +594,7 @@ describe("applyBudgetEnvOverrides", () => {
       balanced: { effort: "medium" },
       eco: { effort: "low" },
     },
+    strategy: "conserve" as const,
   };
 
   test("env values override the base config", () => {
@@ -644,6 +649,7 @@ describe("applyBudgetEnvOverrides — boolean spellings", () => {
       balanced: { effort: "medium" },
       eco: { effort: "low" },
     },
+    strategy: "conserve" as const,
   };
 
   test('accepts "0"/"1" alongside "true"/"false"', () => {
@@ -660,5 +666,121 @@ describe("applyBudgetEnvOverrides — boolean spellings", () => {
       AGENTBRIDGE_BUDGET_ENABLED: "yes",
     });
     expect(result.enabled).toBe(true);
+  });
+});
+
+describe("ConfigService — budget v3 P1 keys (strategy, parse-only)", () => {
+  let tempDir: string;
+
+  beforeEach(() => {
+    tempDir = mkdtempSync(join(tmpdir(), "agentbridge-budget-v3-config-test-"));
+  });
+
+  afterEach(() => {
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  function writeRawConfig(raw: unknown) {
+    mkdirSync(join(tempDir, ".agentbridge"), { recursive: true });
+    writeFileSync(join(tempDir, ".agentbridge", "config.json"), JSON.stringify(raw));
+  }
+
+  function loadBudget(svc: ConfigService) {
+    const result = svc.load();
+    expect(result.state).toBe("parsed");
+    if (result.state !== "parsed") throw new Error("unreachable");
+    return result.config.budget;
+  }
+
+  test("strategy=maximize is parsed and preserved (consumed only by doctor in P1)", () => {
+    const svc = new ConfigService(tempDir);
+    writeRawConfig({ budget: { strategy: "maximize" } });
+    expect(loadBudget(svc).strategy).toBe("maximize");
+  });
+
+  test("invalid strategy values fall back to conserve", () => {
+    const svc = new ConfigService(tempDir);
+    writeRawConfig({ budget: { strategy: "yolo" } });
+    expect(loadBudget(svc).strategy).toBe("conserve");
+    writeRawConfig({ budget: { strategy: 42 } });
+    expect(loadBudget(svc).strategy).toBe("conserve");
+  });
+
+  test("legacy burnRate keys in the raw file are ignored (layered amendment: collection moved to the guard)", () => {
+    const svc = new ConfigService(tempDir);
+    writeRawConfig({ budget: { strategy: "maximize", burnRate: { enabled: false, sampleCap: 100 } } });
+    const budget = loadBudget(svc);
+    expect(budget.strategy).toBe("maximize");
+    expect("burnRate" in budget).toBe(false);
+  });
+});
+
+describe("normalizeBoundedNumber (Q6 — fractional config params)", () => {
+  test("accepts fractional values in range", () => {
+    expect(normalizeBoundedNumber(0.4, 1, 0, 5)).toBe(0.4);
+    expect(normalizeBoundedNumber(5, 1, 0, 5)).toBe(5);
+    expect(normalizeBoundedNumber(0, 1, 0, 5)).toBe(0);
+  });
+
+  test("accepts numeric strings (env-style)", () => {
+    expect(normalizeBoundedNumber("0.7", 1, 0, 5)).toBe(0.7);
+  });
+
+  test("NaN / non-numeric values fall back to the default", () => {
+    expect(normalizeBoundedNumber(Number.NaN, 1.5, 0, 5)).toBe(1.5);
+    expect(normalizeBoundedNumber("ninety", 1.5, 0, 5)).toBe(1.5);
+    expect(normalizeBoundedNumber(undefined, 1.5, 0, 5)).toBe(1.5);
+    expect(normalizeBoundedNumber(null, 1.5, 0, 5)).toBe(1.5);
+    expect(normalizeBoundedNumber({}, 1.5, 0, 5)).toBe(1.5);
+  });
+
+  test("out-of-range values fall back to the default", () => {
+    expect(normalizeBoundedNumber(5.1, 1.5, 0, 5)).toBe(1.5);
+    expect(normalizeBoundedNumber(-0.1, 1.5, 0, 5)).toBe(1.5);
+  });
+
+  test("empty string falls back to the default (does not coerce to 0)", () => {
+    expect(normalizeBoundedNumber("", 1.5, 0, 5)).toBe(1.5);
+    expect(normalizeBoundedNumber("   ", 1.5, 0, 5)).toBe(1.5);
+  });
+});
+
+describe("applyBudgetEnvOverrides — v3 P1 keys", () => {
+  const base = {
+    enabled: true,
+    pollSeconds: 60,
+    pauseAt: 90,
+    resumeBelow: 30,
+    syncDriftPct: 10,
+    parallel: { minRemainingPct: 60, timeWindowSec: 3600 },
+    codexTierControl: false,
+    codexTiers: {
+      full: { effort: "high" },
+      balanced: { effort: "medium" },
+      eco: { effort: "low" },
+    },
+    strategy: "conserve" as const,
+  };
+
+  test("AGENTBRIDGE_BUDGET_STRATEGY overrides the strategy", () => {
+    const result = applyBudgetEnvOverrides(base, {
+      AGENTBRIDGE_BUDGET_STRATEGY: "maximize",
+    });
+    expect(result.strategy).toBe("maximize");
+  });
+
+  test("invalid AGENTBRIDGE_BUDGET_STRATEGY keeps the base value", () => {
+    const result = applyBudgetEnvOverrides(base, {
+      AGENTBRIDGE_BUDGET_STRATEGY: "turbo",
+    });
+    expect(result.strategy).toBe("conserve");
+  });
+
+  test("v3 env keys leave the rest of the config untouched", () => {
+    const result = applyBudgetEnvOverrides(base, {
+      AGENTBRIDGE_BUDGET_STRATEGY: "maximize",
+    });
+    expect(result.pauseAt).toBe(90);
+    expect(result.resumeBelow).toBe(30);
   });
 });

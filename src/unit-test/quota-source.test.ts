@@ -582,3 +582,119 @@ describe("QuotaSource", () => {
     await expect(source.fetchBoth()).resolves.toEqual({ claude: null, codex: null });
   });
 });
+
+describe("quota-source — guard burn fields (v3 layered amendment)", () => {
+  const NOW2 = 1_700_000_000;
+
+  function bucketWith(extra: Record<string, unknown>) {
+    return {
+      ok: true,
+      util: 42,
+      warn_util: 42,
+      fetched_at: NOW2,
+      buckets: [
+        { id: "five_hour", util: 42, reset_epoch: NOW2 + 3600, ...extra },
+      ],
+    };
+  }
+
+  test("passes a complete field group through verbatim", () => {
+    const usage = normalizeProbeResult(
+      bucketWith({
+        burn_rate_pct_per_hour: 1.25,
+        burn_confident: true,
+        runway_seconds: 1800,
+        depleted_at_epoch: NOW2 + 1800,
+        five_hour_windows_left: 2.4,
+      }),
+    );
+    expect(usage!.fiveHour).toEqual({
+      util: 42,
+      resetEpoch: NOW2 + 3600,
+      burnRate: 1.25,
+      burnConfident: true,
+      runwaySeconds: 1800,
+      depletedAtEpoch: NOW2 + 1800,
+      fiveHourWindowsLeft: 2.4,
+    });
+  });
+
+  test("a negative burn rate poisons the WHOLE group (window itself survives)", () => {
+    const usage = normalizeProbeResult(
+      bucketWith({
+        burn_rate_pct_per_hour: -1,
+        burn_confident: true,
+        runway_seconds: 1800,
+      }),
+    );
+    expect(usage!.fiveHour).toEqual({ util: 42, resetEpoch: NOW2 + 3600 });
+  });
+
+  test("non-numeric runway_seconds poisons the group (strings are NOT tolerated here)", () => {
+    const usage = normalizeProbeResult(
+      bucketWith({ burn_rate_pct_per_hour: 1.25, runway_seconds: "1800" }),
+    );
+    expect(usage!.fiveHour).toEqual({ util: 42, resetEpoch: NOW2 + 3600 });
+  });
+
+  test("non-numeric five_hour_windows_left poisons the group (strings are NOT tolerated here)", () => {
+    const usage = normalizeProbeResult(
+      bucketWith({
+        burn_rate_pct_per_hour: 1.25,
+        burn_confident: true,
+        runway_seconds: 1800,
+        five_hour_windows_left: "2.4",
+      }),
+    );
+    expect(usage!.fiveHour).toEqual({ util: 42, resetEpoch: NOW2 + 3600 });
+  });
+
+  test("NaN burn rate and non-boolean burn_confident each poison the group", () => {
+    expect(
+      normalizeProbeResult(bucketWith({ burn_rate_pct_per_hour: Number.NaN }))!.fiveHour,
+    ).toEqual({ util: 42, resetEpoch: NOW2 + 3600 });
+    expect(
+      normalizeProbeResult(bucketWith({ burn_rate_pct_per_hour: 1, burn_confident: "yes" }))!.fiveHour,
+    ).toEqual({ util: 42, resetEpoch: NOW2 + 3600 });
+  });
+
+  test("partial group keeps the valid present fields (guard omits what it cannot estimate)", () => {
+    const usage = normalizeProbeResult(
+      bucketWith({ burn_rate_pct_per_hour: 0.8, burn_confident: false }),
+    );
+    expect(usage!.fiveHour).toEqual({
+      util: 42,
+      resetEpoch: NOW2 + 3600,
+      burnRate: 0.8,
+      burnConfident: false,
+    });
+  });
+
+  test("legacy probe output without burn fields parses exactly as before", () => {
+    const usage = normalizeProbeResult(bucketWith({}));
+    expect(usage!.fiveHour).toEqual({ util: 42, resetEpoch: NOW2 + 3600 });
+  });
+
+  test("top-level probe_schema 2 is tolerated and burn fields ride the top-level fallback", () => {
+    const usage = normalizeProbeResult({
+      ok: true,
+      probe_schema: 2,
+      util: 42,
+      fetched_at: NOW2,
+      reset_epoch: NOW2 + 3600,
+      burn_rate_pct_per_hour: 1.1,
+      burn_confident: true,
+      runway_seconds: 900,
+      depleted_at_epoch: NOW2 + 900,
+    });
+    expect(usage!.parsedVia).toBe("top-level");
+    expect(usage!.fiveHour).toEqual({
+      util: 42,
+      resetEpoch: NOW2 + 3600,
+      burnRate: 1.1,
+      burnConfident: true,
+      runwaySeconds: 900,
+      depletedAtEpoch: NOW2 + 900,
+    });
+  });
+});

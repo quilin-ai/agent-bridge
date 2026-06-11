@@ -4,6 +4,7 @@ import {
   INITIAL_FINGERPRINT_STATE,
   type FingerprintState,
 } from "./budget-fingerprint";
+import { agentBurnRates, agentRunway, hasAnyBurnSignal } from "./burn-view";
 import type {
   AgentName,
   AgentUsage,
@@ -427,6 +428,27 @@ export class BudgetCoordinator {
       parallelRecommended: paused ? false : state.parallel.recommended,
       codexTier: state.effort.codexTier,
       claudeAdvice: state.effort.claudeAdvice,
+      ...this.burnRateSnapshotFields(state),
     };
+  }
+
+  /**
+   * v3 P1 burn fields (display-only, layered amendment): pass the guard's
+   * decision-grade probe fields through verbatim — the bridge selects (min
+   * across windows) but never computes. Absent entirely when the probe
+   * carries no burn signal (old guard / not enough samples), keeping the
+   * legacy snapshot shape for old consumers.
+   */
+  private burnRateSnapshotFields(state: BudgetState): Pick<BudgetSnapshot, "burnRate" | "runway"> | Record<never, never> {
+    const rates = {
+      claude: agentBurnRates(state.perAgent.claude),
+      codex: agentBurnRates(state.perAgent.codex),
+    };
+    const runway = {
+      claude: agentRunway(state.perAgent.claude, state.now),
+      codex: agentRunway(state.perAgent.codex, state.now),
+    };
+    if (!hasAnyBurnSignal(rates, runway)) return {};
+    return { burnRate: rates, runway };
   }
 }

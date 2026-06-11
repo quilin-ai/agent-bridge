@@ -6,7 +6,37 @@
  * User-facing text is Chinese per project convention.
  */
 
-import type { AgentUsage, BudgetSnapshot } from "./types";
+import { agentWeeklyFiveHourWindowsLeft } from "./burn-view";
+import type {
+  AgentBurnRates,
+  AgentUsage,
+  BudgetSnapshot,
+  BudgetWindowKey,
+  BurnRate,
+  RunwayEstimate,
+} from "./types";
+
+/**
+ * Default outer quota-guard hard line (the user's agent-quota-guard
+ * BUDGET_HARD default). Display-only context for the v3 Q7 annotation —
+ * never feeds any pause/resume decision.
+ */
+export const DEFAULT_GUARD_HARD_PCT = 92;
+
+/**
+ * Resolve the guard hard-line DISPLAY hint: AGENTBRIDGE_GUARD_HARD_HINT
+ * overrides the default 92; invalid or out-of-range values fall back. Only
+ * affects rendering (Q7 enhanced-B), never the strategy layer.
+ */
+export function resolveGuardHardHint(
+  env: Record<string, string | undefined> = process.env,
+): number {
+  const raw = env.AGENTBRIDGE_GUARD_HARD_HINT;
+  if (raw === undefined || raw.trim() === "") return DEFAULT_GUARD_HARD_PCT;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 1 || parsed > 100) return DEFAULT_GUARD_HARD_PCT;
+  return parsed;
+}
 
 function formatEpoch(epochSeconds: number | null | undefined): string {
   if (!epochSeconds || epochSeconds <= 0) return "未知";
@@ -43,6 +73,125 @@ function formatAgent(name: string, usage: AgentUsage | null, snapshotAt: number)
   return `${name}：${parts.join(" · ")}`;
 }
 
+const WINDOW_LABELS: Record<BudgetWindowKey, string> = {
+  fiveHour: "5h 窗口",
+  weekly: "周窗口",
+};
+
+/**
+ * Tolerance for "runway truncated by the window reset": the guard's neutral
+ * runway_seconds is reset-truncated, so when it lands within this many
+ * seconds of the basis window's reset, the binding constraint is the refresh
+ * itself, not depletion — annotate accordingly instead of implying the quota
+ * runs out.
+ */
+const RESET_TRUNCATION_EPSILON_SEC = 60;
+
+/** Format a duration as 「X小时Y分钟」 (minutes rounded; <1h shows 「Y分钟」). */
+export function formatDuration(seconds: number): string {
+  const totalMinutes = Math.max(0, Math.round(seconds / 60));
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  if (hours === 0) return `${minutes}分钟`;
+  return `${hours}小时${minutes}分钟`;
+}
+
+/** Format an epoch as a LOCAL-timezone wall-clock 「HH:MM」. */
+export function formatClockTime(epochSeconds: number): string {
+  const date = new Date(epochSeconds * 1000);
+  const hh = String(date.getHours()).padStart(2, "0");
+  const mm = String(date.getMinutes()).padStart(2, "0");
+  return `${hh}:${mm}`;
+}
+
+function formatWindowRate(label: string, rate: BurnRate | null): string | null {
+  if (!rate) return null;
+  if (!rate.confident) return `${label} 采样中`;
+  return `${label} ≈${rate.pctPerHour.toFixed(2)}%/h`;
+}
+
+/**
+ * The runway display segment. All numbers are the guard's verbatim fields
+ * (constraint #2: the bridge never recomputes) — this function only formats:
+ *  - duration from runway_seconds;
+ *  - 「至 HH:MM」 from depleted_at_epoch (local clock; omitted when absent);
+ *  - the reset-truncation note when runway_seconds ends at the basis
+ *    window's reset (refresh un-blocks before depletion would).
+ */
+function formatRunwaySegment(
+  runway: RunwayEstimate,
+  basisWindow: AgentUsage["fiveHour"],
+  snapshotAt: number,
+): string {
+  const truncatedByReset =
+    basisWindow !== null &&
+    basisWindow.resetEpoch > 0 &&
+    snapshotAt + runway.seconds >= basisWindow.resetEpoch - RESET_TRUNCATION_EPSILON_SEC;
+
+  const clock = runway.depletedAtEpoch ? formatClockTime(runway.depletedAtEpoch) : null;
+  let clockNote: string;
+  if (clock) {
+    clockNote = truncatedByReset ? `至 ${clock} 窗口刷新即截断，` : `至 ${clock}，`;
+  } else {
+    clockNote = truncatedByReset ? "窗口刷新即截断，" : "";
+  }
+  return `约可再工作 ${formatDuration(runway.seconds)}（${clockNote}${WINDOW_LABELS[runway.basis]}为约束）`;
+}
+
+/**
+ * One burn-rate/runway line per agent (v3 P1, layered amendment). Returns
+ * null when the agent has no rate data at all — legacy snapshots (and old
+ * guard probes without the burn fields) render exactly as before.
+ *
+ * Claude guard annotation (Q7, honesty-first choice): the guard's
+ * runway_seconds is the NEUTRAL "to 100%" estimate, but quota-guard
+ * hard-stops the Claude process at its own hard line (default 92%) first.
+ * Rather than scaling the number ourselves (a proportional fold assumes
+ * linear burn AND breaks when the runway is reset-truncated — effectively a
+ * recomputation, which constraint #2 forbids), we display the guard's number
+ * untouched and state the caveat explicitly.
+ */
+function formatBurnRateLine(
+  name: string,
+  usage: AgentUsage | null,
+  rates: AgentBurnRates,
+  runway: RunwayEstimate | null,
+  snapshotAt: number,
+  guardHardPct: number | null,
+): string | null {
+  const parts = [
+    formatWindowRate("5h", rates.fiveHour),
+    formatWindowRate("周", rates.weekly),
+  ].filter((part): part is string => part !== null);
+  if (parts.length === 0 && !runway) return null;
+
+  if (runway) {
+    const basisWindow = usage ? usage[runway.basis] : null;
+    parts.push(formatRunwaySegment(runway, basisWindow, snapshotAt));
+  }
+  if (guardHardPct !== null) {
+    parts.push(
+      `外层 guard 硬线 ${guardHardPct}%（v3 不可越过；runway 为中性口径，Claude 会先在硬线被外层停住）`,
+    );
+  }
+  return `${name} 燃尽率：${parts.join(" · ")}`;
+}
+
+function formatFiveHourWindowsLeftLine(snapshot: BudgetSnapshot): string | null {
+  const values: Array<[string, number]> = [];
+  const claude = agentWeeklyFiveHourWindowsLeft(snapshot.claude, snapshot.updatedAt);
+  const codex = agentWeeklyFiveHourWindowsLeft(snapshot.codex, snapshot.updatedAt);
+  if (claude !== null) values.push(["Claude", claude]);
+  if (codex !== null) values.push(["Codex", codex]);
+  if (values.length === 0) return null;
+
+  const unique = [...new Set(values.map(([, value]) => value.toFixed(1)))];
+  if (unique.length === 1) return `按当前节奏，周额度还够 ~${unique[0]} 个 5h 窗口`;
+
+  const byAgent = values.map(([name, value]) => `${name} ~${value.toFixed(1)}`).join(" / ");
+  return `按当前节奏，周额度还够 ${byAgent} 个 5h 窗口`;
+}
+
 const PHASE_LABELS: Record<BudgetSnapshot["phase"], string> = {
   normal: "normal（正常）",
   balance: "balance（需均衡）",
@@ -52,11 +201,42 @@ const PHASE_LABELS: Record<BudgetSnapshot["phase"], string> = {
 };
 
 /** Render a budget snapshot as readable Chinese text. */
-export function renderBudgetSnapshot(snapshot: BudgetSnapshot): string {
+export function renderBudgetSnapshot(
+  snapshot: BudgetSnapshot,
+  options: { guardHardPct?: number } = {},
+): string {
+  const guardHardPct = options.guardHardPct ?? resolveGuardHardHint();
   const lines: string[] = [];
   lines.push(`【预算快照 · 账号级】阶段：${PHASE_LABELS[snapshot.phase]} · 更新于 ${formatEpoch(snapshot.updatedAt)}`);
   lines.push(formatAgent("Claude", snapshot.claude, snapshot.updatedAt));
   lines.push(formatAgent("Codex", snapshot.codex, snapshot.updatedAt));
+
+  // v3 P1 (layered amendment): burn-rate / runway lines, present only when the
+  // guard probe supplied the optional decision-grade fields. The guard-hardline
+  // annotation applies to the CLAUDE side only — quota-guard supervises the
+  // Claude process; Codex has no such bound.
+  if (snapshot.burnRate) {
+    const claudeLine = formatBurnRateLine(
+      "Claude",
+      snapshot.claude,
+      snapshot.burnRate.claude,
+      snapshot.runway?.claude ?? null,
+      snapshot.updatedAt,
+      guardHardPct,
+    );
+    if (claudeLine) lines.push(claudeLine);
+    const codexLine = formatBurnRateLine(
+      "Codex",
+      snapshot.codex,
+      snapshot.burnRate.codex,
+      snapshot.runway?.codex ?? null,
+      snapshot.updatedAt,
+      null,
+    );
+    if (codexLine) lines.push(codexLine);
+  }
+  const fiveHourWindowsLeftLine = formatFiveHourWindowsLeftLine(snapshot);
+  if (fiveHourWindowsLeftLine) lines.push(fiveHourWindowsLeftLine);
 
   if (snapshot.claude && snapshot.codex) {
     const abs = Math.abs(snapshot.driftPct);

@@ -1,7 +1,7 @@
 import { readFileSync, mkdirSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { atomicWriteJson } from "./atomic-json";
-import type { BudgetConfig, CodexTierMap, CodexTurnOverrides } from "./budget/types";
+import type { BudgetConfig, BudgetStrategy, CodexTierMap, CodexTurnOverrides } from "./budget/types";
 
 /** Machine-readable project config schema. */
 export interface AgentBridgeConfig {
@@ -38,6 +38,10 @@ const DEFAULT_BUDGET_CONFIG: BudgetConfig = {
     balanced: { effort: "medium" },
     eco: { effort: "low" },
   },
+  // v3 P1: strategy is parse-and-validate only (behavior stays conserve; the
+  // value feeds the doctor Q7 guard-hardline check). Burn-rate data is
+  // consumed from the guard probe — no collection config on this side.
+  strategy: "conserve",
 };
 
 const DEFAULT_CONFIG: AgentBridgeConfig = {
@@ -212,6 +216,37 @@ function normalizeBoundedInteger(
   return parsed;
 }
 
+/**
+ * Bounded validation for FRACTIONAL config parameters (v3 Q6 consensus:
+ * upcoming keys like reserveSlopePctPerHour are decimals, so the ×10-integer
+ * hack is rejected in favor of first-class number support). Signature mirrors
+ * {@link normalizeBoundedInteger}; unlike normalizeInteger's coercion, an
+ * empty/whitespace string falls back instead of coercing to 0.
+ */
+export function normalizeBoundedNumber(
+  value: unknown,
+  fallback: number,
+  min: number,
+  max: number,
+): number {
+  let parsed: number;
+  if (typeof value === "number") {
+    parsed = value;
+  } else if (typeof value === "string" && value.trim() !== "") {
+    parsed = Number(value);
+  } else {
+    return fallback;
+  }
+  if (!Number.isFinite(parsed)) return fallback;
+  if (parsed < min || parsed > max) return fallback;
+  return parsed;
+}
+
+/** v3 strategy selector: anything but the two known literals falls back. */
+function normalizeStrategy(value: unknown, fallback: BudgetStrategy): BudgetStrategy {
+  return value === "conserve" || value === "maximize" ? value : fallback;
+}
+
 function normalizeBoolean(value: unknown, fallback: boolean): boolean {
   if (typeof value === "boolean") return value;
   // Accept common env-var spellings ("1"/"0") alongside JSON-ish "true"/"false".
@@ -306,6 +341,7 @@ function normalizeBudgetConfig(
       normalizeBoolean(budget.codexTierControl, fallback.codexTierControl) &&
       codexTiers.full !== null,
     codexTiers,
+    strategy: normalizeStrategy(budget.strategy, fallback.strategy),
   };
 }
 
@@ -333,6 +369,7 @@ export function applyBudgetEnvOverrides(
     // Tier mapping is file-config only (nested structure doesn't fit env vars);
     // re-normalization re-applies the full-restore activation rule.
     codexTiers: budget.codexTiers,
+    strategy: env.AGENTBRIDGE_BUDGET_STRATEGY ?? budget.strategy,
   };
   return normalizeBudgetConfig(overlay, budget);
 }

@@ -2,7 +2,12 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, truncateSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { describeBuildDrift, evaluateArtifactAlignment, runDoctor } from "../cli/doctor";
+import {
+  describeBuildDrift,
+  evaluateArtifactAlignment,
+  evaluateBudgetStrategyGuard,
+  runDoctor,
+} from "../cli/doctor";
 import { derivePairId, writeRegistry } from "../pair-registry";
 import type { AgentBridgeBuildInfo } from "../build-info";
 
@@ -91,6 +96,7 @@ describe("doctor command", () => {
         "pair registration",
         "env",
         "config.json",
+        "budget strategy", // v3 P1 Q7 enhanced-B check
         "daemon health",
         "daemon readiness",
         "codex app-server",
@@ -354,5 +360,32 @@ describe("describeBuildDrift (basis annotation)", () => {
     const described = describeBuildDrift(runtime, launcher);
     expect(described.detail).toContain("stamp");
     expect(described.hint).toContain("squash");
+  });
+});
+
+describe("evaluateBudgetStrategyGuard (v3 P1 Q7 enhanced-B)", () => {
+  test("strategy=conserve → ok (v2-equivalent behavior)", () => {
+    const check = evaluateBudgetStrategyGuard("conserve", 92);
+    expect(check.name).toBe("budget strategy");
+    expect(check.status).toBe("ok");
+    expect(check.detail).toContain("conserve");
+  });
+
+  test("strategy=maximize with guard hardline below targetUtil → warn", () => {
+    const check = evaluateBudgetStrategyGuard("maximize", 92);
+    expect(check.status).toBe("warn");
+    expect(check.detail).toContain("92");
+    expect(check.detail).toContain("97");
+    expect(check.hint).toContain("外层 quota-guard 硬线");
+  });
+
+  test("strategy=maximize with guard hardline at/above targetUtil → ok", () => {
+    expect(evaluateBudgetStrategyGuard("maximize", 97).status).toBe("ok");
+    expect(evaluateBudgetStrategyGuard("maximize", 98).status).toBe("ok");
+  });
+
+  test("custom targetUtil is honored", () => {
+    expect(evaluateBudgetStrategyGuard("maximize", 92, 90).status).toBe("ok");
+    expect(evaluateBudgetStrategyGuard("maximize", 89, 90).status).toBe("warn");
   });
 });

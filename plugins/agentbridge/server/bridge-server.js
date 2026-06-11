@@ -13863,7 +13863,48 @@ class StateDirResolver {
   }
 }
 
+// src/budget/types.ts
+var STALE_MAX_AGE_SEC = 600;
+
+// src/budget/budget-state.ts
+function isDecisionGrade(usage, now) {
+  if (!usage)
+    return false;
+  const freshWindow = usage.fiveHour !== null && usage.fiveHour.resetEpoch > now || usage.weekly !== null && usage.weekly.resetEpoch > now;
+  if (!freshWindow)
+    return false;
+  if (usage.fetchedAt > 0 && now - usage.fetchedAt > STALE_MAX_AGE_SEC)
+    return false;
+  return true;
+}
+
+// src/budget/burn-view.ts
+function agentWeeklyFiveHourWindowsLeft(usage, now) {
+  if (!usage || usage.stale || !usage.ok)
+    return null;
+  if (!isDecisionGrade(usage, now))
+    return null;
+  const weekly = usage.weekly;
+  if (!weekly || weekly.resetEpoch <= now)
+    return null;
+  if (weekly.burnConfident !== true)
+    return null;
+  if (weekly.runwaySeconds === undefined)
+    return null;
+  return weekly.fiveHourWindowsLeft ?? null;
+}
+
 // src/budget/render.ts
+var DEFAULT_GUARD_HARD_PCT = 92;
+function resolveGuardHardHint(env = process.env) {
+  const raw = env.AGENTBRIDGE_GUARD_HARD_HINT;
+  if (raw === undefined || raw.trim() === "")
+    return DEFAULT_GUARD_HARD_PCT;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 1 || parsed > 100)
+    return DEFAULT_GUARD_HARD_PCT;
+  return parsed;
+}
 function formatEpoch(epochSeconds) {
   if (!epochSeconds || epochSeconds <= 0)
     return "\u672A\u77E5";
@@ -13897,17 +13938,98 @@ function formatAgent(name, usage, snapshotAt) {
   }
   return `${name}\uFF1A${parts.join(" \xB7 ")}`;
 }
+var WINDOW_LABELS = {
+  fiveHour: "5h \u7A97\u53E3",
+  weekly: "\u5468\u7A97\u53E3"
+};
+var RESET_TRUNCATION_EPSILON_SEC = 60;
+function formatDuration(seconds) {
+  const totalMinutes = Math.max(0, Math.round(seconds / 60));
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  if (hours === 0)
+    return `${minutes}\u5206\u949F`;
+  return `${hours}\u5C0F\u65F6${minutes}\u5206\u949F`;
+}
+function formatClockTime(epochSeconds) {
+  const date4 = new Date(epochSeconds * 1000);
+  const hh = String(date4.getHours()).padStart(2, "0");
+  const mm = String(date4.getMinutes()).padStart(2, "0");
+  return `${hh}:${mm}`;
+}
+function formatWindowRate(label, rate) {
+  if (!rate)
+    return null;
+  if (!rate.confident)
+    return `${label} \u91C7\u6837\u4E2D`;
+  return `${label} \u2248${rate.pctPerHour.toFixed(2)}%/h`;
+}
+function formatRunwaySegment(runway, basisWindow, snapshotAt) {
+  const truncatedByReset = basisWindow !== null && basisWindow.resetEpoch > 0 && snapshotAt + runway.seconds >= basisWindow.resetEpoch - RESET_TRUNCATION_EPSILON_SEC;
+  const clock = runway.depletedAtEpoch ? formatClockTime(runway.depletedAtEpoch) : null;
+  let clockNote;
+  if (clock) {
+    clockNote = truncatedByReset ? `\u81F3 ${clock} \u7A97\u53E3\u5237\u65B0\u5373\u622A\u65AD\uFF0C` : `\u81F3 ${clock}\uFF0C`;
+  } else {
+    clockNote = truncatedByReset ? "\u7A97\u53E3\u5237\u65B0\u5373\u622A\u65AD\uFF0C" : "";
+  }
+  return `\u7EA6\u53EF\u518D\u5DE5\u4F5C ${formatDuration(runway.seconds)}\uFF08${clockNote}${WINDOW_LABELS[runway.basis]}\u4E3A\u7EA6\u675F\uFF09`;
+}
+function formatBurnRateLine(name, usage, rates, runway, snapshotAt, guardHardPct) {
+  const parts = [
+    formatWindowRate("5h", rates.fiveHour),
+    formatWindowRate("\u5468", rates.weekly)
+  ].filter((part) => part !== null);
+  if (parts.length === 0 && !runway)
+    return null;
+  if (runway) {
+    const basisWindow = usage ? usage[runway.basis] : null;
+    parts.push(formatRunwaySegment(runway, basisWindow, snapshotAt));
+  }
+  if (guardHardPct !== null) {
+    parts.push(`\u5916\u5C42 guard \u786C\u7EBF ${guardHardPct}%\uFF08v3 \u4E0D\u53EF\u8D8A\u8FC7\uFF1Brunway \u4E3A\u4E2D\u6027\u53E3\u5F84\uFF0CClaude \u4F1A\u5148\u5728\u786C\u7EBF\u88AB\u5916\u5C42\u505C\u4F4F\uFF09`);
+  }
+  return `${name} \u71C3\u5C3D\u7387\uFF1A${parts.join(" \xB7 ")}`;
+}
+function formatFiveHourWindowsLeftLine(snapshot) {
+  const values = [];
+  const claude = agentWeeklyFiveHourWindowsLeft(snapshot.claude, snapshot.updatedAt);
+  const codex = agentWeeklyFiveHourWindowsLeft(snapshot.codex, snapshot.updatedAt);
+  if (claude !== null)
+    values.push(["Claude", claude]);
+  if (codex !== null)
+    values.push(["Codex", codex]);
+  if (values.length === 0)
+    return null;
+  const unique = [...new Set(values.map(([, value]) => value.toFixed(1)))];
+  if (unique.length === 1)
+    return `\u6309\u5F53\u524D\u8282\u594F\uFF0C\u5468\u989D\u5EA6\u8FD8\u591F ~${unique[0]} \u4E2A 5h \u7A97\u53E3`;
+  const byAgent = values.map(([name, value]) => `${name} ~${value.toFixed(1)}`).join(" / ");
+  return `\u6309\u5F53\u524D\u8282\u594F\uFF0C\u5468\u989D\u5EA6\u8FD8\u591F ${byAgent} \u4E2A 5h \u7A97\u53E3`;
+}
 var PHASE_LABELS = {
   normal: "normal\uFF08\u6B63\u5E38\uFF09",
   balance: "balance\uFF08\u9700\u5747\u8861\uFF09",
   parallel: "parallel\uFF08\u5EFA\u8BAE\u5E76\u884C\u63D0\u901F\uFF09",
   paused: "paused\uFF08\u9884\u7B97\u5E72\u9884\u4E2D\uFF09"
 };
-function renderBudgetSnapshot(snapshot) {
+function renderBudgetSnapshot(snapshot, options = {}) {
+  const guardHardPct = options.guardHardPct ?? resolveGuardHardHint();
   const lines = [];
   lines.push(`\u3010\u9884\u7B97\u5FEB\u7167 \xB7 \u8D26\u53F7\u7EA7\u3011\u9636\u6BB5\uFF1A${PHASE_LABELS[snapshot.phase]} \xB7 \u66F4\u65B0\u4E8E ${formatEpoch(snapshot.updatedAt)}`);
   lines.push(formatAgent("Claude", snapshot.claude, snapshot.updatedAt));
   lines.push(formatAgent("Codex", snapshot.codex, snapshot.updatedAt));
+  if (snapshot.burnRate) {
+    const claudeLine = formatBurnRateLine("Claude", snapshot.claude, snapshot.burnRate.claude, snapshot.runway?.claude ?? null, snapshot.updatedAt, guardHardPct);
+    if (claudeLine)
+      lines.push(claudeLine);
+    const codexLine = formatBurnRateLine("Codex", snapshot.codex, snapshot.burnRate.codex, snapshot.runway?.codex ?? null, snapshot.updatedAt, null);
+    if (codexLine)
+      lines.push(codexLine);
+  }
+  const fiveHourWindowsLeftLine = formatFiveHourWindowsLeftLine(snapshot);
+  if (fiveHourWindowsLeftLine)
+    lines.push(fiveHourWindowsLeftLine);
   if (snapshot.claude && snapshot.codex) {
     const abs = Math.abs(snapshot.driftPct);
     if (abs > 0) {
@@ -14390,10 +14512,10 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.13", "0.0.0-source"),
-  commit: defineString("6b96f15", "source"),
+  commit: defineString("dfc093b", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION),
-  codeHash: defineString("191049553049", "source")
+  codeHash: defineString("6dd30dc80352", "source")
 });
 function sameRuntimeContract(a, b) {
   if (!a || !b)
@@ -15424,7 +15546,8 @@ var DEFAULT_BUDGET_CONFIG = {
     full: null,
     balanced: { effort: "medium" },
     eco: { effort: "low" }
-  }
+  },
+  strategy: "conserve"
 };
 var DEFAULT_CONFIG = {
   version: "1.0",
@@ -15502,6 +15625,9 @@ function normalizeBoundedInteger(value, fallback, min, max) {
     return fallback;
   return parsed;
 }
+function normalizeStrategy(value, fallback) {
+  return value === "conserve" || value === "maximize" ? value : fallback;
+}
 function normalizeBoolean(value, fallback) {
   if (typeof value === "boolean")
     return value;
@@ -15550,7 +15676,8 @@ function normalizeBudgetConfig(raw, fallback = DEFAULT_BUDGET_CONFIG) {
       timeWindowSec: normalizeBoundedInteger(parallel.timeWindowSec, fallback.parallel.timeWindowSec, 60, 604800)
     },
     codexTierControl: normalizeBoolean(budget.codexTierControl, fallback.codexTierControl) && codexTiers.full !== null,
-    codexTiers
+    codexTiers,
+    strategy: normalizeStrategy(budget.strategy, fallback.strategy)
   };
 }
 function normalizeConfig(raw) {

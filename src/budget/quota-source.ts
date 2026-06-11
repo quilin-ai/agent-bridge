@@ -40,6 +40,84 @@ interface RawBucket {
   util: number;
   resetEpoch: number;
   resetAfterSeconds: number | null;
+  /** v3 layered amendment: guard burn fields (consume-only), all-or-nothing group. */
+  burn: BurnFieldGroup | null;
+}
+
+/**
+ * Decision-grade burn fields from the guard probe (v3 layered amendment).
+ * The bridge never computes these — it only validates and passes them on.
+ */
+interface BurnFieldGroup {
+  burnRate?: number;
+  burnConfident?: boolean;
+  runwaySeconds?: number;
+  depletedAtEpoch?: number;
+  fiveHourWindowsLeft?: number;
+}
+
+/**
+ * Parse the optional guard burn-field group off one bucket record.
+ *
+ * Strictness contract (Codex acceptance constraint #1): these fields are
+ * decision-grade and producer-controlled, so unlike the tolerant numeric
+ * parsing elsewhere we accept ONLY well-typed values — numbers must be finite
+ * and non-negative (depleted_at_epoch strictly positive), burn_confident must
+ * be a real boolean. Any PRESENT-but-invalid field poisons the entire group
+ * (conserve degradation: no fabricated runway beats a wrong one). Absent
+ * fields are fine individually — the guard omits what it cannot estimate.
+ */
+function parseBurnFields(record: Record<string, unknown>): BurnFieldGroup | null {
+  const group: BurnFieldGroup = {};
+  let any = false;
+
+  const takeNumber = (value: unknown, min: "zero" | "positive"): number | "invalid" | "absent" => {
+    if (value === undefined) return "absent";
+    if (typeof value !== "number" || !Number.isFinite(value)) return "invalid";
+    if (min === "zero" && value < 0) return "invalid";
+    if (min === "positive" && value <= 0) return "invalid";
+    return value;
+  };
+
+  const burnRate = takeNumber(record.burn_rate_pct_per_hour ?? record.burnRatePctPerHour, "zero");
+  if (burnRate === "invalid") return null;
+  if (burnRate !== "absent") {
+    group.burnRate = burnRate;
+    any = true;
+  }
+
+  const confidentRaw = record.burn_confident ?? record.burnConfident;
+  if (confidentRaw !== undefined) {
+    if (typeof confidentRaw !== "boolean") return null;
+    group.burnConfident = confidentRaw;
+    any = true;
+  }
+
+  const runwaySeconds = takeNumber(record.runway_seconds ?? record.runwaySeconds, "zero");
+  if (runwaySeconds === "invalid") return null;
+  if (runwaySeconds !== "absent") {
+    group.runwaySeconds = runwaySeconds;
+    any = true;
+  }
+
+  const depletedAtEpoch = takeNumber(record.depleted_at_epoch ?? record.depletedAtEpoch, "positive");
+  if (depletedAtEpoch === "invalid") return null;
+  if (depletedAtEpoch !== "absent") {
+    group.depletedAtEpoch = depletedAtEpoch;
+    any = true;
+  }
+
+  const fiveHourWindowsLeft = takeNumber(
+    record.five_hour_windows_left ?? record.fiveHourWindowsLeft,
+    "zero",
+  );
+  if (fiveHourWindowsLeft === "invalid") return null;
+  if (fiveHourWindowsLeft !== "absent") {
+    group.fiveHourWindowsLeft = fiveHourWindowsLeft;
+    any = true;
+  }
+
+  return any ? group : null;
 }
 
 const DEFAULT_TIMEOUT_MS = 10_000;
@@ -121,6 +199,7 @@ function normalizeBucket(value: unknown, fetchedAt: number): RawBucket | null {
     util: clamp(util, 0, 100),
     resetEpoch: Math.max(0, resetEpoch),
     resetAfterSeconds: resetAfter === null ? null : Math.max(0, resetAfter),
+    burn: parseBurnFields(bucket),
   };
 }
 
@@ -141,12 +220,23 @@ function normalizeTopLevelBucket(record: Record<string, unknown>, util: number, 
     util: clamp(util, 0, 100),
     resetEpoch: Math.max(0, resetEpoch),
     resetAfterSeconds: resetAfter === null ? null : Math.max(0, resetAfter),
+    burn: parseBurnFields(record),
   };
 }
 
 function toWindow(bucket: RawBucket | null | undefined): BudgetWindow | null {
   if (!bucket) return null;
-  return { util: bucket.util, resetEpoch: bucket.resetEpoch };
+  const window: BudgetWindow = { util: bucket.util, resetEpoch: bucket.resetEpoch };
+  if (bucket.burn) {
+    // Spread only present fields — `toEqual`-style consumers and JSON
+    // serialization must not see explicit-undefined keys.
+    if (bucket.burn.burnRate !== undefined) window.burnRate = bucket.burn.burnRate;
+    if (bucket.burn.burnConfident !== undefined) window.burnConfident = bucket.burn.burnConfident;
+    if (bucket.burn.runwaySeconds !== undefined) window.runwaySeconds = bucket.burn.runwaySeconds;
+    if (bucket.burn.depletedAtEpoch !== undefined) window.depletedAtEpoch = bucket.burn.depletedAtEpoch;
+    if (bucket.burn.fiveHourWindowsLeft !== undefined) window.fiveHourWindowsLeft = bucket.burn.fiveHourWindowsLeft;
+  }
+  return window;
 }
 
 function bucketSortKey(bucket: RawBucket): number {
@@ -260,10 +350,15 @@ function normalizeTolerantProbeRecord(record: Record<string, unknown>): AgentUsa
 
 const PROBE_SCHEMA_PARSERS: Record<string, ProbeParser> = {
   "1": normalizeTolerantProbeRecord,
+  // v3 layered amendment: probe_schema 2 adds the optional per-bucket burn
+  // fields; the tolerant parser already consumes them by presence, so the
+  // version is recognized (no unknown-schema log) but never strictly required.
+  "2": normalizeTolerantProbeRecord,
 };
 
 function schemaVersionKey(record: Record<string, unknown>): string | null {
-  const value = record.schema_version ?? record.schemaVersion;
+  const value =
+    record.schema_version ?? record.schemaVersion ?? record.probe_schema ?? record.probeSchema;
   if (typeof value === "number" && Number.isFinite(value)) return String(value);
   if (typeof value === "string" && value.trim() !== "") return value.trim();
   return null;

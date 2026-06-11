@@ -27,10 +27,10 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.13", "0.0.0-source"),
-  commit: defineString("6b96f15", "source"),
+  commit: defineString("dfc093b", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION),
-  codeHash: defineString("191049553049", "source")
+  codeHash: defineString("6dd30dc80352", "source")
 });
 function daemonStatusBuildInfo() {
   return { ...BUILD_INFO };
@@ -3401,7 +3401,8 @@ var DEFAULT_BUDGET_CONFIG = {
     full: null,
     balanced: { effort: "medium" },
     eco: { effort: "low" }
-  }
+  },
+  strategy: "conserve"
 };
 var DEFAULT_CONFIG = {
   version: "1.0",
@@ -3479,6 +3480,9 @@ function normalizeBoundedInteger(value, fallback, min, max) {
     return fallback;
   return parsed;
 }
+function normalizeStrategy(value, fallback) {
+  return value === "conserve" || value === "maximize" ? value : fallback;
+}
 function normalizeBoolean(value, fallback) {
   if (typeof value === "boolean")
     return value;
@@ -3527,7 +3531,8 @@ function normalizeBudgetConfig(raw, fallback = DEFAULT_BUDGET_CONFIG) {
       timeWindowSec: normalizeBoundedInteger(parallel.timeWindowSec, fallback.parallel.timeWindowSec, 60, 604800)
     },
     codexTierControl: normalizeBoolean(budget.codexTierControl, fallback.codexTierControl) && codexTiers.full !== null,
-    codexTiers
+    codexTiers,
+    strategy: normalizeStrategy(budget.strategy, fallback.strategy)
   };
 }
 function applyBudgetEnvOverrides(budget, env = process.env) {
@@ -3542,7 +3547,8 @@ function applyBudgetEnvOverrides(budget, env = process.env) {
       timeWindowSec: env.AGENTBRIDGE_BUDGET_PARALLEL_TIME_WINDOW_SEC ?? budget.parallel.timeWindowSec
     },
     codexTierControl: env.AGENTBRIDGE_BUDGET_CODEX_TIER_CONTROL ?? budget.codexTierControl,
-    codexTiers: budget.codexTiers
+    codexTiers: budget.codexTiers,
+    strategy: env.AGENTBRIDGE_BUDGET_STRATEGY ?? budget.strategy
   };
   return normalizeBudgetConfig(overlay, budget);
 }
@@ -4038,6 +4044,54 @@ function classifyPoll(prev, state, cfg) {
   return { next: prev, effect: { kind: "none" } };
 }
 
+// src/budget/burn-view.ts
+function windowBurnRate(window) {
+  if (!window || window.burnRate === undefined)
+    return null;
+  return {
+    pctPerHour: window.burnRate,
+    confident: window.burnConfident === true
+  };
+}
+function agentBurnRates(usage) {
+  if (!usage)
+    return { fiveHour: null, weekly: null };
+  return {
+    fiveHour: windowBurnRate(usage.fiveHour),
+    weekly: windowBurnRate(usage.weekly)
+  };
+}
+function agentRunway(usage, now) {
+  if (!usage || usage.stale || !usage.ok)
+    return null;
+  if (!isDecisionGrade(usage, now))
+    return null;
+  let best = null;
+  const candidates = [
+    ["fiveHour", usage.fiveHour],
+    ["weekly", usage.weekly]
+  ];
+  for (const [basis, window] of candidates) {
+    if (!window || window.resetEpoch <= now)
+      continue;
+    if (window.burnConfident !== true)
+      continue;
+    if (window.runwaySeconds === undefined)
+      continue;
+    if (best === null || window.runwaySeconds < best.seconds) {
+      best = {
+        seconds: window.runwaySeconds,
+        basis,
+        depletedAtEpoch: window.depletedAtEpoch ?? null
+      };
+    }
+  }
+  return best;
+}
+function hasAnyBurnSignal(rates, runway) {
+  return rates.claude.fiveHour !== null || rates.claude.weekly !== null || rates.codex.fiveHour !== null || rates.codex.weekly !== null || runway.claude !== null || runway.codex !== null;
+}
+
 // src/budget/budget-coordinator.ts
 var LOW_UTIL_PCT = 50;
 var NEAR_PAUSE_MARGIN_PCT = 10;
@@ -4348,8 +4402,22 @@ class BudgetCoordinator {
       resumeAfterEpoch: paused ? this.fpState.resumeEpoch ?? state.pause.resumeAfterEpoch : null,
       parallelRecommended: paused ? false : state.parallel.recommended,
       codexTier: state.effort.codexTier,
-      claudeAdvice: state.effort.claudeAdvice
+      claudeAdvice: state.effort.claudeAdvice,
+      ...this.burnRateSnapshotFields(state)
     };
+  }
+  burnRateSnapshotFields(state) {
+    const rates = {
+      claude: agentBurnRates(state.perAgent.claude),
+      codex: agentBurnRates(state.perAgent.codex)
+    };
+    const runway = {
+      claude: agentRunway(state.perAgent.claude, state.now),
+      codex: agentRunway(state.perAgent.codex, state.now)
+    };
+    if (!hasAnyBurnSignal(rates, runway))
+      return {};
+    return { burnRate: rates, runway };
   }
 }
 
@@ -4358,6 +4426,57 @@ import { execFile } from "child_process";
 import { existsSync as existsSync5 } from "fs";
 import { homedir as homedir2 } from "os";
 import { basename, join as join5 } from "path";
+function parseBurnFields(record) {
+  const group = {};
+  let any = false;
+  const takeNumber = (value, min) => {
+    if (value === undefined)
+      return "absent";
+    if (typeof value !== "number" || !Number.isFinite(value))
+      return "invalid";
+    if (min === "zero" && value < 0)
+      return "invalid";
+    if (min === "positive" && value <= 0)
+      return "invalid";
+    return value;
+  };
+  const burnRate = takeNumber(record.burn_rate_pct_per_hour ?? record.burnRatePctPerHour, "zero");
+  if (burnRate === "invalid")
+    return null;
+  if (burnRate !== "absent") {
+    group.burnRate = burnRate;
+    any = true;
+  }
+  const confidentRaw = record.burn_confident ?? record.burnConfident;
+  if (confidentRaw !== undefined) {
+    if (typeof confidentRaw !== "boolean")
+      return null;
+    group.burnConfident = confidentRaw;
+    any = true;
+  }
+  const runwaySeconds = takeNumber(record.runway_seconds ?? record.runwaySeconds, "zero");
+  if (runwaySeconds === "invalid")
+    return null;
+  if (runwaySeconds !== "absent") {
+    group.runwaySeconds = runwaySeconds;
+    any = true;
+  }
+  const depletedAtEpoch = takeNumber(record.depleted_at_epoch ?? record.depletedAtEpoch, "positive");
+  if (depletedAtEpoch === "invalid")
+    return null;
+  if (depletedAtEpoch !== "absent") {
+    group.depletedAtEpoch = depletedAtEpoch;
+    any = true;
+  }
+  const fiveHourWindowsLeft = takeNumber(record.five_hour_windows_left ?? record.fiveHourWindowsLeft, "zero");
+  if (fiveHourWindowsLeft === "invalid")
+    return null;
+  if (fiveHourWindowsLeft !== "absent") {
+    group.fiveHourWindowsLeft = fiveHourWindowsLeft;
+    any = true;
+  }
+  return any ? group : null;
+}
 var DEFAULT_TIMEOUT_MS = 1e4;
 var MAX_BUFFER = 1024 * 1024;
 function defaultRunner(command, args, options) {
@@ -4419,7 +4538,8 @@ function normalizeBucket(value, fetchedAt) {
     id,
     util: clamp(util, 0, 100),
     resetEpoch: Math.max(0, resetEpoch),
-    resetAfterSeconds: resetAfter === null ? null : Math.max(0, resetAfter)
+    resetAfterSeconds: resetAfter === null ? null : Math.max(0, resetAfter),
+    burn: parseBurnFields(bucket)
   };
 }
 function normalizeTopLevelBucket(record, util, fetchedAt) {
@@ -4432,13 +4552,27 @@ function normalizeTopLevelBucket(record, util, fetchedAt) {
     id: "top_level",
     util: clamp(util, 0, 100),
     resetEpoch: Math.max(0, resetEpoch),
-    resetAfterSeconds: resetAfter === null ? null : Math.max(0, resetAfter)
+    resetAfterSeconds: resetAfter === null ? null : Math.max(0, resetAfter),
+    burn: parseBurnFields(record)
   };
 }
 function toWindow(bucket) {
   if (!bucket)
     return null;
-  return { util: bucket.util, resetEpoch: bucket.resetEpoch };
+  const window = { util: bucket.util, resetEpoch: bucket.resetEpoch };
+  if (bucket.burn) {
+    if (bucket.burn.burnRate !== undefined)
+      window.burnRate = bucket.burn.burnRate;
+    if (bucket.burn.burnConfident !== undefined)
+      window.burnConfident = bucket.burn.burnConfident;
+    if (bucket.burn.runwaySeconds !== undefined)
+      window.runwaySeconds = bucket.burn.runwaySeconds;
+    if (bucket.burn.depletedAtEpoch !== undefined)
+      window.depletedAtEpoch = bucket.burn.depletedAtEpoch;
+    if (bucket.burn.fiveHourWindowsLeft !== undefined)
+      window.fiveHourWindowsLeft = bucket.burn.fiveHourWindowsLeft;
+  }
+  return window;
 }
 function bucketSortKey(bucket) {
   if (bucket.resetAfterSeconds !== null)
@@ -4518,10 +4652,11 @@ function normalizeTolerantProbeRecord(record) {
   };
 }
 var PROBE_SCHEMA_PARSERS = {
-  "1": normalizeTolerantProbeRecord
+  "1": normalizeTolerantProbeRecord,
+  "2": normalizeTolerantProbeRecord
 };
 function schemaVersionKey(record) {
-  const value = record.schema_version ?? record.schemaVersion;
+  const value = record.schema_version ?? record.schemaVersion ?? record.probe_schema ?? record.probeSchema;
   if (typeof value === "number" && Number.isFinite(value))
     return String(value);
   if (typeof value === "string" && value.trim() !== "")
@@ -5119,7 +5254,7 @@ function ensureBudgetCoordinatorStarted() {
   if (!BUDGET_CONFIG.enabled)
     return;
   if (!budgetCoordinator) {
-    log(`Budget coordinator config: pollSeconds=${BUDGET_CONFIG.pollSeconds} pauseAt=${BUDGET_CONFIG.pauseAt} ` + `resumeBelow=${BUDGET_CONFIG.resumeBelow} syncDriftPct=${BUDGET_CONFIG.syncDriftPct} ` + `parallel=${BUDGET_CONFIG.parallel.minRemainingPct}%/${BUDGET_CONFIG.parallel.timeWindowSec}s ` + `codexTierControl=${BUDGET_CONFIG.codexTierControl} ` + `codexTiersFull=${BUDGET_CONFIG.codexTiers.full ? "configured" : "missing"}`);
+    log(`Budget coordinator config: pollSeconds=${BUDGET_CONFIG.pollSeconds} pauseAt=${BUDGET_CONFIG.pauseAt} ` + `resumeBelow=${BUDGET_CONFIG.resumeBelow} syncDriftPct=${BUDGET_CONFIG.syncDriftPct} ` + `parallel=${BUDGET_CONFIG.parallel.minRemainingPct}%/${BUDGET_CONFIG.parallel.timeWindowSec}s ` + `codexTierControl=${BUDGET_CONFIG.codexTierControl} ` + `codexTiersFull=${BUDGET_CONFIG.codexTiers.full ? "configured" : "missing"} ` + `strategy=${BUDGET_CONFIG.strategy}`);
     budgetCoordinator = new BudgetCoordinator({
       source: createQuotaSource({ log }),
       config: BUDGET_CONFIG,
