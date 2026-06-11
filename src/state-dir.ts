@@ -3,6 +3,26 @@ import { join } from "node:path";
 import { homedir, platform } from "node:os";
 
 /**
+ * Resolve the XDG state base directory, treating an EMPTY string as unset.
+ *
+ * The XDG spec's `${XDG_STATE_HOME:-~/.local/state}` (`:-`, not `:`) falls back
+ * when the variable is unset OR empty. A plain `??` only catches undefined/null,
+ * so `XDG_STATE_HOME=""` would slip through and `join("", "agentbridge")` would
+ * yield the RELATIVE path "agentbridge" — state files written under ./agentbridge
+ * relative to cwd (orphan daemon, port lockout, capability-token silently off).
+ *
+ * Exported (and parameterized on the raw env value) so the empty/unset fallback
+ * is unit-testable on any host platform, since {@link StateDirResolver.platformBaseDir}
+ * only reaches this branch off-darwin.
+ */
+export function resolveXdgStateBase(
+  rawXdg: string | undefined = process.env.XDG_STATE_HOME,
+): string {
+  const xdgState = rawXdg && rawXdg.length > 0 ? rawXdg : join(homedir(), ".local", "state");
+  return join(xdgState, "agentbridge");
+}
+
+/**
  * Resolves the shared runtime state directory for AgentBridge.
  *
  * macOS:  ~/Library/Application Support/AgentBridge
@@ -26,8 +46,7 @@ export class StateDirResolver {
     if (platform() === "darwin") {
       return join(homedir(), "Library", "Application Support", "AgentBridge");
     }
-    const xdgState = process.env.XDG_STATE_HOME ?? join(homedir(), ".local", "state");
-    return join(xdgState, "agentbridge");
+    return resolveXdgStateBase(process.env.XDG_STATE_HOME);
   }
 
   constructor(envOverride?: string) {

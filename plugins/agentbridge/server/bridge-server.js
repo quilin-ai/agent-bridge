@@ -13806,6 +13806,10 @@ function formatError2(error2) {
 import { mkdirSync, existsSync as existsSync2 } from "fs";
 import { join } from "path";
 import { homedir, platform } from "os";
+function resolveXdgStateBase(rawXdg = process.env.XDG_STATE_HOME) {
+  const xdgState = rawXdg && rawXdg.length > 0 ? rawXdg : join(homedir(), ".local", "state");
+  return join(xdgState, "agentbridge");
+}
 
 class StateDirResolver {
   stateDir;
@@ -13813,8 +13817,7 @@ class StateDirResolver {
     if (platform() === "darwin") {
       return join(homedir(), "Library", "Application Support", "AgentBridge");
     }
-    const xdgState = process.env.XDG_STATE_HOME ?? join(homedir(), ".local", "state");
-    return join(xdgState, "agentbridge");
+    return resolveXdgStateBase(process.env.XDG_STATE_HOME);
   }
   constructor(envOverride) {
     const override = envOverride ?? process.env.AGENTBRIDGE_STATE_DIR;
@@ -14382,7 +14385,7 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.12", "0.0.0-source"),
-  commit: defineString("47a6d3e", "source"),
+  commit: defineString("c6147e5", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION)
 });
@@ -15545,13 +15548,13 @@ function normalizeConfig(raw) {
   return {
     version: typeof config2.version === "string" ? config2.version : DEFAULT_CONFIG.version,
     codex: {
-      appPort: normalizeInteger(codex.appPort ?? daemon.port, DEFAULT_CONFIG.codex.appPort),
-      proxyPort: normalizeInteger(codex.proxyPort ?? daemon.proxyPort, DEFAULT_CONFIG.codex.proxyPort)
+      appPort: normalizeBoundedInteger(codex.appPort ?? daemon.port, DEFAULT_CONFIG.codex.appPort, 1, 65535),
+      proxyPort: normalizeBoundedInteger(codex.proxyPort ?? daemon.proxyPort, DEFAULT_CONFIG.codex.proxyPort, 1, 65535)
     },
     turnCoordination: {
-      attentionWindowSeconds: normalizeInteger(turnCoordination.attentionWindowSeconds, DEFAULT_CONFIG.turnCoordination.attentionWindowSeconds)
+      attentionWindowSeconds: normalizeBoundedInteger(turnCoordination.attentionWindowSeconds, DEFAULT_CONFIG.turnCoordination.attentionWindowSeconds, 0, Number.MAX_SAFE_INTEGER)
     },
-    idleShutdownSeconds: normalizeInteger(config2.idleShutdownSeconds, DEFAULT_CONFIG.idleShutdownSeconds),
+    idleShutdownSeconds: normalizeBoundedInteger(config2.idleShutdownSeconds, DEFAULT_CONFIG.idleShutdownSeconds, 1, Number.MAX_SAFE_INTEGER),
     budget: normalizeBudgetConfig(config2.budget)
   };
 }

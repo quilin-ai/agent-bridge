@@ -497,6 +497,85 @@ describe("ConfigService — budget section", () => {
   });
 });
 
+describe("ConfigService — top-level numeric bounds (no negative/zero passthrough)", () => {
+  let tempDir: string;
+
+  beforeEach(() => {
+    tempDir = mkdtempSync(join(tmpdir(), "agentbridge-numeric-bounds-test-"));
+  });
+
+  afterEach(() => {
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  function writeRawConfig(raw: unknown) {
+    mkdirSync(join(tempDir, ".agentbridge"), { recursive: true });
+    writeFileSync(join(tempDir, ".agentbridge", "config.json"), JSON.stringify(raw));
+  }
+
+  test("negative idleShutdownSeconds falls back to default (prevents daemon self-shutdown)", () => {
+    const svc = new ConfigService(tempDir);
+    // A coercible negative passes shape-check; daemon.ts computes *1000 → -N ms,
+    // setTimeout clamps to 0 → daemon self-shuts ~immediately after boot. Must
+    // fall back to the default (30) instead of passing through.
+    writeRawConfig({ idleShutdownSeconds: -1 });
+    const config = expectParsed(svc);
+    expect(config.idleShutdownSeconds).toBe(DEFAULT_CONFIG.idleShutdownSeconds);
+  });
+
+  test("zero idleShutdownSeconds falls back to default (min 1)", () => {
+    const svc = new ConfigService(tempDir);
+    writeRawConfig({ idleShutdownSeconds: 0 });
+    const config = expectParsed(svc);
+    expect(config.idleShutdownSeconds).toBe(DEFAULT_CONFIG.idleShutdownSeconds);
+  });
+
+  test("positive idleShutdownSeconds is honored", () => {
+    const svc = new ConfigService(tempDir);
+    writeRawConfig({ idleShutdownSeconds: 120 });
+    const config = expectParsed(svc);
+    expect(config.idleShutdownSeconds).toBe(120);
+  });
+
+  test("negative attentionWindowSeconds falls back to default; zero is allowed (min 0)", () => {
+    const svc = new ConfigService(tempDir);
+    writeRawConfig({ turnCoordination: { attentionWindowSeconds: -5 } });
+    let config = expectParsed(svc);
+    expect(config.turnCoordination.attentionWindowSeconds).toBe(
+      DEFAULT_CONFIG.turnCoordination.attentionWindowSeconds,
+    );
+
+    // 0 is a legitimate "no attention window" value and must pass through.
+    writeRawConfig({ turnCoordination: { attentionWindowSeconds: 0 } });
+    config = expectParsed(svc);
+    expect(config.turnCoordination.attentionWindowSeconds).toBe(0);
+  });
+
+  test("out-of-range codex ports fall back to defaults (1..65535)", () => {
+    const svc = new ConfigService(tempDir);
+    writeRawConfig({ codex: { appPort: -1, proxyPort: 70000 } });
+    const config = expectParsed(svc);
+    expect(config.codex.appPort).toBe(DEFAULT_CONFIG.codex.appPort);
+    expect(config.codex.proxyPort).toBe(DEFAULT_CONFIG.codex.proxyPort);
+  });
+
+  test("zero codex ports fall back to defaults", () => {
+    const svc = new ConfigService(tempDir);
+    writeRawConfig({ codex: { appPort: 0, proxyPort: 0 } });
+    const config = expectParsed(svc);
+    expect(config.codex.appPort).toBe(DEFAULT_CONFIG.codex.appPort);
+    expect(config.codex.proxyPort).toBe(DEFAULT_CONFIG.codex.proxyPort);
+  });
+
+  test("in-range codex ports are honored", () => {
+    const svc = new ConfigService(tempDir);
+    writeRawConfig({ codex: { appPort: 4600, proxyPort: 4601 } });
+    const config = expectParsed(svc);
+    expect(config.codex.appPort).toBe(4600);
+    expect(config.codex.proxyPort).toBe(4601);
+  });
+});
+
 describe("applyBudgetEnvOverrides", () => {
   const base = {
     enabled: true,
