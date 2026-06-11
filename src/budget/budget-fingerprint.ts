@@ -219,9 +219,18 @@ export function directiveFingerprint(state: BudgetState, activeSide?: ActivePaus
   // parallel (side is always "none"). Proven unreachable — instrumenting them
   // with throws kept all 53 budget tests green — so they are removed.
 
+  // `drift.heavier` is which side carries more usage by drift — relevant only
+  // to a balance/parallel advisory. A pause is keyed on the paused side
+  // (activeSide), so folding `heavier` into a PAUSED fingerprint lets the
+  // NON-paused side's warnUtil re-emit a duplicate pause banner whenever its
+  // drift flips `heavier`, even though the pause itself never changed. Drop
+  // `heavier` from the fingerprint while paused; keep it when not paused so the
+  // balance/parallel dedup behavior is unchanged.
+  const heavier = activeSide ? "" : (state.drift.heavier ?? "none");
+
   return [
     activeSide ? "paused" : state.phase,
-    state.drift.heavier ?? "none",
+    heavier,
     side,
     // Round-to-nearest bucket, not the raw epoch: the probe's reset_epoch
     // jitters by ±1s between polls (observed live: 09:49:59 ⇄ 09:50:00),

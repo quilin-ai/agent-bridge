@@ -22,7 +22,7 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.12", "0.0.0-source"),
-  commit: defineString("ab65a14", "source"),
+  commit: defineString("b00d7b8", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION)
 });
@@ -3886,9 +3886,10 @@ function directiveFingerprint(state, activeSide) {
   } else if (state.phase === "balance" && state.drift.lighter) {
     reset = state.perAgent[state.drift.lighter]?.fiveHour?.resetEpoch ?? 0;
   }
+  const heavier = activeSide ? "" : state.drift.heavier ?? "none";
   return [
     activeSide ? "paused" : state.phase,
-    state.drift.heavier ?? "none",
+    heavier,
     side,
     Math.round(reset / RESET_FINGERPRINT_BUCKET_SEC)
   ].join("|");

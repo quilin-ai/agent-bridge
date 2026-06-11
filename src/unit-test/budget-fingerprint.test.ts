@@ -333,4 +333,59 @@ describe("directiveFingerprint — pure fingerprint", () => {
     );
     expect(directiveFingerprint(a)).toBe(directiveFingerprint(b));
   });
+
+  // Regression (MEDIUM-4): the PAUSED fingerprint must NOT depend on
+  // `drift.heavier`. A pause is keyed on the paused side; `heavier` reflects the
+  // NON-paused side's relative drift, which is irrelevant to a pause decision.
+  // Folding it in let the non-paused side's warnUtil re-emit a DUPLICATE pause
+  // banner whenever its drift flipped `heavier`, even though the pause never
+  // changed.
+  test("paused fingerprint ignores drift.heavier flipped by the non-paused side", () => {
+    // Codex is the paused side (gateUtil 92). Only claude (the NON-paused side)
+    // changes its warnUtil, flipping drift.heavier claude⇄codex while codex's
+    // pause-relevant state stays identical.
+    const heavierClaude = state(
+      usage({ gateUtil: 20, warnUtil: 70 }),
+      usage({ gateUtil: 92, warnUtil: 50, remaining: 8 }),
+    );
+    const heavierCodex = state(
+      usage({ gateUtil: 20, warnUtil: 30 }),
+      usage({ gateUtil: 92, warnUtil: 50, remaining: 8 }),
+    );
+    // Sanity: drift.heavier genuinely flipped between the two states.
+    expect(heavierClaude.drift.heavier).toBe("claude");
+    expect(heavierCodex.drift.heavier).toBe("codex");
+    // The PAUSED fingerprint (activeSide = "codex") must be EQUAL → no dup banner.
+    expect(directiveFingerprint(heavierClaude, "codex")).toBe(
+      directiveFingerprint(heavierCodex, "codex"),
+    );
+  });
+
+  test("not-paused fingerprint still folds in drift.heavier (behavior preserved)", () => {
+    // Two balance states identical except for drift.heavier (lighter held the
+    // same) — the NON-paused path must still distinguish them, or a real
+    // balance-direction change would be silently deduped.
+    const base: BudgetState = {
+      phase: "balance",
+      now: NOW,
+      perAgent: { claude: usage({ gateUtil: 35, warnUtil: 45 }), codex: usage({ gateUtil: 20, warnUtil: 20 }) },
+      drift: { pct: 25, heavier: "claude", lighter: "codex" },
+      pause: {
+        active: false,
+        side: null,
+        reason: null,
+        resumeBelow: CONFIG.resumeBelow,
+        resumeAfterEpoch: null,
+        resetEpochs: { claude: 0, codex: 0 },
+      },
+      parallel: { recommended: false, reason: null },
+      effort: { claudeAdvice: null, codexTier: "full" },
+      directiveToClaude: "balance",
+    };
+    const heavierClaude: BudgetState = { ...base, drift: { ...base.drift, heavier: "claude" } };
+    const heavierCodex: BudgetState = { ...base, drift: { ...base.drift, heavier: "codex" } };
+    // lighter is identical → balance `side` is identical → the ONLY difference is
+    // heavier. The fingerprints must still differ.
+    expect(directiveFingerprint(heavierClaude)).not.toBe(directiveFingerprint(heavierCodex));
+  });
 });
