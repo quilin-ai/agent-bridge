@@ -18,6 +18,7 @@ import type { ControlServerMessage, DaemonStatus } from "../control-protocol";
 import { portsForSlot, type PairPorts } from "../pair-registry";
 import { readControlToken, resolveControlTokenPath } from "../control-token";
 import { CONTRACT_VERSION } from "../contract-version";
+import { installFakeCodex } from "./fixtures/fake-codex-install";
 
 const DAEMON_PATH = join(process.cwd(), "src", "daemon.ts");
 const DEFAULT_TEST_SLOT_START = 2500 + (process.pid % 500);
@@ -1359,9 +1360,7 @@ async function startHarness(opts: {
   const { slot, ports } = await reserveFreePairSlot();
   const { appPort, proxyPort, controlPort } = ports;
 
-  const codexPath = join(binDir, "codex");
-  writeFileSync(codexPath, fakeCodexScript(), "utf-8");
-  chmodSync(codexPath, 0o755);
+  installFakeCodex({ binDir, capability: "command-driven" });
 
   const env = {
     ...scrubAgentBridgeEnv(process.env),
@@ -1542,159 +1541,6 @@ function rawUpgradeStatus(port: number, path: string, origin: string): Promise<s
       reject(e);
     });
   });
-}
-
-function fakeCodexScript(): string {
-  return `#!/usr/bin/env bun
-import { appendFileSync, existsSync, readFileSync, unlinkSync } from "node:fs";
-
-if (process.argv.includes("--version")) {
-  console.log("codex fake");
-  process.exit(0);
-}
-
-if (process.argv[2] !== "app-server") {
-  await Bun.sleep(60_000);
-  process.exit(0);
-}
-
-const listenIndex = process.argv.indexOf("--listen");
-const listen = process.argv[listenIndex + 1];
-const port = Number(new URL(listen).port);
-const commandFile = process.env.FAKE_APP_COMMAND_FILE;
-let appWs = null;
-let lastStartedTurnId = null;
-let turnStartCounter = 0;
-let agentMessageCounter = 0;
-
-const server = Bun.serve({
-  hostname: "127.0.0.1",
-  port,
-  fetch(req, serverInstance) {
-    const url = new URL(req.url);
-    if (url.pathname === "/healthz" || url.pathname === "/readyz") {
-      return Response.json({ ok: true });
-    }
-    if (serverInstance.upgrade(req)) return undefined;
-    return new Response("fake codex app-server");
-  },
-  websocket: {
-    open(ws) {
-      appWs = ws;
-    },
-    message(ws, raw) {
-      // Minimal handshake support: auto-respond to thread/start so the adapter
-      // can detect an active thread and emit "ready" (used by budget gate tests).
-      try {
-        const msg = JSON.parse(typeof raw === "string" ? raw : raw.toString());
-        if (msg.method === "thread/start") {
-          ws.send(JSON.stringify({ id: msg.id, result: { thread: { id: "thread-fake-1" } } }));
-        }
-        // Record received turn/start params (tier-override assertions), then
-        // respond success with the created turn id like the real app-server
-        // (TurnStartResponse.turn.id) so the bridge's turn_started ACK
-        // correlation can be asserted end-to-end. NOTE: deliberately NO
-        // turn/started notification here — emitting one would mark the
-        // adapter busy and break the multi-injection budget tests; the
-        // "start-turn" command drives the busy state explicitly.
-        if (msg.method === "turn/start") {
-          if (process.env.FAKE_APP_TURNSTART_LOG) {
-            appendFileSync(process.env.FAKE_APP_TURNSTART_LOG, JSON.stringify(msg.params) + "\\n");
-          }
-          turnStartCounter += 1;
-          ws.send(JSON.stringify({ id: msg.id, result: { turn: { id: "turn-injected-" + turnStartCounter } } }));
-        }
-        // turn/interrupt: record params, respond success ({}), then emit the
-        // terminal turn/completed for that turnId — mirroring the REAL
-        // app-server (verified in codex-rs): the success response is deferred
-        // until TurnAborted and the interrupted turn's terminal notification
-        // is a normal turn/completed with status "interrupted".
-        if (msg.method === "turn/interrupt") {
-          if (process.env.FAKE_APP_TURNINTERRUPT_LOG) {
-            appendFileSync(process.env.FAKE_APP_TURNINTERRUPT_LOG, JSON.stringify(msg.params) + "\\n");
-          }
-          // Harness-only switch (TOCTOU test): defer the terminal boundary so
-          // the daemon's waitForInterruptOutcome await stays open long enough
-          // for the originating control socket to detach and another to attach
-          // mid-wait. Real app-server defers the success response until
-          // TurnAborted, so deferring BOTH the {} response and the terminal
-          // turn/completed faithfully models a slow interrupt.
-          const interruptDelayMs = Number(process.env.FAKE_APP_INTERRUPT_DELAY_MS || 0);
-          const emitInterruptTerminal = () => {
-            ws.send(JSON.stringify({ id: msg.id, result: {} }));
-            ws.send(JSON.stringify({ method: "turn/completed", params: { turn: { id: msg.params.turnId, status: "interrupted" } } }));
-            if (lastStartedTurnId === msg.params.turnId) lastStartedTurnId = null;
-          };
-          if (interruptDelayMs > 0) {
-            setTimeout(emitInterruptTerminal, interruptDelayMs);
-          } else {
-            emitInterruptTerminal();
-          }
-        }
-        // turn/steer: record params, then ack — or reject when the text carries
-        // the [force-steer-error] marker (drives the steerFailed wiring test).
-        // Strict emulation of the real app-server (expectedTurnId has been
-        // REQUIRED since turn/steer was introduced — live-E2E regression: B0
-        // shipped without the field and every steer bounced): missing field →
-        // serde-style error; wrong value → ExpectedTurnMismatch-style error.
-        if (msg.method === "turn/steer") {
-          if (process.env.FAKE_APP_TURNSTEER_LOG) {
-            appendFileSync(process.env.FAKE_APP_TURNSTEER_LOG, JSON.stringify(msg.params) + "\\n");
-          }
-          const steerText = msg.params?.input?.[0]?.text ?? "";
-          if (typeof msg.params?.expectedTurnId !== "string" || msg.params.expectedTurnId.length === 0) {
-            ws.send(JSON.stringify({ id: msg.id, error: { message: "Invalid request: missing field \`expectedTurnId\`" } }));
-          } else if (lastStartedTurnId && msg.params.expectedTurnId !== lastStartedTurnId) {
-            ws.send(JSON.stringify({ id: msg.id, error: { message: "expected active turn id \`" + msg.params.expectedTurnId + "\` but found \`" + lastStartedTurnId + "\`" } }));
-          } else if (steerText.includes("[hang-steer]")) {
-            // Deliberately send NO verdict — simulate a steer whose app-server
-            // response is lost while the WS stays open (drives the PR B #3
-            // lost-response orphan test: turnTrackingReset must clean it up).
-          } else if (steerText.includes("[force-steer-error]")) {
-            ws.send(JSON.stringify({ id: msg.id, error: { message: "ActiveTurnNotSteerable" } }));
-          } else {
-            ws.send(JSON.stringify({ id: msg.id, result: { turnId: msg.params.expectedTurnId } }));
-          }
-        }
-      } catch {}
-    },
-    close(ws) {
-      if (appWs === ws) appWs = null;
-    },
-  },
-});
-
-setInterval(() => {
-  if (!commandFile || !existsSync(commandFile)) return;
-  const command = readFileSync(commandFile, "utf-8").trim();
-  try { unlinkSync(commandFile); } catch {}
-  if (!appWs) return;
-  if (command === "start-turn") {
-    lastStartedTurnId = "turn-1";
-    appWs.send(JSON.stringify({ method: "turn/started", params: { turn: { id: "turn-1" } } }));
-  }
-  if (command === "complete-turn" && lastStartedTurnId) {
-    appWs.send(JSON.stringify({ method: "turn/completed", params: { turn: { id: lastStartedTurnId } } }));
-    lastStartedTurnId = null;
-  }
-  if (command.startsWith("agent-message:")) {
-    const content = command.slice("agent-message:".length);
-    const id = "agent-message-" + (++agentMessageCounter);
-    appWs.send(JSON.stringify({ method: "item/started", params: { item: { id, type: "agentMessage" } } }));
-    appWs.send(JSON.stringify({ method: "item/agentMessage/delta", params: { itemId: id, delta: content } }));
-    appWs.send(JSON.stringify({ method: "item/completed", params: { item: { id, type: "agentMessage" } } }));
-  }
-  if (command === "close-app-server") {
-    appWs.close(1011, "test app-server close");
-    setTimeout(() => server.stop(true), 20);
-  }
-}, 25).unref();
-
-process.on("SIGTERM", () => process.exit(0));
-process.on("SIGINT", () => process.exit(0));
-
-await new Promise(() => {});
-`;
 }
 
 function scrubAgentBridgeEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
