@@ -84,6 +84,89 @@ describe("daemon-record", () => {
     test("readDaemonRecord returns null when file absent", () => {
       expect(readDaemonRecord(paths.daemonRecordFile)).toBeNull();
     });
+
+    test("readDaemonRecord drops fields whose type is wrong (untrusted daemon.json — #536 regression)", () => {
+      // A corrupt / hand-edited daemon.json with a numeric proxyUrl etc. must NOT
+      // pass a number through to callers (cli/codex.ts does new URL(proxyUrl)).
+      writeFileSync(
+        paths.daemonRecordFile,
+        JSON.stringify({
+          pid: 4242,
+          phase: "ready",
+          proxyUrl: 1234, // wrong type
+          appServerUrl: { not: "a string" }, // wrong type
+          startedAt: "nope", // wrong type
+          nonce: 99, // wrong type
+          ports: "ws://x", // wrong type (should be object)
+          turnPhase: 7, // wrong type
+          turnInProgress: "yes", // wrong type
+          attentionWindowActive: 1, // wrong type
+          pairId: 5, // wrong type (string | null expected)
+          cwd: false, // wrong type
+        }),
+      );
+      const rec = readDaemonRecord(paths.daemonRecordFile);
+      expect(rec).not.toBeNull();
+      expect(rec!.pid).toBe(4242);
+      expect(rec!.phase).toBe("ready");
+      // Every wrongly-typed field is dropped, not carried through raw.
+      expect(rec!.proxyUrl).toBeUndefined();
+      expect(rec!.appServerUrl).toBeUndefined();
+      expect(rec!.startedAt).toBeUndefined();
+      expect(rec!.nonce).toBeUndefined();
+      expect(rec!.ports).toBeUndefined();
+      expect(rec!.turnPhase).toBeUndefined();
+      expect(rec!.turnInProgress).toBeUndefined();
+      expect(rec!.attentionWindowActive).toBeUndefined();
+      expect(rec!.pairId).toBeUndefined();
+      expect(rec!.cwd).toBeUndefined();
+    });
+
+    test("readDaemonRecord keeps well-typed fields and a null pairId/cwd/stateDir", () => {
+      writeFileSync(
+        paths.daemonRecordFile,
+        JSON.stringify({
+          pid: 7,
+          phase: "ready",
+          proxyUrl: "ws://127.0.0.1:4501",
+          appServerUrl: "ws://127.0.0.1:4500",
+          ports: { appPort: 4500, proxyPort: 4501, controlPort: 4502 },
+          pairId: null,
+          cwd: null,
+          stateDir: null,
+          turnPhase: "idle",
+          turnInProgress: false,
+          attentionWindowActive: true,
+          startedAt: 1000,
+          nonce: "deadbeef",
+        }),
+      );
+      const rec = readDaemonRecord(paths.daemonRecordFile);
+      expect(rec!.proxyUrl).toBe("ws://127.0.0.1:4501");
+      expect(rec!.appServerUrl).toBe("ws://127.0.0.1:4500");
+      expect(rec!.ports).toEqual({ appPort: 4500, proxyPort: 4501, controlPort: 4502 });
+      expect(rec!.pairId).toBeNull();
+      expect(rec!.cwd).toBeNull();
+      expect(rec!.stateDir).toBeNull();
+      expect(rec!.turnPhase).toBe("idle");
+      expect(rec!.turnInProgress).toBe(false);
+      expect(rec!.attentionWindowActive).toBe(true);
+      expect(rec!.startedAt).toBe(1000);
+      expect(rec!.nonce).toBe("deadbeef");
+    });
+
+    test("readDaemonRecord sanitizes nested ports — drops non-numeric port entries", () => {
+      writeFileSync(
+        paths.daemonRecordFile,
+        JSON.stringify({
+          pid: 9,
+          phase: "ready",
+          ports: { appPort: 4500, proxyPort: "nope", controlPort: 4502 },
+        }),
+      );
+      const rec = readDaemonRecord(paths.daemonRecordFile);
+      expect(rec!.ports).toEqual({ appPort: 4500, controlPort: 4502 });
+    });
   });
 
   describe("synthesizeLegacyRecord (old daemon: daemon.pid + status.json)", () => {

@@ -345,7 +345,11 @@ export async function runCodex(args: string[]) {
   // the legacy status.json) or, last resort, the config.
   let proxyUrl: string;
   const record = lifecycle.readDaemonRecord();
-  if (record?.proxyUrl) {
+  // Defense-in-depth (#536): readDaemonRecord now drops a wrong-typed proxyUrl, but
+  // also guard here so a number/object from a corrupt or hand-edited daemon.json can
+  // never reach `new URL(proxyUrl)` (which would throw and crash the CLI). Only trust
+  // a non-empty STRING; anything else falls through to the config-derived fallback.
+  if (typeof record?.proxyUrl === "string" && record.proxyUrl.length > 0) {
     proxyUrl = record.proxyUrl;
   } else {
     // Mirror exactly how the daemon resolves its proxy port (daemon.ts:39):
@@ -733,7 +737,15 @@ function isManagedCodexTuiProcess(pid: number, proxyUrl: string): boolean {
 }
 
 function proxyHealthUrl(proxyUrl: string): string {
-  const url = new URL(proxyUrl);
+  let url: URL;
+  try {
+    url = new URL(proxyUrl);
+  } catch {
+    // A malformed proxyUrl (e.g. a string that survived the type guard but is not a
+    // valid URL, from a hand-edited daemon.json) must produce an actionable error,
+    // not a bare "Invalid URL" — the caller catches this and exits with the message.
+    throw new Error(`Malformed Codex proxy URL: ${JSON.stringify(proxyUrl)}`);
+  }
   url.protocol = url.protocol === "wss:" ? "https:" : "http:";
   url.pathname = "/healthz";
   url.search = "";

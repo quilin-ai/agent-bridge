@@ -31,6 +31,7 @@ import {
   resolveControlTokenPath,
   writeControlToken,
 } from "./control-token";
+import { pidFileOwnedByUs } from "./daemon-identity-ownership";
 import { IdempotencyTracker, type IdempotencyDuplicate } from "./idempotency-tracker";
 import { ReplyRequiredTracker } from "./reply-required-tracker";
 import { persistCurrentThreadWithRolloutRetry } from "./thread-state";
@@ -78,17 +79,18 @@ const processLogger = createProcessLogger({ component: "AgentBridgeDaemon", logF
 // bricking the daemon. Per-pair isolation is automatic: each pair has its own
 // state dir, hence its own token.
 const controlTokenPath = resolveControlTokenPath(stateDir.dir);
-let controlToken: string | null = null;
-try {
-  controlToken = generateControlToken();
-  writeControlToken(controlTokenPath, controlToken);
-} catch (err: any) {
-  controlToken = null;
-  processLogger.log(
-    `Failed to write control token (${controlTokenPath}): ${err?.message ?? err} — ` +
-    `token layer DISABLED for this daemon (attach guard + Origin guard still active)`,
-  );
-}
+// Generate the per-start token at module load (cheap, no IO), but DEFER the
+// disk write until AFTER a successful control-port bind. Writing it here — before
+// the wasKilled() early-exit and before the bind — would let a no-op killed spawn
+// or a losing bind-race daemon (D2) clobber the LIVE incumbent's (D1) shared token
+// (HIGH-1c / MEDIUM-3). The write now happens in writeControlTokenPostBind() and
+// flips `weWroteToken` so the ownership-aware remover only ever deletes OUR token.
+let controlToken: string | null = generateControlToken();
+// Ownership flags: set true ONLY after WE successfully wrote OUR own shared file
+// post-bind. The process.on("exit") cleanup is unconditional, so these gates are
+// what stop a losing D2 from wiping D1's identity (HIGH-1b).
+let weWroteToken = false;
+let weWrotePid = false;
 const configService = new ConfigService();
 // Thread the daemon logger so a corrupt config.json fails loud (to log + stderr)
 // instead of silently reverting custom budget/idle thresholds to defaults.
@@ -131,9 +133,20 @@ const codex = new CodexAdapter(CODEX_APP_PORT, CODEX_PROXY_PORT, stateDir.logFil
 const attachCmd = `codex --enable tui_app_server --remote ${codex.proxyUrl}`;
 
 let controlServer: ReturnType<typeof Bun.serve> | null = null;
+// Set true ONLY after Bun.serve successfully binds the control port. A losing
+// bind-race daemon (EADDRINUSE) never flips this, so its cleanup is a no-op and
+// the live incumbent's identity files survive (HIGH-1a).
+let boundControlPort = false;
 let attachedClaude: ServerWebSocket<ControlSocketData> | null = null;
 let nextControlClientId = 0;
 let nextSystemMessageId = 0;
+// Per-PROCESS salt for systemMessage ids (HIGH-2). The counter resets to 0 on
+// every daemon start, so a restarted daemon would re-emit `system_ready_1` —
+// which the bridge-side deduper (claude-adapter: 20-min LRU/TTL keyed on id)
+// suppresses as a duplicate of the OLD daemon's `system_ready_1`. The salt makes
+// ids unique ACROSS restarts, the counter keeps them unique WITHIN a process.
+// Same fix class as STATUS_SUMMARY_SALT in message-filter.ts (PR #139).
+const SYSTEM_MSG_SALT = randomUUID().slice(0, 8);
 let codexBootstrapped = false;
 let attentionWindowTimer: ReturnType<typeof setTimeout> | null = null;
 let inAttentionWindow = false;
@@ -618,7 +631,9 @@ codex.on("exit", (code: number | null) => {
 });
 
 function startControlServer() {
-  controlServer = Bun.serve({
+  let server: ReturnType<typeof Bun.serve>;
+  try {
+    server = Bun.serve({
     port: CONTROL_PORT,
     hostname: "127.0.0.1",
     fetch(req, server) {
@@ -690,7 +705,22 @@ function startControlServer() {
         }
       },
     },
-  });
+    });
+  } catch (err: any) {
+    // Lost the control-port bind race (typically EADDRINUSE because a live
+    // incumbent D1 still holds the port). We did NOT bind, so boundControlPort
+    // stays false and the unconditional process.on("exit") cleanup is a no-op
+    // for every shared file (the ownership-aware removers all gate on our
+    // bind/write flags). Exit WITHOUT destructive cleanup so D1's identity files
+    // (pid/status/daemon.json/token) survive intact (HIGH-1a).
+    log(
+      `Control port ${CONTROL_PORT} bind failed (${err?.code ?? err?.message ?? err}) — ` +
+      `another daemon owns it; exiting without touching shared identity files`,
+    );
+    process.exit(0);
+  }
+  controlServer = server;
+  boundControlPort = true;
 }
 
 function handleControlMessage(ws: ServerWebSocket<ControlSocketData>, raw: string | Buffer) {
@@ -1576,7 +1606,7 @@ function currentReadyMessage() {
 
 function systemMessage(idPrefix: string, content: string): BridgeMessage {
   return {
-    id: `${idPrefix}_${++nextSystemMessageId}`,
+    id: `${idPrefix}_${SYSTEM_MSG_SALT}_${++nextSystemMessageId}`,
     source: "codex",
     content,
     timestamp: Date.now(),
@@ -1590,9 +1620,36 @@ function writePidFile() {
   // already known here (codex constructed); turn fields default to the idle/boot
   // state. bootstrap success replaces this with the READY phase (writeStatusFile).
   daemonLifecycle.writeDaemonRecord(buildDaemonRecord("booting"));
+  // We now own these shared files — the ownership-aware removers may delete them.
+  weWrotePid = true;
+}
+
+// Deferred control-token write: runs ONLY after a successful control-port bind
+// (HIGH-1c / MEDIUM-3). A write/chmod failure degrades the token layer to OFF
+// (null) rather than bricking the daemon — the attach-convergence guard + Origin
+// guard still apply. `weWroteToken` flips true only on success so the
+// ownership-aware remover never deletes a token we did not write.
+function writeControlTokenPostBind() {
+  if (controlToken === null) return;
+  try {
+    writeControlToken(controlTokenPath, controlToken);
+    weWroteToken = true;
+  } catch (err: any) {
+    controlToken = null;
+    processLogger.log(
+      `Failed to write control token (${controlTokenPath}): ${err?.message ?? err} — ` +
+      `token layer DISABLED for this daemon (attach guard + Origin guard still active)`,
+    );
+  }
 }
 
 function removePidFile() {
+  // Ownership gate (HIGH-1b): only unlink the SHARED pid/daemon.json files when
+  // the pid currently on disk is ours. A losing bind-race D2 reading D1's pid
+  // skips the unlink, so D1's identity survives. We also require weWrotePid so a
+  // no-op killed spawn (which never wrote anything) is a guaranteed no-op even if
+  // a same-pid coincidence ever arose.
+  if (!weWrotePid || !pidFileOwnedByUs(stateDir.pidFile, process.pid)) return;
   daemonLifecycle.removePidFile();
   daemonLifecycle.removeDaemonRecord();
 }
@@ -1661,6 +1718,12 @@ function writeStatusFile() {
 }
 
 function removeStatusFile() {
+  // Ownership gate (HIGH-1b): status.json + daemon.json are shared per-pair files
+  // owned by whichever daemon won the bind. Only remove them if WE bound the
+  // control port (boundControlPort) — a losing D2 never did, so it never wipes
+  // D1's status. We do not have a per-process marker inside status.json to check,
+  // so the bind flag is the safest ownership proxy here.
+  if (!boundControlPort) return;
   daemonLifecycle.removeStatusFile();
   daemonLifecycle.removeDaemonRecord();
 }
@@ -1784,6 +1847,11 @@ function shutdown(reason: string, exitCode = 0) {
  * fresh one anyway. Never throws — removal failure must not block shutdown.
  */
 function removeControlToken() {
+  // Ownership gate (HIGH-1b): the control token is a per-start secret. Only remove
+  // it if WE actually wrote it post-bind (weWroteToken). A losing D2 — or a no-op
+  // killed spawn — never wrote it, so it must not delete the live incumbent's
+  // token (which would lock the legitimate frontend out on a token mismatch).
+  if (!weWroteToken) return;
   try {
     rmSync(controlTokenPath, { force: true });
   } catch {}
@@ -1803,10 +1871,27 @@ process.on("exit", () => {
   removeControlToken();
 });
 process.on("uncaughtException", (err) => {
-  processLogger.fatal("UNCAUGHT EXCEPTION", err);
+  processLogger.fatal("UNCAUGHT EXCEPTION — auto-shutting down daemon", err);
+  // LOW-6: never leave a half-alive daemon. Attempt the graceful shutdown (stops the
+  // control server + codex child, runs ownership-aware cleanup via process.exit's exit
+  // handler) with a non-zero code, then ALWAYS hard-exit. shutdown() is idempotent
+  // (shuttingDown guard) — if it early-returns because a shutdown is already in flight,
+  // or throws, the unconditional exit below still terminates us so we never linger.
+  try {
+    shutdown("uncaught exception", 1);
+  } catch (shutdownErr) {
+    processLogger.fatal("shutdown during uncaughtException failed", shutdownErr);
+  }
+  process.exit(1);
 });
 process.on("unhandledRejection", (reason: any) => {
-  processLogger.fatal("UNHANDLED REJECTION", reason);
+  processLogger.fatal("UNHANDLED REJECTION — auto-shutting down daemon", reason);
+  try {
+    shutdown("unhandled rejection", 1);
+  } catch (shutdownErr) {
+    processLogger.fatal("shutdown during unhandledRejection failed", shutdownErr);
+  }
+  process.exit(1);
 });
 
 function log(msg: string) {
@@ -1821,8 +1906,13 @@ if (daemonLifecycle.wasKilled()) {
   process.exit(0);
 }
 
-writePidFile();
+// Bind the control port FIRST (HIGH-1c / MEDIUM-3): only after we own the port do
+// we write the SHARED pid/status/daemon.json + control token. startControlServer()
+// process.exit(0)'s on a lost bind race WITHOUT touching shared files, so reaching
+// the lines below means we are the sole owner and may safely claim the identity.
 startControlServer();
+writePidFile();
+writeControlTokenPostBind();
 // Arm the readiness watchdog BEFORE bootCodex: if codex.start() hangs (never
 // resolves/rejects), bootCodex's retry/self-exit never runs, so this deadline is
 // the only thing that releases the control port. bootCodex clears it on success.
