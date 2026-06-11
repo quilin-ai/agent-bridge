@@ -281,4 +281,110 @@ describe("StatusBuffer pause/resume", () => {
     buf.dispose();
   });
 });
+
+describe("StatusBuffer summary id uniqueness (LOW-1)", () => {
+  // The summary id is used as the dedup key by ClaudeAdapter.rememberDelivery.
+  // Two flushes within the same millisecond MUST NOT collide, otherwise the
+  // second summary is silently suppressed as a "duplicate".
+  test("two flushes in the same millisecond produce distinct ids", () => {
+    const flushed: BridgeMessage[] = [];
+    const buf = new StatusBuffer((m) => flushed.push(m), { flushThreshold: 1, flushTimeoutMs: 60000 });
+    buf.add(makeMsg("[STATUS] a"));
+    buf.add(makeMsg("[STATUS] b"));
+    expect(flushed).toHaveLength(2);
+    expect(flushed[0].id).not.toBe(flushed[1].id);
+    buf.dispose();
+  });
+
+  test("ids are monotonic within a process and prefixed with a stable salt", () => {
+    const flushed: BridgeMessage[] = [];
+    const buf = new StatusBuffer((m) => flushed.push(m), { flushThreshold: 1, flushTimeoutMs: 60000 });
+    for (let i = 0; i < 5; i++) buf.add(makeMsg(`[STATUS] ${i}`));
+    expect(flushed).toHaveLength(5);
+    const ids = flushed.map((m) => m.id);
+    // All distinct.
+    expect(new Set(ids).size).toBe(ids.length);
+    // Shape: status_summary_<salt>_<counter>. Salt is shared, counter strictly increases.
+    const parsed = ids.map((id) => {
+      const m = id.match(/^status_summary_([^_]+)_(\d+)$/);
+      expect(m).not.toBeNull();
+      return { salt: m![1], counter: Number(m![2]) };
+    });
+    const salt = parsed[0].salt;
+    for (const p of parsed) expect(p.salt).toBe(salt);
+    for (let i = 1; i < parsed.length; i++) {
+      expect(parsed[i].counter).toBeGreaterThan(parsed[i - 1].counter);
+    }
+    buf.dispose();
+  });
+
+  test("timestamp field still reflects wall-clock time", () => {
+    const flushed: BridgeMessage[] = [];
+    const buf = new StatusBuffer((m) => flushed.push(m), { flushThreshold: 1, flushTimeoutMs: 60000 });
+    const before = Date.now();
+    buf.add(makeMsg("[STATUS] a"));
+    const after = Date.now();
+    expect(flushed[0].timestamp).toBeGreaterThanOrEqual(before);
+    expect(flushed[0].timestamp).toBeLessThanOrEqual(after);
+    buf.dispose();
+  });
+});
+
+describe("StatusBuffer bounded buffer (LOW-2)", () => {
+  // Without an upper bound, a long attention window (auto-flush paused) lets
+  // STATUS messages accumulate without limit. Cap the buffer and drop oldest.
+  test("drops oldest beyond maxBuffered while paused", () => {
+    const flushed: BridgeMessage[] = [];
+    const buf = new StatusBuffer((m) => flushed.push(m), {
+      flushThreshold: 100,
+      flushTimeoutMs: 60000,
+      maxBuffered: 3,
+    });
+    buf.pause();
+    for (let i = 0; i < 6; i++) buf.add(makeMsg(`[STATUS] msg${i}`));
+    // Buffer never exceeds the cap.
+    expect(buf.size).toBe(3);
+    buf.flush("manual");
+    expect(flushed).toHaveLength(1);
+    const content = flushed[0].content;
+    // Oldest (msg0..msg2) dropped, newest (msg3..msg5) retained.
+    expect(content).toContain("msg5");
+    expect(content).toContain("msg3");
+    expect(content).not.toContain("msg0");
+    expect(content).not.toContain("msg2");
+    // Sentinel reflects the dropped count.
+    expect(content).toContain("3");
+    buf.dispose();
+  });
+
+  test("dropped count resets after a flush", () => {
+    const flushed: BridgeMessage[] = [];
+    const buf = new StatusBuffer((m) => flushed.push(m), {
+      flushThreshold: 100,
+      flushTimeoutMs: 60000,
+      maxBuffered: 2,
+    });
+    buf.pause();
+    for (let i = 0; i < 5; i++) buf.add(makeMsg(`[STATUS] a${i}`)); // drops 3
+    buf.flush("first");
+    // After flush, a fresh fill that stays under the cap must NOT report drops.
+    buf.add(makeMsg("[STATUS] b0"));
+    buf.add(makeMsg("[STATUS] b1"));
+    buf.flush("second");
+    expect(flushed).toHaveLength(2);
+    expect(flushed[1].content).not.toContain("dropped");
+    buf.dispose();
+  });
+
+  test("default maxBuffered allows normal small bursts without drops", () => {
+    const flushed: BridgeMessage[] = [];
+    const buf = new StatusBuffer((m) => flushed.push(m), { flushThreshold: 100, flushTimeoutMs: 60000 });
+    buf.pause();
+    for (let i = 0; i < 50; i++) buf.add(makeMsg(`[STATUS] x${i}`));
+    expect(buf.size).toBe(50);
+    buf.flush("manual");
+    expect(flushed[0].content).not.toContain("dropped");
+    buf.dispose();
+  });
+});
 // (The bridge-contract marker spec moved to AGENTS_MD_SECTION; see role-patterns.test.ts.)

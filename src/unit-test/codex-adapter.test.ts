@@ -3014,3 +3014,83 @@ describe("CodexAdapter turn/interrupt (protocol v2 PR B)", () => {
     expect(completedIds).toEqual(["t1", null]);
   });
 });
+
+describe("CodexAdapter agentMessageBuffers lifecycle (LOW-3)", () => {
+  // agentMessageBuffers is filled on item/started(agentMessage) and normally
+  // deleted on item/completed. When a turn is interrupted / aborted / the
+  // app-server socket drops mid-stream, the item/completed never arrives and
+  // the entry leaks forever. It must be cleared at the reset boundaries.
+  test("handleAppServerClose clears a dangling agentMessage buffer (no item/completed)", () => {
+    const adapter = createAdapter();
+    adapter.handleServerNotification({ method: "turn/started", params: { turn: { id: "t1" } } });
+    // Stream STARTS an agent message but never COMPLETES it.
+    adapter.handleServerNotification({
+      method: "item/started",
+      params: { item: { type: "agentMessage", id: "item-1" } },
+    });
+    adapter.handleServerNotification({
+      method: "item/agentMessage/delta",
+      params: { itemId: "item-1", delta: "partial..." },
+    });
+    expect(adapter.agentMessageBuffers.size).toBe(1);
+
+    // App-server socket drops mid-stream (routes through resetTurnState).
+    adapter.intentionalDisconnect = true;
+    adapter.handleAppServerClose();
+
+    expect(adapter.agentMessageBuffers.size).toBe(0);
+    adapter.clearResponseTrackingState();
+  });
+
+  test("resetTurnState clears dangling agentMessage buffers", () => {
+    const adapter = createAdapter();
+    adapter.handleServerNotification({ method: "turn/started", params: { turn: { id: "t1" } } });
+    adapter.handleServerNotification({
+      method: "item/started",
+      params: { item: { type: "agentMessage", id: "item-a" } },
+    });
+    adapter.handleServerNotification({
+      method: "item/started",
+      params: { item: { type: "agentMessage", id: "item-b" } },
+    });
+    expect(adapter.agentMessageBuffers.size).toBe(2);
+
+    adapter.resetTurnState("interrupted", false);
+    expect(adapter.agentMessageBuffers.size).toBe(0);
+  });
+
+  test("markTurnCompleted with missing turnId clears all agentMessage buffers", () => {
+    const adapter = createAdapter();
+    adapter.handleServerNotification({ method: "turn/started", params: { turn: { id: "t1" } } });
+    adapter.handleServerNotification({
+      method: "item/started",
+      params: { item: { type: "agentMessage", id: "item-x" } },
+    });
+    expect(adapter.agentMessageBuffers.size).toBe(1);
+
+    // turn/completed with NO id (the "all active turns cleared" branch).
+    adapter.handleServerNotification({ method: "turn/completed", params: {} });
+    expect(adapter.agentMessageBuffers.size).toBe(0);
+  });
+
+  test("normal item/completed still drains its own buffer (no regression)", () => {
+    const adapter = createAdapter();
+    const emitted: string[] = [];
+    adapter.on("agentMessage", (m: { content: string }) => emitted.push(m.content));
+    adapter.handleServerNotification({ method: "turn/started", params: { turn: { id: "t1" } } });
+    adapter.handleServerNotification({
+      method: "item/started",
+      params: { item: { type: "agentMessage", id: "item-1" } },
+    });
+    adapter.handleServerNotification({
+      method: "item/agentMessage/delta",
+      params: { itemId: "item-1", delta: "hello" },
+    });
+    adapter.handleServerNotification({
+      method: "item/completed",
+      params: { item: { type: "agentMessage", id: "item-1" } },
+    });
+    expect(adapter.agentMessageBuffers.size).toBe(0);
+    expect(emitted).toEqual(["hello"]);
+  });
+});

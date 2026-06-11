@@ -2223,6 +2223,10 @@ export class CodexAdapter extends EventEmitter {
       this.clearAllTurnWatchdogs();
       this.stalledTurnIds.clear();
       this.currentlyStalledTurnIds.clear();
+      // A completion with no turn id clears ALL active turns, so any
+      // agentMessage still mid-stream will never see its item/completed —
+      // drop the dangling buffers instead of leaking them.
+      this.agentMessageBuffers.clear();
     }
 
     this.lastTurnEndedAbnormally = false;
@@ -2318,6 +2322,11 @@ export class CodexAdapter extends EventEmitter {
     this.clearAllTurnWatchdogs();
     this.stalledTurnIds.clear();
     this.currentlyStalledTurnIds.clear();
+    // app-server close / reconnect / stop interrupts any in-flight agentMessage
+    // stream: the item/completed that would normally delete its buffer never
+    // arrives, so clear here (single reset boundary) to prevent unbounded growth
+    // across the daemon's long lifetime. Matches the per-turn map discipline.
+    this.agentMessageBuffers.clear();
     this.turnInProgress = false;
     if (wasInProgress) {
       this.lastTurnEndedAbnormally = !emitCompleted;
