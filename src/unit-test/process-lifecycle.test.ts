@@ -217,7 +217,7 @@ describe("isAgentBridgeDaemon (single strict daemon matcher)", () => {
     // The anchored matcher must reject it: `daemon-self-heal.test.ts` is not a
     // `*-daemon.{ts,js}` entry.
     expect(
-      isAgentBridgeDaemon(1, cmd("bun test /Users/x/agentbridge/src/unit-test/daemon-self-heal.test.ts")),
+      isAgentBridgeDaemon(1, cmd("bun test /Users/x/agentbridge/src/integration-test/daemon-self-heal.test.ts")),
     ).toBe(false);
   });
 

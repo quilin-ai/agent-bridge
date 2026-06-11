@@ -31,6 +31,8 @@
     "prepublishOnly": "bun run build:cli && bun run build:plugin && bun run verify:plugin-sync && bun scripts/check-plugin-versions.js",
     "validate:plugin": "claude plugin validate plugins/agentbridge && claude plugin validate .claude-plugin/marketplace.json",
     "test": "bun test src",
+    "test:unit": "bun test src/unit-test",
+    "test:integration": "bun test src/integration-test",
     "e2e:transport": "bun scripts/e2e-codex-transport.mjs",
     "install:global": "node scripts/install-global.mjs local",
     "install:global:local": "node scripts/install-global.mjs local",

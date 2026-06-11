@@ -87,4 +87,4 @@ accidentally revive a session.
 ### Automated coverage
 
 - Unit: `src/unit-test/liveness-probe.test.ts` — pure probe state machine (7 scenarios, fake clock)
-- Integration: `src/unit-test/daemon-client.test.ts`, `src/unit-test/e2e-reconnect.test.ts` still green
+- Integration: `src/unit-test/daemon-client.test.ts`, `src/integration-test/e2e-reconnect.test.ts` still green
