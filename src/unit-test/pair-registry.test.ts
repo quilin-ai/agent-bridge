@@ -32,6 +32,7 @@ import {
   probePortFree,
   readRegistry,
   RECLAIMABLE_MIN_AGE_MS,
+  removeOrphanPairDirIgnoringRegistry,
   removePairDir,
   removePairEntry,
   removePairEntryAndDir,
@@ -270,6 +271,32 @@ describe("readRegistry / writeRegistry", () => {
     const files = readdirSync(join(base, "pairs"));
     const tmpFiles = files.filter((f) => f.includes(".tmp."));
     expect(tmpFiles).toEqual([]);
+  });
+
+  test("duplicate slot throws PAIR_REGISTRY_CORRUPT carrying the registry path", () => {
+    // writeRegistry only serializes — the duplicate guard lives in readRegistry.
+    writeRegistry(base, { version: 1, pairs: [entry(0, "alpha"), entry(0, "beta")] });
+    const regPath = join(base, "pairs", "registry.json");
+    try {
+      readRegistry(base);
+      throw new Error("expected throw");
+    } catch (err) {
+      expect(err).toBeInstanceOf(PairError);
+      expect((err as PairError).code).toBe("PAIR_REGISTRY_CORRUPT");
+      // The CLI degradation surfaces this path to the user — assert it is present.
+      expect((err as PairError).details?.path).toBe(regPath);
+    }
+  });
+
+  test("duplicate lowercased pairId throws PAIR_REGISTRY_CORRUPT", () => {
+    writeRegistry(base, { version: 1, pairs: [entry(0, "Alpha"), entry(1, "alpha")] });
+    try {
+      readRegistry(base);
+      throw new Error("expected throw");
+    } catch (err) {
+      expect(err).toBeInstanceOf(PairError);
+      expect((err as PairError).code).toBe("PAIR_REGISTRY_CORRUPT");
+    }
   });
 });
 
@@ -843,6 +870,24 @@ describe("removePairEntryAndDir / removeUnregisteredPairDir — locked atomic cl
     expect(existsSync(join(base, "pairs", registered))).toBe(true);
 
     expect(await removeUnregisteredPairDir(base, live)).toEqual({ removed: false, reason: "live" });
+    expect(existsSync(join(base, "pairs", live))).toBe(true);
+  });
+
+  test("removeOrphanPairDirIgnoringRegistry removes a dead dir on the liveness gate alone (corrupt-registry path)", async () => {
+    const dead = "main-dead0001";
+    const live = "main-live0005";
+    for (const id of [dead, live]) mkdirSync(join(base, "pairs", id), { recursive: true });
+    writeFileSync(join(base, "pairs", live, "daemon.pid"), `${process.pid}\n`, "utf-8");
+    // Deliberately corrupt the registry: this delete path must NOT read it.
+    mkdirSync(join(base, "pairs"), { recursive: true });
+    writeFileSync(join(base, "pairs", "registry.json"), "{ not valid json", "utf-8");
+
+    // A dead dir is removed without ANY registry read (readRegistry would throw).
+    expect(await removeOrphanPairDirIgnoringRegistry(base, dead)).toEqual({ removed: true });
+    expect(existsSync(join(base, "pairs", dead))).toBe(false);
+
+    // A live dir is still protected by the liveness gate, even with no registry truth.
+    expect(await removeOrphanPairDirIgnoringRegistry(base, live)).toEqual({ removed: false, reason: "live" });
     expect(existsSync(join(base, "pairs", live))).toBe(true);
   });
 

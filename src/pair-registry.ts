@@ -1012,6 +1012,37 @@ export async function removeUnregisteredPairDir(
   });
 }
 
+/**
+ * Degraded variant of {@link removeUnregisteredPairDir} for a CORRUPT registry.
+ *
+ * When the registry is unparseable (duplicate slot/pairId, malformed entry) the
+ * recovery tooling cannot do the "is this id registered?" membership check —
+ * `readRegistry` itself throws. This variant deliberately SKIPS that check (the
+ * registry truth is unavailable) and removes the dir purely on the liveness gate:
+ * still under the registry lock (so a concurrent daemon start serializes), and
+ * still refusing to delete a dir whose daemon is alive. It exists ONLY for the
+ * corrupt-registry degradation path in `abg pairs prune` — the normal path keeps
+ * using {@link removeUnregisteredPairDir}, which honours registry membership.
+ *
+ * Trade-off: without the registry we cannot tell a still-registered pair from an
+ * orphan, so a corrupt-registry `--apply` could reap a dir whose entry would have
+ * survived a manual fix. That is acceptable here — the liveness gate already
+ * protects any RUNNING pair, the user explicitly asked to reclaim, and the
+ * alternative (the command crashing outright) leaves the broken registry
+ * un-cleanable. The dry run shows exactly which dirs would be removed first.
+ */
+export async function removeOrphanPairDirIgnoringRegistry(
+  base: string,
+  pairId: string,
+): Promise<{ removed: boolean; reason?: "live" }> {
+  return withRegistryLock(base, () => {
+    if (pairDirDaemonAlive(base, pairId)) {
+      return { removed: false, reason: "live" as const };
+    }
+    return { removed: removePairDir(base, pairId) };
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Entry-level reclamation (P1 #9)
 //

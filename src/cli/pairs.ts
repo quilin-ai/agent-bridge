@@ -5,6 +5,9 @@ import {
   detectLegacyRootDaemon,
   listPairDirs,
   pairDirDaemonAlive,
+  PairError,
+  pairsRootDir,
+  removeOrphanPairDirIgnoringRegistry,
   removePairEntryAndDir,
   removeUnregisteredPairDir,
   validatePairId,
@@ -34,6 +37,27 @@ interface PairRow {
   threadId: string | null;
   threadStatus: string | null;
   threadUpdatedAt: string | null;
+}
+
+/**
+ * The registry is exactly the state that gets corrupted when things go wrong — a
+ * duplicate slot / duplicate pairId (a manual edit or downgrade-then-upgrade)
+ * makes `readRegistry` throw PAIR_REGISTRY_CORRUPT. The recovery commands
+ * (`abg pairs` / `abg pairs prune`) must not crash on the very thing they exist
+ * to clean up, so they catch THIS error (by code, never by string match) and
+ * degrade to the disk-scan reclamation that does not need a parseable registry —
+ * mirroring `abg kill --all` (see cli/kill.ts). Any other error still propagates.
+ */
+function isRegistryCorruptError(error: unknown): error is PairError {
+  return error instanceof PairError && error.code === "PAIR_REGISTRY_CORRUPT";
+}
+
+/** Best-effort registry file path for the degraded notice (prefers the error's own path). */
+function registryPathForNotice(base: string, error: PairError): string {
+  const fromDetails = error.details?.path;
+  return typeof fromDetails === "string" && fromDetails.length > 0
+    ? fromDetails
+    : join(pairsRootDir(base), "registry.json");
 }
 
 export async function runPairs(args: string[] = []) {
@@ -174,10 +198,35 @@ async function runPrune(args: string[]) {
   // Classify reclaimable entries up front so the orphan-dir pass can SKIP the
   // dirs that the entry pass will reclaim — otherwise a stranded entry's dir is
   // double-reported (once as "registered" in Kept, once as a reclaimed entry).
-  const reclaimable = classifyReclaimableEntries(base);
+  //
+  // The registry is the very thing prune exists to repair, so a CORRUPT registry
+  // (duplicate slot/pairId from a manual edit or downgrade-then-upgrade) must NOT
+  // crash the command — `classifyReclaimableEntries` funnels through `readRegistry`
+  // which throws PAIR_REGISTRY_CORRUPT. Degrade like `abg kill --all`: report the
+  // registry path, then run the registry-free disk-scan reclamation (orphan dirs)
+  // that needs no parseable registry. The entry pass is skipped (it cannot run
+  // without a readable registry) and `registryReadable=false` switches the dir
+  // pass to a membership-check-free delete.
+  let reclaimable: ReclaimableEntry[];
+  let registryReadable = true;
+  try {
+    reclaimable = classifyReclaimableEntries(base);
+  } catch (error) {
+    if (!isRegistryCorruptError(error)) throw error;
+    registryReadable = false;
+    reclaimable = [];
+    console.error(
+      `⚠️  pair registry 不可读（${error.message}）——` +
+        `位于 ${registryPathForNotice(base, error)}。` +
+        `跳过 registry 条目回收，降级为磁盘扫描清理孤儿目录（无需可解析的 registry）。` +
+        `修复或删除该文件后可恢复完整 prune。`,
+    );
+    // Scriptability: a degraded run is not a clean success.
+    process.exitCode = 2;
+  }
   const reclaimableIds = new Set(reclaimable.map((c) => c.entry.pairId.toLowerCase()));
 
-  const dirResult = pruneOrphanDirs(base, apply, reclaimableIds);
+  const dirResult = pruneOrphanDirs(base, apply, reclaimableIds, registryReadable);
   const entryResult = await pruneReclaimableEntries(reclaimable, base, apply);
   // The orphan-dir prune may itself perform locked deletes; await it after we
   // have its (synchronously-built) plan so both passes report coherently.
@@ -195,13 +244,24 @@ interface OrphanDirResult {
  * Reclaim orphan pair state dirs (dir exists, no registry entry, not live).
  * `reclaimableIds` are the lowercased pairIds the ENTRY pass will reclaim — their
  * dirs are skipped here so they are not also reported as "registered" Kept dirs.
+ *
+ * `registryReadable=false` is the corrupt-registry degradation: `listPairs` would
+ * itself throw, so we treat the registered set as empty and switch the `--apply`
+ * delete to {@link removeOrphanPairDirIgnoringRegistry} (liveness gate only, no
+ * registry membership read). This is the registry-free disk-scan reclamation the
+ * recovery command must still offer when the registry cannot be parsed.
  */
 async function pruneOrphanDirs(
   base: string,
   apply: boolean,
   reclaimableIds: ReadonlySet<string>,
+  registryReadable: boolean,
 ): Promise<OrphanDirResult> {
-  const registered = new Set(listPairs(base).map((pair) => pair.pairId.toLowerCase()));
+  // On a corrupt registry `listPairs` throws — degrade to an empty registered set
+  // so the disk scan can still surface (and, under --apply, reclaim) orphan dirs.
+  const registered = registryReadable
+    ? new Set(listPairs(base).map((pair) => pair.pairId.toLowerCase()))
+    : new Set<string>();
   const removed: string[] = [];
   const kept: Array<{ name: string; reason: string }> = [];
 
@@ -245,7 +305,13 @@ async function pruneOrphanDirs(
       // daemon start for this id cannot race the orphan check — under the lock
       // removeUnregisteredPairDir re-verifies membership AND liveness before it
       // removes anything (the initial gates above are just a cheap pre-filter).
-      const outcome = await removeUnregisteredPairDir(base, id);
+      //
+      // On a corrupt registry the membership re-check is impossible (readRegistry
+      // throws under the lock too), so degrade to the liveness-only delete — still
+      // locked, still refusing any live daemon's dir.
+      const outcome = registryReadable
+        ? await removeUnregisteredPairDir(base, id)
+        : await removeOrphanPairDirIgnoringRegistry(base, id);
       if (outcome.removed) {
         removed.push(name);
       } else if (outcome.reason === "registered") {
@@ -373,7 +439,26 @@ function printPruneSummary(dirResult: OrphanDirResult, entryResult: EntryReclaim
 
 async function collectRows(): Promise<PairRow[]> {
   const base = computeBaseDir();
-  const rows = await Promise.all(listPairs(base).map((pair) => rowForPair(base, pair)));
+  // The list command is itself a recovery aid, so a CORRUPT registry (duplicate
+  // slot/pairId) must not crash it — `listPairs` funnels through `readRegistry`
+  // which throws PAIR_REGISTRY_CORRUPT. Degrade like `abg kill --all`: report the
+  // registry path, then enumerate the on-disk pair dirs (disk scan) so the user
+  // can still see — and clean up — what is on disk.
+  let rows: PairRow[];
+  try {
+    rows = await Promise.all(listPairs(base).map((pair) => rowForPair(base, pair)));
+  } catch (error) {
+    if (!isRegistryCorruptError(error)) throw error;
+    console.error(
+      `⚠️  pair registry 不可读（${error.message}）——` +
+        `位于 ${registryPathForNotice(base, error)}。` +
+        `降级为磁盘扫描列出 ${pairsRootDir(base)} 下的 pair 目录（slot/name/cwd 等需 registry 的字段显示为 -）。` +
+        `修复或删除该文件后可恢复完整列表；用 \`abg pairs prune\` 清理孤儿目录。`,
+    );
+    // Scriptability: a degraded list is not a clean success.
+    process.exitCode = 2;
+    rows = await collectDiskScanRows(base);
+  }
   const legacy = detectLegacyRootDaemon(base);
   if (legacy) {
     rows.push({
@@ -414,6 +499,56 @@ async function rowForPair(base: string, pair: PairEntry): Promise<PairRow> {
     ports,
     source: pair.source,
     cwd: pair.cwd,
+    running,
+    pid: typeof record?.pid === "number" ? record.pid : null,
+    threadId: thread?.threadId ?? null,
+    threadStatus: thread?.status ?? null,
+    threadUpdatedAt: thread?.updatedAt ?? null,
+  };
+}
+
+/**
+ * Degraded row source for a CORRUPT registry: enumerate the on-disk pair dirs
+ * (no registry read) and read each daemon's own advertised record from disk. The
+ * registry-only fields (slot / friendly name / source / registered cwd) are not
+ * available, so they render as `-` / 0 — the dir name (pairId) plus liveness is
+ * still enough for the user to act (`abg pairs prune`, `abg kill --all`).
+ */
+async function collectDiskScanRows(base: string): Promise<PairRow[]> {
+  const names = listPairDirsSafe(base);
+  return Promise.all(names.map((name) => rowForDiskScanDir(base, name)));
+}
+
+function listPairDirsSafe(base: string): string[] {
+  try {
+    return listPairDirs(base);
+  } catch {
+    return [];
+  }
+}
+
+async function rowForDiskScanDir(base: string, dirName: string): Promise<PairRow> {
+  const stateDir = new StateDirResolver(join(base, "pairs", dirName));
+  // Read the daemon's own advertised record from disk to recover ports/pid — the
+  // slot→port arithmetic needs a registry entry we cannot read here.
+  const record = new DaemonLifecycle({ stateDir, controlPort: 0, log: () => {} }).readDaemonRecord();
+  const ports: PairPorts = {
+    appPort: record?.ports?.appPort ?? 0,
+    proxyPort: record?.ports?.proxyPort ?? 0,
+    controlPort: record?.ports?.controlPort ?? 0,
+  };
+  const running =
+    ports.controlPort > 0
+      ? await new DaemonLifecycle({ stateDir, controlPort: ports.controlPort, log: () => {} }).isHealthy()
+      : false;
+  const thread = readRawCurrentThread(stateDir);
+  return {
+    pairId: dirName,
+    name: "-",
+    slot: null,
+    ports,
+    source: "cwd",
+    cwd: "-",
     running,
     pid: typeof record?.pid === "number" ? record.pid : null,
     threadId: thread?.threadId ?? null,
