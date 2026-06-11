@@ -21,7 +21,7 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.12", "0.0.0-source"),
-  commit: defineString("75e139d", "source"),
+  commit: defineString("a2d8062", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION)
 });
@@ -2044,6 +2044,7 @@ class CodexAdapter extends EventEmitter {
       this.clearAllTurnWatchdogs();
       this.stalledTurnIds.clear();
       this.currentlyStalledTurnIds.clear();
+      this.agentMessageBuffers.clear();
     }
     this.lastTurnEndedAbnormally = false;
     this.turnInProgress = this.activeTurnIds.size > 0;
@@ -2106,6 +2107,7 @@ class CodexAdapter extends EventEmitter {
     this.clearAllTurnWatchdogs();
     this.stalledTurnIds.clear();
     this.currentlyStalledTurnIds.clear();
+    this.agentMessageBuffers.clear();
     this.turnInProgress = false;
     if (wasInProgress) {
       this.lastTurnEndedAbnormally = !emitCompleted;
@@ -2375,6 +2377,9 @@ function evaluateInjectionAttachGuard(attachedSocket, requestingSocket) {
 }
 
 // src/message-filter.ts
+import { randomUUID as randomUUID3 } from "crypto";
+var STATUS_SUMMARY_SALT = randomUUID3().slice(0, 8);
+var statusSummaryCounter = 0;
 var MARKER_REGEX = /^\s*\[(IMPORTANT|STATUS|FYI)\]\s*/i;
 function parseMarker(content) {
   const match = content.match(MARKER_REGEX);
@@ -2440,11 +2445,14 @@ class StatusBuffer {
   flushTimer = null;
   flushThreshold;
   flushTimeoutMs;
+  maxBuffered;
   paused = false;
+  droppedCount = 0;
   constructor(onFlush, options) {
     this.onFlush = onFlush;
     this.flushThreshold = options?.flushThreshold ?? 3;
     this.flushTimeoutMs = options?.flushTimeoutMs ?? 15000;
+    this.maxBuffered = options?.maxBuffered ?? 200;
   }
   get size() {
     return this.buffer.length;
@@ -2464,6 +2472,10 @@ class StatusBuffer {
   }
   add(message) {
     this.buffer.push(message);
+    while (this.buffer.length > this.maxBuffered) {
+      this.buffer.shift();
+      this.droppedCount++;
+    }
     if (this.paused)
       return;
     this.resetTimer();
@@ -2478,19 +2490,22 @@ class StatusBuffer {
     const combined = this.buffer.map((m) => parseMarker(m.content).body).join(`
 ---
 `);
+    const droppedNote = this.droppedCount > 0 ? `, ${this.droppedCount} older dropped` : "";
     const summary = {
-      id: `status_summary_${Date.now()}`,
+      id: `status_summary_${STATUS_SUMMARY_SALT}_${++statusSummaryCounter}`,
       source: "codex",
-      content: `[STATUS summary \u2014 ${this.buffer.length} update(s), flushed: ${reason}]
+      content: `[STATUS summary \u2014 ${this.buffer.length} update(s)${droppedNote}, flushed: ${reason}]
 ${combined}`,
       timestamp: Date.now()
     };
     this.onFlush(summary);
     this.buffer = [];
+    this.droppedCount = 0;
   }
   dispose() {
     this.clearTimer();
     this.buffer = [];
+    this.droppedCount = 0;
   }
   clearTimer() {
     if (this.flushTimer) {
