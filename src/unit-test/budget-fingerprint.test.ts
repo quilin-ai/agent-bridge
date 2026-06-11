@@ -23,6 +23,7 @@ const CONFIG: BudgetConfig = {
     balanced: { effort: "medium" },
     eco: { effort: "low" },
   },
+  strategy: "conserve",
 };
 
 function usage(overrides: Partial<AgentUsage> = {}): AgentUsage {

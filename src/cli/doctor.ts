@@ -10,7 +10,9 @@ import {
   type AgentBridgeBuildInfo,
 } from "../build-info";
 import { cliInvocationName } from "../cli-invocation";
-import { ConfigService } from "../config-service";
+import { ConfigService, applyBudgetEnvOverrides } from "../config-service";
+import { resolveGuardHardHint } from "../budget/render";
+import type { BudgetStrategy } from "../budget/types";
 import { fetchDaemonStatus } from "../daemon-status";
 import { inspectAgentBridgeEnv } from "../env-guard";
 import {
@@ -217,6 +219,7 @@ async function buildDoctorReport(pair: PairResolution, registered: boolean): Pro
       : `环境变量与当前目录不匹配：请在正确的项目目录里重新运行 \`${cli} claude\`，不要复用其他目录的会话环境。`,
   });
   checks.push(configParseabilityCheck(cwd, cli));
+  checks.push(budgetStrategyGuardCheck(cwd));
   checks.push({
     name: "daemon health",
     status: health ? "ok" : "warn",
@@ -555,6 +558,64 @@ function configParseabilityCheck(cwd: string, cli: string): DoctorCheck {
       ? `parsed at ${desc.path} — custom values in effect`
       : `parsed at ${desc.path} — all values match defaults`,
   };
+}
+
+/**
+ * Default v3 maximize target utilization (design §3.1). P1 does not parse the
+ * maximize parameter block yet (that lands with P2), so the doctor check
+ * compares the guard hard line against this design default.
+ */
+export const V3_DEFAULT_TARGET_UTIL = 97;
+
+/**
+ * Pure verdict for the v3 Q7 enhanced-B doctor check: with strategy=maximize,
+ * the OUTER quota-guard hard line (default 92, the guard's BUDGET_HARD
+ * default) hard-stops the Claude process BEFORE v3's targetUtil — the
+ * 92→targetUtil band is unreachable until the user raises the guard line.
+ * v3 never crosses or bypasses the guard (REAL-3); this check makes that
+ * boundary visible instead of letting runway displays mislead.
+ */
+export function evaluateBudgetStrategyGuard(
+  strategy: BudgetStrategy,
+  guardHardPct: number,
+  targetUtilPct: number = V3_DEFAULT_TARGET_UTIL,
+): DoctorCheck {
+  if (strategy !== "maximize") {
+    return {
+      name: "budget strategy",
+      status: "ok",
+      detail: "strategy=conserve — v2-equivalent budget behavior (v3 maximize is opt-in)",
+    };
+  }
+  if (guardHardPct >= targetUtilPct) {
+    return {
+      name: "budget strategy",
+      status: "ok",
+      detail:
+        `strategy=maximize — outer guard hard line ${guardHardPct}% covers targetUtil ${targetUtilPct}%`,
+    };
+  }
+  return {
+    name: "budget strategy",
+    status: "warn",
+    detail:
+      `strategy=maximize but the outer quota-guard hard line (${guardHardPct}%) is below ` +
+      `targetUtil (${targetUtilPct}%) — the ${guardHardPct}→${targetUtilPct} band is unreachable for Claude`,
+    hint:
+      "v3 不可越过外层 quota-guard 硬线：Claude 侧达到 guard 硬线时进程会被外层强停，" +
+      `maximize 的 ${guardHardPct}%→${targetUtilPct}% 区间实际烧不到。想真正用到 targetUtil，` +
+      "需自行调高 quota-guard 的 BUDGET_HARD（本仓库不代改外层配置）；展示侧已按 guard 线收口。",
+  };
+}
+
+/**
+ * IO shell: read the project budget config (with env overrides, matching what
+ * the daemon would run with) and the guard hard-line display hint.
+ */
+function budgetStrategyGuardCheck(cwd: string): DoctorCheck {
+  const config = new ConfigService(cwd).loadOrDefault();
+  const budget = applyBudgetEnvOverrides(config.budget);
+  return evaluateBudgetStrategyGuard(budget.strategy, resolveGuardHardHint());
 }
 
 function logCheck(name: string, path: string, cli: string): DoctorCheck {

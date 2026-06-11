@@ -234,7 +234,11 @@ function ensureBudgetCoordinatorStarted() {
       `codexTierControl=${BUDGET_CONFIG.codexTierControl} ` +
       // Normalization degrades tier control to false when the sticky-restore
       // point is missing; surface that state so the degrade is diagnosable.
-      `codexTiersFull=${BUDGET_CONFIG.codexTiers.full ? "configured" : "missing"}`,
+      `codexTiersFull=${BUDGET_CONFIG.codexTiers.full ? "configured" : "missing"} ` +
+      // v3 P1: strategy is parse-only (behavior stays conserve). Burn-rate
+      // data is CONSUMED from the guard probe (layered amendment) — the
+      // daemon collects nothing.
+      `strategy=${BUDGET_CONFIG.strategy}`,
     );
     budgetCoordinator = new BudgetCoordinator({
       source: createQuotaSource({ log }),
