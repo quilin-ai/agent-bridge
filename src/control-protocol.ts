@@ -176,3 +176,21 @@ export const CLOSE_CODE_PAIR_MISMATCH = 4004;
  * rotated its token, and a fresh `claude` launch (re-reading the token) recovers.
  */
 export const CLOSE_CODE_TOKEN_MISMATCH = 4005;
+
+/**
+ * WebSocket close code sent when a Claude frontend's `claude_connect` carries a
+ * missing or mismatched control-protocol contract version (arch-review P1 #303).
+ * Distinct from CLOSE_CODE_PAIR_MISMATCH (4004, wrong directory) and
+ * CLOSE_CODE_TOKEN_MISMATCH (4005, stale token): a contract mismatch means the
+ * installed plugin/daemon are built from incompatible protocol snapshots (one
+ * side upgraded, the other did not), so the messages on this socket would parse
+ * but silently misbehave. Recovery is a rebuild/reinstall (`bun run
+ * install:global`) + a fresh Claude Code session, NOT killing another pair.
+ *
+ * Checked LAST in admission (after pair/cwd → 4004 and token → 4005) so a token
+ * error is never masked as a contract error. A frontend that carries NO identity
+ * (legacy / AGENTBRIDGE_COMPAT_IDENTITYLESS) is exempt: with no identity it can
+ * carry no contractVersion to negotiate, so the same compat policy as the token
+ * gate applies — only identity-carrying sockets are held to the contract.
+ */
+export const CLOSE_CODE_CONTRACT_MISMATCH = 4006;

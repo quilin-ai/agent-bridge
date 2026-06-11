@@ -2,7 +2,7 @@
 
 import type { ServerWebSocket } from "bun";
 import { rmSync } from "node:fs";
-import { daemonStatusBuildInfo } from "./build-info";
+import { BUILD_INFO, daemonStatusBuildInfo } from "./build-info";
 import { CodexAdapter } from "./codex-adapter";
 import { validateClaudeClientIdentity, evaluateInjectionAttachGuard } from "./daemon-identity";
 import {
@@ -696,12 +696,18 @@ function handleControlMessage(ws: ServerWebSocket<ControlSocketData>, raw: strin
 
   switch (message.type) {
     case "claude_connect":
+      // Contract-version negotiation (arch-review P1 #303) applies ONLY here, at
+      // claude_connect attach admission. control-only paths (probe_incumbent /
+      // status / generic WS) deliberately never reach this validator, so a
+      // contract mismatch can never reject a doctor/budget/probe socket — it is
+      // purely an attach-precondition.
       const admission = validateClaudeClientIdentity({
         expectedPairId: process.env.AGENTBRIDGE_PAIR_ID ?? null,
         daemonCwd: process.cwd(),
         identity: message.identity,
         allowIdentityless: ALLOW_IDENTITYLESS_CLIENT,
         expectedControlToken: controlToken,
+        expectedContractVersion: BUILD_INFO.contractVersion,
       });
       if (!admission.ok) {
         log(`Rejecting Claude frontend #${ws.data.clientId}: ${admission.reason}`);

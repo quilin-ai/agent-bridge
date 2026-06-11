@@ -17,6 +17,7 @@ import type { BridgeMessage } from "../types";
 import type { ControlServerMessage, DaemonStatus } from "../control-protocol";
 import { portsForSlot, type PairPorts } from "../pair-registry";
 import { readControlToken, resolveControlTokenPath } from "../control-token";
+import { CONTRACT_VERSION } from "../contract-version";
 
 const DAEMON_PATH = join(process.cwd(), "src", "daemon.ts");
 const DEFAULT_TEST_SLOT_START = 2500 + (process.pid % 500);
@@ -1032,7 +1033,7 @@ describe("daemon wiring", () => {
         cwd: harness.cwd,
         stateDir: harness.stateDir,
         clientPid: process.pid,
-        contractVersion: 1,
+        contractVersion: CONTRACT_VERSION,
         controlToken: "totally-wrong-token",
       },
     }));
@@ -1070,7 +1071,7 @@ describe("daemon wiring", () => {
         cwd: harness.cwd,
         stateDir: harness.stateDir,
         clientPid: process.pid,
-        contractVersion: 1,
+        contractVersion: CONTRACT_VERSION,
       },
     }));
 
@@ -1099,6 +1100,109 @@ describe("daemon wiring", () => {
       (m) => m.type === "claude_to_codex_result" && m.requestId === "req-ok-1",
     ) as Extract<ControlServerMessage, { type: "claude_to_codex_result" }>;
     expect(accepted.success).toBe(true);
+  }, 30000);
+
+  // --- Contract-version negotiation (arch-review P1 #303) ---
+
+  test("contract gate: claude_connect with a MISMATCHED contractVersion is rejected and closed (4006)", async () => {
+    const harness = await startHarness({ pairId: "main-contmism", pairName: "main" });
+
+    const ws = await connectControlSocket(harness.controlPort);
+    const closed = new Promise<{ code: number; reason: string }>((resolve) => {
+      ws.onclose = (event) => resolve({ code: event.code, reason: event.reason });
+    });
+
+    // Correct pair/cwd AND the correct capability token, so the ONLY thing the
+    // daemon can reject is the contract version (proves 4006 is checked last and
+    // is the deciding gate here, not 4004/4005).
+    const controlToken = readControlToken(resolveControlTokenPath(harness.stateDir));
+    ws.send(JSON.stringify({
+      type: "claude_connect",
+      identity: {
+        pairId: "main-contmism",
+        pairName: "main",
+        cwd: harness.cwd,
+        stateDir: harness.stateDir,
+        clientPid: process.pid,
+        contractVersion: CONTRACT_VERSION + 999, // deliberately incompatible
+        ...(controlToken ? { controlToken } : {}),
+      },
+    }));
+
+    const result = await Promise.race([closed, sleep(4000).then(() => null)]);
+    expect(result).not.toBeNull();
+    expect(result!.code).toBe(4006); // CLOSE_CODE_CONTRACT_MISMATCH
+    expect(result!.reason).toContain("contract version mismatch");
+
+    // The mismatched socket was NOT attached: the daemon still serves /healthz.
+    const healthz = await fetch(`http://127.0.0.1:${harness.controlPort}/healthz`);
+    expect(healthz.ok).toBe(true);
+  }, 30000);
+
+  test("contract gate: claude_connect MISSING contractVersion is rejected (4006)", async () => {
+    const harness = await startHarness({ pairId: "main-contmiss", pairName: "main" });
+
+    const ws = await connectControlSocket(harness.controlPort);
+    const closed = new Promise<{ code: number; reason: string }>((resolve) => {
+      ws.onclose = (event) => resolve({ code: event.code, reason: event.reason });
+    });
+
+    // Correct pair/cwd + token, but NO contractVersion at all — an old frontend
+    // that predates contract negotiation. Default policy = reject (can't negotiate).
+    const controlToken = readControlToken(resolveControlTokenPath(harness.stateDir));
+    ws.send(JSON.stringify({
+      type: "claude_connect",
+      identity: {
+        pairId: "main-contmiss",
+        pairName: "main",
+        cwd: harness.cwd,
+        stateDir: harness.stateDir,
+        clientPid: process.pid,
+        // contractVersion intentionally omitted
+        ...(controlToken ? { controlToken } : {}),
+      },
+    }));
+
+    const result = await Promise.race([closed, sleep(4000).then(() => null)]);
+    expect(result).not.toBeNull();
+    expect(result!.code).toBe(4006);
+    expect(result!.reason).toContain("missing contract version");
+  }, 30000);
+
+  test("control-only path: probe_incumbent is NEVER rejected by the contract gate (no claude_connect)", async () => {
+    // A control-only socket (the `abg claude` conflict guard) connects and sends
+    // ONLY probe_incumbent — it carries no identity / contractVersion. The contract
+    // gate lives in claude_connect admission, so this socket must get a normal
+    // incumbent_status reply and must NOT be closed with 4006.
+    const harness = await startHarness({ pairId: "main-probecon", pairName: "main" });
+
+    const ws = await connectControlSocket(harness.controlPort);
+    const replies: ControlServerMessage[] = [];
+    ws.onmessage = (event) => {
+      const raw = typeof event.data === "string" ? event.data : event.data.toString();
+      replies.push(JSON.parse(raw) as ControlServerMessage);
+    };
+    let closeCode: number | null = null;
+    ws.onclose = (event) => { closeCode = event.code; };
+
+    ws.send(JSON.stringify({ type: "probe_incumbent" }));
+
+    await waitFor(
+      () => replies.some((m) => m.type === "incumbent_status"),
+      "incumbent_status reply for the control-only probe socket",
+    );
+    const reply = replies.find((m) => m.type === "incumbent_status") as Extract<
+      ControlServerMessage,
+      { type: "incumbent_status" }
+    >;
+    // No live frontend attached yet → connected:false. The point: a normal reply,
+    // not a 4006 close.
+    expect(reply.connected).toBe(false);
+    // Give any (erroneous) close a chance to arrive, then assert it never did.
+    await sleep(200);
+    expect(closeCode).toBeNull();
+
+    try { ws.close(); } catch {}
   }, 30000);
 });
 
@@ -1211,7 +1315,9 @@ async function startHarness(opts: {
           cwd,
           stateDir,
           clientPid: process.pid,
-          contractVersion: 1,
+          // Mirror bridge.ts: echo the daemon's contract version (#303). Read from
+          // the single source so a future bump keeps the happy path green.
+          contractVersion: CONTRACT_VERSION,
           ...(controlToken ? { controlToken } : {}),
         },
       }));

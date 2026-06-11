@@ -14379,7 +14379,7 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.12", "0.0.0-source"),
-  commit: defineString("a2d8062", "source"),
+  commit: defineString("3f988c0", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION)
 });
@@ -14408,6 +14408,7 @@ var CLOSE_CODE_EVICTED_STALE = 4002;
 var CLOSE_CODE_PROBE_IN_PROGRESS = 4003;
 var CLOSE_CODE_PAIR_MISMATCH = 4004;
 var CLOSE_CODE_TOKEN_MISMATCH = 4005;
+var CLOSE_CODE_CONTRACT_MISMATCH = 4006;
 
 // src/interrupt-timing.ts
 var CLIENT_REPLY_TIMEOUT_MS = 15000;
@@ -14633,7 +14634,7 @@ class DaemonClient extends EventEmitter2 {
       if (isCurrent) {
         this.ws = null;
         this.rejectPendingReplies("AgentBridge daemon disconnected.");
-        if (event.code === CLOSE_CODE_REPLACED || event.code === CLOSE_CODE_EVICTED_STALE || event.code === CLOSE_CODE_PROBE_IN_PROGRESS || event.code === CLOSE_CODE_PAIR_MISMATCH || event.code === CLOSE_CODE_TOKEN_MISMATCH) {
+        if (event.code === CLOSE_CODE_REPLACED || event.code === CLOSE_CODE_EVICTED_STALE || event.code === CLOSE_CODE_PROBE_IN_PROGRESS || event.code === CLOSE_CODE_PAIR_MISMATCH || event.code === CLOSE_CODE_TOKEN_MISMATCH || event.code === CLOSE_CODE_CONTRACT_MISMATCH) {
           this.emit("rejected", event.code);
         } else {
           this.emit("disconnect");
@@ -15926,6 +15927,11 @@ daemonClient.on("rejected", async (code) => {
       reason = "rejected";
       notificationId = "system_bridge_token_mismatch";
       notificationContent = `\u26A0\uFE0F AgentBridge daemon rejected this session \u2014 control token mismatch (the daemon likely restarted and rotated its token). Start a fresh session with \`${pairScopedCommand("claude")}\` to pick up the current token. AgentBridge \u62D2\u7EDD\u4E86\u6B64\u4F1A\u8BDD\u2014\u2014\u63A7\u5236\u4EE4\u724C\u4E0D\u5339\u914D\uFF08daemon \u53EF\u80FD\u5DF2\u91CD\u542F\u5E76\u8F6E\u6362\u4EE4\u724C\uFF09\u3002\u8BF7\u7528 \`${pairScopedCommand("claude")}\` \u91CD\u65B0\u542F\u52A8\u4EE5\u83B7\u53D6\u6700\u65B0\u4EE4\u724C\u3002`;
+      break;
+    case CLOSE_CODE_CONTRACT_MISMATCH:
+      reason = "rejected";
+      notificationId = "system_bridge_contract_mismatch";
+      notificationContent = `\u26A0\uFE0F AgentBridge daemon rejected this session \u2014 protocol contract mismatch. The installed plugin and the running daemon are built from out-of-sync protocol versions. Run \`bun run install:global\` to rebuild + reinstall, then close and reopen Claude Code. Do NOT kill other pairs \u2014 this is local build skew, not a session conflict. AgentBridge \u62D2\u7EDD\u4E86\u6B64\u4F1A\u8BDD\u2014\u2014\u534F\u8BAE\u5951\u7EA6\u7248\u672C\u4E0D\u5339\u914D\u3002\u5DF2\u5B89\u88C5\u7684\u63D2\u4EF6\u4E0E\u8FD0\u884C\u4E2D\u7684 daemon \u534F\u8BAE\u7248\u672C\u4E0D\u4E00\u81F4\u3002\u8BF7\u8FD0\u884C \`bun run install:global\` \u91CD\u65B0\u7F16\u8BD1\u5E76\u5B89\u88C5\uFF0C\u7136\u540E\u5173\u95ED\u5E76\u91CD\u65B0\u6253\u5F00 Claude Code\u3002\u8BF7\u52FF kill \u5176\u5B83 pair\u2014\u2014\u8FD9\u662F\u672C\u5730\u6784\u5EFA\u7248\u672C\u6F02\u79FB\uFF0C\u4E0D\u662F\u4F1A\u8BDD\u51B2\u7A81\u3002`;
       break;
     default:
       reason = "rejected";

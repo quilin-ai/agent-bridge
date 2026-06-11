@@ -18,6 +18,7 @@ import {
   CLOSE_CODE_PAIR_MISMATCH,
   CLOSE_CODE_PROBE_IN_PROGRESS,
   CLOSE_CODE_TOKEN_MISMATCH,
+  CLOSE_CODE_CONTRACT_MISMATCH,
 } from "./control-protocol";
 import type { ControlClientIdentity } from "./control-protocol";
 import type { BridgeMessage } from "./types";
@@ -214,6 +215,17 @@ daemonClient.on("rejected", async (code: number) => {
       reason = "rejected";
       notificationId = "system_bridge_token_mismatch";
       notificationContent = `⚠️ AgentBridge daemon rejected this session — control token mismatch (the daemon likely restarted and rotated its token). Start a fresh session with \`${pairScopedCommand("claude")}\` to pick up the current token. AgentBridge 拒绝了此会话——控制令牌不匹配（daemon 可能已重启并轮换令牌）。请用 \`${pairScopedCommand("claude")}\` 重新启动以获取最新令牌。`;
+      break;
+    case CLOSE_CODE_CONTRACT_MISMATCH:
+      // The frontend and daemon were built from incompatible protocol snapshots
+      // (one upgraded, the other did not) — messages would parse but silently
+      // drift. The fix is to rebuild/reinstall so BOTH sides share the same
+      // contract, NOT to kill another pair (its daemon is fine; the mismatch is
+      // local build skew). Distinct message so the user reinstalls instead of
+      // chasing a phantom "another session" / "wrong directory" conflict.
+      reason = "rejected";
+      notificationId = "system_bridge_contract_mismatch";
+      notificationContent = `⚠️ AgentBridge daemon rejected this session — protocol contract mismatch. The installed plugin and the running daemon are built from out-of-sync protocol versions. Run \`bun run install:global\` to rebuild + reinstall, then close and reopen Claude Code. Do NOT kill other pairs — this is local build skew, not a session conflict. AgentBridge 拒绝了此会话——协议契约版本不匹配。已安装的插件与运行中的 daemon 协议版本不一致。请运行 \`bun run install:global\` 重新编译并安装，然后关闭并重新打开 Claude Code。请勿 kill 其它 pair——这是本地构建版本漂移，不是会话冲突。`;
       break;
     default:
       reason = "rejected";

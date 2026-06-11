@@ -6,6 +6,7 @@ import {
   CLOSE_CODE_PROBE_IN_PROGRESS,
   CLOSE_CODE_PAIR_MISMATCH,
   CLOSE_CODE_TOKEN_MISMATCH,
+  CLOSE_CODE_CONTRACT_MISMATCH,
 } from "./control-protocol";
 import type { ControlClientIdentity, ControlClientMessage, ControlServerMessage, DaemonStatus, TurnPhase } from "./control-protocol";
 import { CLIENT_REPLY_TIMEOUT_MS } from "./interrupt-timing";
@@ -328,7 +329,8 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
           event.code === CLOSE_CODE_EVICTED_STALE ||
           event.code === CLOSE_CODE_PROBE_IN_PROGRESS ||
           event.code === CLOSE_CODE_PAIR_MISMATCH ||
-          event.code === CLOSE_CODE_TOKEN_MISMATCH
+          event.code === CLOSE_CODE_TOKEN_MISMATCH ||
+          event.code === CLOSE_CODE_CONTRACT_MISMATCH
         ) {
           this.emit("rejected", event.code);
         } else {
