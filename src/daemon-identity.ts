@@ -1,4 +1,5 @@
 import {
+  CLOSE_CODE_CONTRACT_MISMATCH,
   CLOSE_CODE_PAIR_MISMATCH,
   CLOSE_CODE_TOKEN_MISMATCH,
   type ControlClientIdentity,
@@ -17,6 +18,21 @@ export interface ClaudeIdentityValidationInput {
    * pre-token pair/cwd checks plus the attach-convergence guard at injection.
    */
   expectedControlToken?: string | null;
+  /**
+   * The daemon's control-protocol contract version (arch-review P1 #303, from
+   * BUILD_INFO.contractVersion). When set, an identity-carrying client MUST echo
+   * the SAME contractVersion or it is rejected with CLOSE_CODE_CONTRACT_MISMATCH
+   * (4006) — a missing or mismatched version means the frontend/daemon were
+   * built from incompatible protocol snapshots and would silently drift.
+   *
+   * Compat (mirrors the token gate): undefined disables the contract gate (an
+   * older daemon that never negotiated a contract); and an identity-LESS client
+   * (legacy / AGENTBRIDGE_COMPAT_IDENTITYLESS) is exempt because it carries no
+   * version to negotiate — the identityless admit paths below stay intact. The
+   * check runs LAST (after pair/cwd → 4004 and token → 4005) so a token error is
+   * never masked as a contract error.
+   */
+  expectedContractVersion?: number;
 }
 
 export type ClaudeIdentityValidationResult =
@@ -59,7 +75,13 @@ export function validateClaudeClientIdentity(
     }
   }
 
-  if (!input.expectedPairId) return { ok: true };
+  // Legacy mode (no pairId enforcement): pair/cwd are not checked, but an
+  // identity-carrying client still negotiates the contract (and already cleared
+  // the token gate above). An identityless legacy client carries no version to
+  // negotiate, so it is admitted unchanged.
+  if (!input.expectedPairId) {
+    return input.identity ? validateContractVersion(input) : { ok: true };
+  }
   if (!input.identity) {
     return input.allowIdentityless
       ? { ok: true }
@@ -77,6 +99,38 @@ export function validateClaudeClientIdentity(
       ok: false,
       closeCode: CLOSE_CODE_PAIR_MISMATCH,
       reason: `cwd mismatch: expected ${input.daemonCwd}, got ${input.identity.cwd ?? "<none>"}`,
+    };
+  }
+  // Contract-version gate (P1 #303) runs LAST — after pair/cwd (4004) and the
+  // token gate (4005) above — so a token/pair error is never mislabeled 4006.
+  return validateContractVersion(input);
+}
+
+/**
+ * Contract-version gate (arch-review P1 #303). Only reached for identity-
+ * carrying clients that have already cleared the token + pair/cwd gates. When
+ * the daemon advertises a contract (expectedContractVersion set), the client's
+ * identity MUST echo the exact same version; a missing or mismatched version is
+ * rejected with CLOSE_CODE_CONTRACT_MISMATCH (4006). expectedContractVersion
+ * undefined disables the gate (older daemon that never negotiated a contract).
+ */
+function validateContractVersion(
+  input: ClaudeIdentityValidationInput,
+): ClaudeIdentityValidationResult {
+  if (input.expectedContractVersion === undefined) return { ok: true };
+  const provided = input.identity?.contractVersion;
+  if (provided === undefined || provided === null) {
+    return {
+      ok: false,
+      closeCode: CLOSE_CODE_CONTRACT_MISMATCH,
+      reason: `missing contract version: daemon speaks contract v${input.expectedContractVersion}`,
+    };
+  }
+  if (provided !== input.expectedContractVersion) {
+    return {
+      ok: false,
+      closeCode: CLOSE_CODE_CONTRACT_MISMATCH,
+      reason: `contract version mismatch: daemon v${input.expectedContractVersion}, client v${provided}`,
     };
   }
   return { ok: true };

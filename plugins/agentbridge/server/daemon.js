@@ -21,7 +21,7 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.12", "0.0.0-source"),
-  commit: defineString("a2d8062", "source"),
+  commit: defineString("3f988c0", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION)
 });
@@ -2253,6 +2253,7 @@ var CLOSE_CODE_EVICTED_STALE = 4002;
 var CLOSE_CODE_PROBE_IN_PROGRESS = 4003;
 var CLOSE_CODE_PAIR_MISMATCH = 4004;
 var CLOSE_CODE_TOKEN_MISMATCH = 4005;
+var CLOSE_CODE_CONTRACT_MISMATCH = 4006;
 
 // src/control-token.ts
 import { chmodSync as chmodSync2, readFileSync } from "fs";
@@ -2344,8 +2345,9 @@ function validateClaudeClientIdentity(input) {
       };
     }
   }
-  if (!input.expectedPairId)
-    return { ok: true };
+  if (!input.expectedPairId) {
+    return input.identity ? validateContractVersion(input) : { ok: true };
+  }
   if (!input.identity) {
     return input.allowIdentityless ? { ok: true } : { ok: false, closeCode: CLOSE_CODE_PAIR_MISMATCH, reason: "missing client identity" };
   }
@@ -2361,6 +2363,26 @@ function validateClaudeClientIdentity(input) {
       ok: false,
       closeCode: CLOSE_CODE_PAIR_MISMATCH,
       reason: `cwd mismatch: expected ${input.daemonCwd}, got ${input.identity.cwd ?? "<none>"}`
+    };
+  }
+  return validateContractVersion(input);
+}
+function validateContractVersion(input) {
+  if (input.expectedContractVersion === undefined)
+    return { ok: true };
+  const provided = input.identity?.contractVersion;
+  if (provided === undefined || provided === null) {
+    return {
+      ok: false,
+      closeCode: CLOSE_CODE_CONTRACT_MISMATCH,
+      reason: `missing contract version: daemon speaks contract v${input.expectedContractVersion}`
+    };
+  }
+  if (provided !== input.expectedContractVersion) {
+    return {
+      ok: false,
+      closeCode: CLOSE_CODE_CONTRACT_MISMATCH,
+      reason: `contract version mismatch: daemon v${input.expectedContractVersion}, client v${provided}`
     };
   }
   return { ok: true };
@@ -5091,7 +5113,8 @@ function handleControlMessage(ws, raw) {
         daemonCwd: process.cwd(),
         identity: message.identity,
         allowIdentityless: ALLOW_IDENTITYLESS_CLIENT,
-        expectedControlToken: controlToken
+        expectedControlToken: controlToken,
+        expectedContractVersion: BUILD_INFO.contractVersion
       });
       if (!admission.ok) {
         log(`Rejecting Claude frontend #${ws.data.clientId}: ${admission.reason}`);

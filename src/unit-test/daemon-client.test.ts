@@ -153,6 +153,28 @@ describe("DaemonClient", () => {
     expect(disconnectEmitted).toBe(false);
   });
 
+  test("emits rejected (not disconnect) when server closes with code 4006 (contract mismatch)", async () => {
+    await client.connect();
+
+    let disconnectEmitted = false;
+    client.on("disconnect", () => { disconnectEmitted = true; });
+
+    const rejected = new Promise<number>((resolve) => {
+      client.on("rejected", (code) => resolve(code));
+    });
+
+    for (const ws of serverSockets) {
+      ws.close(4006, "contract version mismatch: daemon v1, client v2");
+    }
+
+    const code = await rejected;
+    expect(code).toBe(4006);
+    await new Promise((r) => setTimeout(r, 50));
+    // A contract mismatch is terminal-until-reinstall, like pair/token mismatch:
+    // it must NOT fall into the disconnect (auto-reconnect) path.
+    expect(disconnectEmitted).toBe(false);
+  });
+
   test("attachClaudeAndWaitForStatus resolves daemon status when the daemon confirms attachment", async () => {
     onServerMessage = (ws, raw) => {
       const message = JSON.parse(raw.toString());
