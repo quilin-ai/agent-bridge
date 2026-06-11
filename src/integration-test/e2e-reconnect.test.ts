@@ -1,11 +1,12 @@
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import { spawn, type ChildProcess } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DaemonClient } from "../daemon-client";
+import { installFakeCodex } from "./fixtures/fake-codex-install";
 
 /**
  * E2E tests: daemon lifecycle + client reconnect
@@ -47,39 +48,6 @@ function freePort(): Promise<number> {
       srv.close(() => resolve(port));
     });
   });
-}
-
-/** Minimal fake codex app-server: healthz/readyz + WS accept + clean SIGTERM. */
-function fakeCodexScript(): string {
-  return `#!/usr/bin/env bun
-if (process.argv.includes("--version")) {
-  console.log("codex fake");
-  process.exit(0);
-}
-if (process.argv[2] !== "app-server") {
-  await Bun.sleep(60_000);
-  process.exit(0);
-}
-const listenIndex = process.argv.indexOf("--listen");
-const listen = process.argv[listenIndex + 1];
-const port = Number(new URL(listen).port);
-Bun.serve({
-  hostname: "127.0.0.1",
-  port,
-  fetch(req, server) {
-    const url = new URL(req.url);
-    if (url.pathname === "/healthz" || url.pathname === "/readyz") {
-      return Response.json({ ok: true });
-    }
-    if (server.upgrade(req)) return undefined;
-    return new Response("fake codex app-server");
-  },
-  websocket: { open() {}, message() {}, close() {} },
-});
-process.on("SIGTERM", () => process.exit(0));
-process.on("SIGINT", () => process.exit(0));
-await new Promise(() => {});
-`;
 }
 
 function launchDaemon(): ChildProcess {
@@ -147,9 +115,8 @@ describe("E2E: daemon lifecycle + reconnect", () => {
     stateDir = join(testRoot, "state");
     binDir = join(testRoot, "bin");
     mkdirSync(binDir, { recursive: true });
-    const codexPath = join(binDir, "codex");
-    writeFileSync(codexPath, fakeCodexScript(), "utf-8");
-    chmodSync(codexPath, 0o755);
+    // Minimal fake codex app-server: healthz/readyz + WS accept + clean SIGTERM.
+    installFakeCodex({ binDir, capability: "minimal" });
 
     [controlPort, appPort, proxyPort] = await Promise.all([freePort(), freePort(), freePort()]);
     healthUrl = `http://127.0.0.1:${controlPort}/healthz`;
