@@ -14382,7 +14382,7 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.12", "0.0.0-source"),
-  commit: defineString("2ea9d06", "source"),
+  commit: defineString("2e5a131", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION)
 });
@@ -14805,6 +14805,19 @@ var defaultRead = (path) => readFileSync(path, "utf-8");
 function writeDaemonRecord(path, record3) {
   atomicWriteJson(path, record3);
 }
+function sanitizePorts(value) {
+  if (typeof value !== "object" || value === null)
+    return;
+  const raw = value;
+  const ports = {};
+  if (typeof raw.appPort === "number")
+    ports.appPort = raw.appPort;
+  if (typeof raw.proxyPort === "number")
+    ports.proxyPort = raw.proxyPort;
+  if (typeof raw.controlPort === "number")
+    ports.controlPort = raw.controlPort;
+  return Object.keys(ports).length > 0 ? ports : undefined;
+}
 function readDaemonRecord(path, read = defaultRead) {
   let parsed;
   try {
@@ -14818,7 +14831,35 @@ function readDaemonRecord(path, read = defaultRead) {
   if (typeof obj.pid !== "number" || !Number.isFinite(obj.pid))
     return null;
   const phase = obj.phase === "ready" ? "ready" : "booting";
-  return { ...obj, pid: obj.pid, phase };
+  const record3 = { pid: obj.pid, phase };
+  if (typeof obj.startedAt === "number")
+    record3.startedAt = obj.startedAt;
+  if (typeof obj.nonce === "string")
+    record3.nonce = obj.nonce;
+  if (obj.pairId === null || typeof obj.pairId === "string")
+    record3.pairId = obj.pairId;
+  if (obj.cwd === null || typeof obj.cwd === "string")
+    record3.cwd = obj.cwd;
+  if (obj.stateDir === null || typeof obj.stateDir === "string")
+    record3.stateDir = obj.stateDir;
+  if (typeof obj.proxyUrl === "string")
+    record3.proxyUrl = obj.proxyUrl;
+  if (typeof obj.appServerUrl === "string")
+    record3.appServerUrl = obj.appServerUrl;
+  const ports = sanitizePorts(obj.ports);
+  if (ports !== undefined)
+    record3.ports = ports;
+  if (typeof obj.build === "object" && obj.build !== null) {
+    record3.build = obj.build;
+  }
+  if (typeof obj.turnPhase === "string")
+    record3.turnPhase = obj.turnPhase;
+  if (typeof obj.turnInProgress === "boolean")
+    record3.turnInProgress = obj.turnInProgress;
+  if (typeof obj.attentionWindowActive === "boolean") {
+    record3.attentionWindowActive = obj.attentionWindowActive;
+  }
+  return record3;
 }
 function synthesizeLegacyRecord(pidFilePath, statusFilePath, read = defaultRead) {
   let pidFromPidFile = null;

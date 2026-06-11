@@ -88,10 +88,30 @@ export function writeDaemonRecord(path: string, record: DaemonRecord): void {
   atomicWriteJson(path, record);
 }
 
+/** Sanitize the untrusted `ports` object — keep only numeric port entries. */
+function sanitizePorts(value: unknown): DaemonRecordPorts | undefined {
+  if (typeof value !== "object" || value === null) return undefined;
+  const raw = value as Record<string, unknown>;
+  const ports: DaemonRecordPorts = {};
+  if (typeof raw.appPort === "number") ports.appPort = raw.appPort;
+  if (typeof raw.proxyPort === "number") ports.proxyPort = raw.proxyPort;
+  if (typeof raw.controlPort === "number") ports.controlPort = raw.controlPort;
+  return Object.keys(ports).length > 0 ? ports : undefined;
+}
+
 /**
  * Read the unified daemon.json. Returns the parsed record only when it is a
  * well-formed object with a finite numeric pid; otherwise null (a partially
  * written / corrupt file must NOT masquerade as a live record).
+ *
+ * HARDENING (#536 regression): every field is typeof-validated INDIVIDUALLY and
+ * only carried through if it matches its expected type — mirroring how
+ * {@link synthesizeLegacyRecord} builds a record. Previously the whole parsed
+ * object was spread raw, so a corrupt / hand-edited daemon.json could pass a
+ * non-string `proxyUrl` (number/object) straight through to consumers — e.g.
+ * cli/codex.ts does `new URL(proxyUrl)`, which throws on a non-string and crashes
+ * the CLI. Dropping (not coercing) wrong-typed fields keeps the trust boundary at
+ * the parse site.
  */
 export function readDaemonRecord(path: string, read: ReadFile = defaultRead): DaemonRecord | null {
   let parsed: unknown;
@@ -104,7 +124,27 @@ export function readDaemonRecord(path: string, read: ReadFile = defaultRead): Da
   const obj = parsed as Record<string, unknown>;
   if (typeof obj.pid !== "number" || !Number.isFinite(obj.pid)) return null;
   const phase: DaemonRecordPhase = obj.phase === "ready" ? "ready" : "booting";
-  return { ...(obj as unknown as DaemonRecord), pid: obj.pid, phase };
+
+  // Build a fresh record, carrying through ONLY well-typed fields.
+  const record: DaemonRecord = { pid: obj.pid, phase };
+  if (typeof obj.startedAt === "number") record.startedAt = obj.startedAt;
+  if (typeof obj.nonce === "string") record.nonce = obj.nonce;
+  if (obj.pairId === null || typeof obj.pairId === "string") record.pairId = obj.pairId;
+  if (obj.cwd === null || typeof obj.cwd === "string") record.cwd = obj.cwd;
+  if (obj.stateDir === null || typeof obj.stateDir === "string") record.stateDir = obj.stateDir;
+  if (typeof obj.proxyUrl === "string") record.proxyUrl = obj.proxyUrl;
+  if (typeof obj.appServerUrl === "string") record.appServerUrl = obj.appServerUrl;
+  const ports = sanitizePorts(obj.ports);
+  if (ports !== undefined) record.ports = ports;
+  if (typeof obj.build === "object" && obj.build !== null) {
+    record.build = obj.build as AgentBridgeBuildInfo;
+  }
+  if (typeof obj.turnPhase === "string") record.turnPhase = obj.turnPhase as TurnPhase;
+  if (typeof obj.turnInProgress === "boolean") record.turnInProgress = obj.turnInProgress;
+  if (typeof obj.attentionWindowActive === "boolean") {
+    record.attentionWindowActive = obj.attentionWindowActive;
+  }
+  return record;
 }
 
 /**

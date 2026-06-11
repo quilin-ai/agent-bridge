@@ -22,7 +22,7 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.12", "0.0.0-source"),
-  commit: defineString("2ea9d06", "source"),
+  commit: defineString("2e5a131", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION)
 });
@@ -88,6 +88,19 @@ var defaultRead = (path) => readFileSync(path, "utf-8");
 function writeDaemonRecord(path, record) {
   atomicWriteJson(path, record);
 }
+function sanitizePorts(value) {
+  if (typeof value !== "object" || value === null)
+    return;
+  const raw = value;
+  const ports = {};
+  if (typeof raw.appPort === "number")
+    ports.appPort = raw.appPort;
+  if (typeof raw.proxyPort === "number")
+    ports.proxyPort = raw.proxyPort;
+  if (typeof raw.controlPort === "number")
+    ports.controlPort = raw.controlPort;
+  return Object.keys(ports).length > 0 ? ports : undefined;
+}
 function readDaemonRecord(path, read = defaultRead) {
   let parsed;
   try {
@@ -101,7 +114,35 @@ function readDaemonRecord(path, read = defaultRead) {
   if (typeof obj.pid !== "number" || !Number.isFinite(obj.pid))
     return null;
   const phase = obj.phase === "ready" ? "ready" : "booting";
-  return { ...obj, pid: obj.pid, phase };
+  const record = { pid: obj.pid, phase };
+  if (typeof obj.startedAt === "number")
+    record.startedAt = obj.startedAt;
+  if (typeof obj.nonce === "string")
+    record.nonce = obj.nonce;
+  if (obj.pairId === null || typeof obj.pairId === "string")
+    record.pairId = obj.pairId;
+  if (obj.cwd === null || typeof obj.cwd === "string")
+    record.cwd = obj.cwd;
+  if (obj.stateDir === null || typeof obj.stateDir === "string")
+    record.stateDir = obj.stateDir;
+  if (typeof obj.proxyUrl === "string")
+    record.proxyUrl = obj.proxyUrl;
+  if (typeof obj.appServerUrl === "string")
+    record.appServerUrl = obj.appServerUrl;
+  const ports = sanitizePorts(obj.ports);
+  if (ports !== undefined)
+    record.ports = ports;
+  if (typeof obj.build === "object" && obj.build !== null) {
+    record.build = obj.build;
+  }
+  if (typeof obj.turnPhase === "string")
+    record.turnPhase = obj.turnPhase;
+  if (typeof obj.turnInProgress === "boolean")
+    record.turnInProgress = obj.turnInProgress;
+  if (typeof obj.attentionWindowActive === "boolean") {
+    record.attentionWindowActive = obj.attentionWindowActive;
+  }
+  return record;
 }
 function synthesizeLegacyRecord(pidFilePath, statusFilePath, read = defaultRead) {
   let pidFromPidFile = null;
@@ -4591,6 +4632,27 @@ function createQuotaSource(options) {
   return new QuotaSource(options);
 }
 
+// src/daemon-identity-ownership.ts
+import { readFileSync as readFileSync5 } from "fs";
+var defaultRead2 = (path) => readFileSync5(path, "utf-8");
+function pidFileOwnedByUs(pidFilePath, ourPid, read = defaultRead2) {
+  let raw;
+  try {
+    raw = read(pidFilePath);
+  } catch {
+    return false;
+  }
+  const trimmed = raw.trim();
+  if (trimmed.length === 0)
+    return false;
+  if (!/^[+-]?\d+$/.test(trimmed))
+    return false;
+  const pid = Number.parseInt(trimmed, 10);
+  if (!Number.isFinite(pid))
+    return false;
+  return pid === ourPid;
+}
+
 // src/idempotency-tracker.ts
 var DEFAULT_TOMBSTONE_TTL_MS = 20 * 60 * 1000;
 
@@ -4742,7 +4804,7 @@ class ReplyRequiredTracker {
 import {
   existsSync as existsSync6,
   readdirSync,
-  readFileSync as readFileSync5
+  readFileSync as readFileSync6
 } from "fs";
 import { homedir as homedir3 } from "os";
 import { basename as basename2, join as join6 } from "path";
@@ -4758,7 +4820,7 @@ function codexHome(env = process.env) {
 }
 function readRawCurrentThread(stateDir) {
   try {
-    const parsed = JSON.parse(readFileSync5(stateDir.currentThreadFile, "utf-8"));
+    const parsed = JSON.parse(readFileSync6(stateDir.currentThreadFile, "utf-8"));
     if (parsed?.version === 1 && typeof parsed.threadId === "string" && parsed.threadId.length > 0 && (parsed.status === "pending" || parsed.status === "current") && typeof parsed.cwd === "string") {
       return parsed;
     }
@@ -4953,14 +5015,9 @@ var stateDir = new StateDirResolver;
 stateDir.ensure();
 var processLogger = createProcessLogger({ component: "AgentBridgeDaemon", logFile: stateDir.logFile });
 var controlTokenPath = resolveControlTokenPath(stateDir.dir);
-var controlToken = null;
-try {
-  controlToken = generateControlToken();
-  writeControlToken(controlTokenPath, controlToken);
-} catch (err) {
-  controlToken = null;
-  processLogger.log(`Failed to write control token (${controlTokenPath}): ${err?.message ?? err} \u2014 ` + `token layer DISABLED for this daemon (attach guard + Origin guard still active)`);
-}
+var controlToken = generateControlToken();
+var weWroteToken = false;
+var weWrotePid = false;
 var configService = new ConfigService;
 var config = configService.loadOrDefault(processLogger.log);
 var CODEX_APP_PORT = parseInt(process.env.CODEX_WS_PORT ?? String(config.codex.appPort), 10);
@@ -4982,9 +5039,11 @@ var DAEMON_STARTED_AT = Date.now();
 var codex = new CodexAdapter(CODEX_APP_PORT, CODEX_PROXY_PORT, stateDir.logFile);
 var attachCmd = `codex --enable tui_app_server --remote ${codex.proxyUrl}`;
 var controlServer = null;
+var boundControlPort = false;
 var attachedClaude = null;
 var nextControlClientId = 0;
 var nextSystemMessageId = 0;
+var SYSTEM_MSG_SALT = randomUUID4().slice(0, 8);
 var codexBootstrapped = false;
 var attentionWindowTimer = null;
 var inAttentionWindow = false;
@@ -5244,60 +5303,68 @@ codex.on("exit", (code) => {
   armBootDeadline();
 });
 function startControlServer() {
-  controlServer = Bun.serve({
-    port: CONTROL_PORT,
-    hostname: "127.0.0.1",
-    fetch(req, server) {
-      const url = new URL(req.url);
-      if (url.pathname === "/healthz") {
-        return Response.json(currentStatus());
-      }
-      if (url.pathname === "/readyz") {
-        return Response.json(currentStatus(), { status: codexBootstrapped ? 200 : 503 });
-      }
-      if (url.pathname === "/ws") {
-        if (!isAllowedWsUpgrade(req)) {
-          log("Rejected WS upgrade on control port: Origin header present (possible CSWSH)");
-          return wsOriginRejectedResponse();
+  let server;
+  try {
+    server = Bun.serve({
+      port: CONTROL_PORT,
+      hostname: "127.0.0.1",
+      fetch(req, server2) {
+        const url = new URL(req.url);
+        if (url.pathname === "/healthz") {
+          return Response.json(currentStatus());
         }
-        if (server.upgrade(req, { data: { clientId: 0, attached: false, lastPongAt: Date.now(), pongCount: 0, pendingBackpressure: createPendingBackpressureBuffer() } })) {
-          return;
+        if (url.pathname === "/readyz") {
+          return Response.json(currentStatus(), { status: codexBootstrapped ? 200 : 503 });
         }
-      }
-      return new Response("AgentBridge daemon");
-    },
-    websocket: {
-      idleTimeout: 960,
-      sendPings: true,
-      open: (ws) => {
-        ws.data.clientId = ++nextControlClientId;
-        ws.data.lastPongAt = Date.now();
-        ws.data.pendingBackpressure = createPendingBackpressureBuffer();
-        log(`Frontend socket opened (#${ws.data.clientId})`);
+        if (url.pathname === "/ws") {
+          if (!isAllowedWsUpgrade(req)) {
+            log("Rejected WS upgrade on control port: Origin header present (possible CSWSH)");
+            return wsOriginRejectedResponse();
+          }
+          if (server2.upgrade(req, { data: { clientId: 0, attached: false, lastPongAt: Date.now(), pongCount: 0, pendingBackpressure: createPendingBackpressureBuffer() } })) {
+            return;
+          }
+        }
+        return new Response("AgentBridge daemon");
       },
-      close: (ws, code, reason) => {
-        log(`Frontend socket closed (#${ws.data.clientId}, code=${code}, reason=${reason || "none"}, wasAttached=${attachedClaude === ws})`);
-        if (attachedClaude === ws) {
-          detachClaude(ws, "frontend socket closed");
-        }
-      },
-      message: (ws, raw) => {
-        handleControlMessage(ws, raw);
-      },
-      pong: (ws) => {
-        ws.data.lastPongAt = Date.now();
-        ws.data.pongCount++;
-      },
-      drain: (ws) => {
-        if (ws.data.pendingBackpressure.length > 0 && ws.getBufferedAmount() === 0) {
-          ws.data.pendingBackpressure.clear();
-        }
-        if (ws === attachedClaude && bufferedMessages.length > 0) {
-          flushBufferedMessages(ws);
+      websocket: {
+        idleTimeout: 960,
+        sendPings: true,
+        open: (ws) => {
+          ws.data.clientId = ++nextControlClientId;
+          ws.data.lastPongAt = Date.now();
+          ws.data.pendingBackpressure = createPendingBackpressureBuffer();
+          log(`Frontend socket opened (#${ws.data.clientId})`);
+        },
+        close: (ws, code, reason) => {
+          log(`Frontend socket closed (#${ws.data.clientId}, code=${code}, reason=${reason || "none"}, wasAttached=${attachedClaude === ws})`);
+          if (attachedClaude === ws) {
+            detachClaude(ws, "frontend socket closed");
+          }
+        },
+        message: (ws, raw) => {
+          handleControlMessage(ws, raw);
+        },
+        pong: (ws) => {
+          ws.data.lastPongAt = Date.now();
+          ws.data.pongCount++;
+        },
+        drain: (ws) => {
+          if (ws.data.pendingBackpressure.length > 0 && ws.getBufferedAmount() === 0) {
+            ws.data.pendingBackpressure.clear();
+          }
+          if (ws === attachedClaude && bufferedMessages.length > 0) {
+            flushBufferedMessages(ws);
+          }
         }
       }
-    }
-  });
+    });
+  } catch (err) {
+    log(`Control port ${CONTROL_PORT} bind failed (${err?.code ?? err?.message ?? err}) \u2014 ` + `another daemon owns it; exiting without touching shared identity files`);
+    process.exit(0);
+  }
+  controlServer = server;
+  boundControlPort = true;
 }
 function handleControlMessage(ws, raw) {
   let message;
@@ -5851,7 +5918,7 @@ function currentReadyMessage() {
 }
 function systemMessage(idPrefix, content) {
   return {
-    id: `${idPrefix}_${++nextSystemMessageId}`,
+    id: `${idPrefix}_${SYSTEM_MSG_SALT}_${++nextSystemMessageId}`,
     source: "codex",
     content,
     timestamp: Date.now()
@@ -5860,8 +5927,22 @@ function systemMessage(idPrefix, content) {
 function writePidFile() {
   daemonLifecycle.writePid();
   daemonLifecycle.writeDaemonRecord(buildDaemonRecord("booting"));
+  weWrotePid = true;
+}
+function writeControlTokenPostBind() {
+  if (controlToken === null)
+    return;
+  try {
+    writeControlToken(controlTokenPath, controlToken);
+    weWroteToken = true;
+  } catch (err) {
+    controlToken = null;
+    processLogger.log(`Failed to write control token (${controlTokenPath}): ${err?.message ?? err} \u2014 ` + `token layer DISABLED for this daemon (attach guard + Origin guard still active)`);
+  }
 }
 function removePidFile() {
+  if (!weWrotePid || !pidFileOwnedByUs(stateDir.pidFile, process.pid))
+    return;
   daemonLifecycle.removePidFile();
   daemonLifecycle.removeDaemonRecord();
 }
@@ -5905,6 +5986,8 @@ function writeStatusFile() {
   daemonLifecycle.writeDaemonRecord(buildDaemonRecord("ready"));
 }
 function removeStatusFile() {
+  if (!boundControlPort)
+    return;
   daemonLifecycle.removeStatusFile();
   daemonLifecycle.removeDaemonRecord();
 }
@@ -5983,6 +6066,8 @@ function shutdown(reason, exitCode = 0) {
   process.exit(exitCode);
 }
 function removeControlToken() {
+  if (!weWroteToken)
+    return;
   try {
     rmSync2(controlTokenPath, { force: true });
   } catch {}
@@ -5996,10 +6081,22 @@ process.on("exit", () => {
   removeControlToken();
 });
 process.on("uncaughtException", (err) => {
-  processLogger.fatal("UNCAUGHT EXCEPTION", err);
+  processLogger.fatal("UNCAUGHT EXCEPTION \u2014 auto-shutting down daemon", err);
+  try {
+    shutdown("uncaught exception", 1);
+  } catch (shutdownErr) {
+    processLogger.fatal("shutdown during uncaughtException failed", shutdownErr);
+  }
+  process.exit(1);
 });
 process.on("unhandledRejection", (reason) => {
-  processLogger.fatal("UNHANDLED REJECTION", reason);
+  processLogger.fatal("UNHANDLED REJECTION \u2014 auto-shutting down daemon", reason);
+  try {
+    shutdown("unhandled rejection", 1);
+  } catch (shutdownErr) {
+    processLogger.fatal("shutdown during unhandledRejection failed", shutdownErr);
+  }
+  process.exit(1);
 });
 function log(msg) {
   processLogger.log(msg);
@@ -6008,7 +6105,8 @@ if (daemonLifecycle.wasKilled()) {
   log("Killed sentinel found \u2014 daemon was intentionally stopped. Exiting immediately.");
   process.exit(0);
 }
-writePidFile();
 startControlServer();
+writePidFile();
+writeControlTokenPostBind();
 armBootDeadline();
 bootCodex();
