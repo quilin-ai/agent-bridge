@@ -47,10 +47,10 @@ Both must pass. If your change affects the local bridge flow, add manual reprodu
 
 ## Testing
 
-- **Unit tests**: Co-located with source files (`*.test.ts`)
-- **E2E tests**: `src/e2e-cli.test.ts` (CLI surface), `src/e2e-reconnect.test.ts` (daemon reconnect)
-- E2E tests use isolated harnesses with temporary directories, reserved ports, and shim binaries
-- All tests run with `bun test src/`
+- **Unit tests**: `src/unit-test/*.test.ts` (pure-logic, fast inner loop — `bun run test:unit`)
+- **Integration / E2E tests**: `src/integration-test/*.test.ts` (spawn real processes; slow). Includes `e2e-cli.test.ts` (CLI surface) and `e2e-reconnect.test.ts` (daemon reconnect). Run with `bun run test:integration`.
+- Integration tests use isolated harnesses with temporary directories, reserved ports, and shim binaries
+- All tests (both layers) run with `bun test src` (the `check` gate and CI run the full suite)
 
 ## Pull Requests
 

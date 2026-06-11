@@ -71,9 +71,10 @@ Claude Code ── MCP stdio ──▶ bridge.ts (foreground)
 
 ### Tests
 
-- Unit tests: `src/unit-test/*.test.ts` (one file per module, e.g. `daemon-lifecycle.test.ts`, `codex-adapter.test.ts`, `marker-section.test.ts`).
-- CLI integration: `src/e2e-cli.test.ts` + `src/unit-test/cli.test.ts`.
-- Reconnect E2E: `src/unit-test/e2e-reconnect.test.ts` and `src/unit-test/e2e/`.
+- Tests are split by process boundary: pure-logic **unit tests** in `src/unit-test/*.test.ts` (fast, `bun run test:unit`), and spawn-real-process **integration tests** in `src/integration-test/*.test.ts` (slow, `bun run test:integration`). `bun test src` (and the `check` gate / CI) runs the full suite recursively.
+- Unit tests: one file per module, e.g. `daemon-lifecycle.test.ts`, `codex-adapter.test.ts`, `marker-section.test.ts`.
+- CLI integration: `src/integration-test/e2e-cli.test.ts` + `src/unit-test/cli.test.ts`.
+- Reconnect E2E: `src/integration-test/e2e-reconnect.test.ts`. Manual E2E test plans live in `docs/test-plans/`.
 - `message-delivery.test.ts` covers push delivery and the fallback queue.
 - Every PR must ship both unit tests and an E2E test plan before merge.
 

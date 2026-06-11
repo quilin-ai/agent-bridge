@@ -5,10 +5,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer } from "node:net";
 import { fileURLToPath } from "node:url";
-import { derivePairId, portsForSlot } from "./pair-registry";
+import { derivePairId, portsForSlot } from "../pair-registry";
 
-const CLI_PATH = fileURLToPath(new URL("./cli.ts", import.meta.url));
-const BRIDGE_PATH = fileURLToPath(new URL("./bridge.ts", import.meta.url));
+const CLI_PATH = fileURLToPath(new URL("../cli.ts", import.meta.url));
+const BRIDGE_PATH = fileURLToPath(new URL("../bridge.ts", import.meta.url));
 
 interface HarnessOptions {
   daemonDelayMs?: number;
