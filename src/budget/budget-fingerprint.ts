@@ -108,6 +108,50 @@ export interface ClassifyResult {
   effect: CoordinatorEffect;
 }
 
+/**
+ * Daemon-injected readiness signals for the resume-candidate reducer. The
+ * reducer stays pure — every probe is gathered by the daemon (TUI state, pending
+ * glob, checkpoint stat) and passed in, so this module performs no fs/socket IO.
+ *
+ * `tuiReady` and `pendingExists` are PER-SIDE: an earlier GLOBAL-OR shape
+ * (`codex ready || claude attached`) let one side's readiness leak onto the
+ * other, and a pending file from an UNRELATED repo falsely satisfied the
+ * pending predicate. Each side now carries its own boolean so the reducer can
+ * gate codex/claude independently. `checkpointExists` stays shared — the handoff
+ * checkpoint is a single per-pair artifact, not a per-agent one.
+ */
+export interface ResumeSignals {
+  /** tuiReady.codex = tuiConnectionState.canReply(); tuiReady.claude = attachedClaude != null. */
+  tuiReady: Record<AgentName, boolean>;
+  /** Per-side: a guard-pending record for THIS agent, scoped to the current pair cwd, exists. */
+  pendingExists: Record<AgentName, boolean>;
+  /** fs.existsSync(<pair cwd>/.agent/checkpoint.md) — shared across sides. */
+  checkpointExists: boolean;
+}
+
+/**
+ * Per-side resume-candidate detail (PR2 detection only). Only the sides passed
+ * to `computeResumeCandidate` get an entry; uncovered sides stay `undefined`
+ * (idle → both undefined). The richer shape (pending entry + checkpoint path) is
+ * carried so PR3's atomic claim need not re-read the guard/checkpoint files.
+ */
+export interface ResumeCandidateDetail {
+  /** All four predicates held: window refreshed AND per-side signals AND checkpoint. */
+  ready: boolean;
+}
+
+/**
+ * Per-side resume-candidate result. `codex`/`claude` are booleans for backward
+ * compatibility with the read-only `getResumeCandidate()` contract; the detail
+ * map exposes the richer per-side shape for PR3 without re-reading files.
+ */
+export interface ResumeCandidate {
+  codex?: boolean;
+  claude?: boolean;
+  /** Per-side detail for sides that were evaluated this poll. */
+  detail?: Partial<Record<AgentName, ResumeCandidateDetail>>;
+}
+
 // ---------------------------------------------------------------------------
 // Pure helpers (verbatim ports of the old coordinator private methods, now
 // parametrized by an explicit activeSides set instead of reading `this`).
@@ -319,4 +363,81 @@ export function classifyPoll(prev: FingerprintState, state: BudgetState, cfg: Bu
     };
   }
   return { next: prev, effect: { kind: "none" } };
+}
+
+/**
+ * Resolve the agent set whose resume-candidate must be evaluated this poll from
+ * the {@link classifyPoll} effect.
+ *
+ * CRITICAL: the candidate must hang off the EXITING side, not the post-exit
+ * fingerprint. `classifyPoll`'s hysteresis removes a side from `next.side` on
+ * the SAME poll its window refreshes (canAgentResume → true), so that poll takes
+ * the `exit` branch with `next.side = null`. Computing the candidate against
+ * `next.side` would therefore always yield `{}` on exactly the poll a side
+ * becomes resumable. Instead:
+ *   - exit  → evaluate the recovered `effect.previousSide`.
+ *   - enter / hold-uncertain → evaluate the still-paused `effect.side` (so a
+ *     side that is paused but not yet refreshed reports ready=false, matching
+ *     the "while paused, not a candidate" contract).
+ *   - advise / none → no side is paused → no candidate.
+ *
+ * NB: this uses only the CURRENT exit branch (whole-side recovery: single side
+ * or "both" → null). Per-side partial recovery (both → claude) is PR2.5; this
+ * function needs no change when that lands because it reads the effect, not the
+ * branch internals.
+ */
+export function resumeCandidateSides(effect: CoordinatorEffect): AgentName[] {
+  switch (effect.kind) {
+    case "exit":
+      return sideToAgents(effect.previousSide);
+    case "enter":
+    case "hold-uncertain":
+      return sideToAgents(effect.side);
+    case "advise":
+    case "none":
+      return [];
+  }
+}
+
+/**
+ * Pure resume-candidate reducer (PR2 — detection only, no emit/inject). For each
+ * EXPLICITLY supplied side, decides whether ALL four readiness predicates hold:
+ *
+ *   1. window refreshed — reuse the existing hysteresis `canAgentResume`
+ *      (decision-grade AND gateUtil < resumeBelow AND no live rate_limit). This
+ *      is the SINGLE source of truth for "window reset"; we deliberately do NOT
+ *      reinvent an epoch-diff detector (a second source would STALE-fork).
+ *   2. signals.pendingExists[side]   (per-side)
+ *   3. signals.tuiReady[side]        (per-side)
+ *   4. signals.checkpointExists      (shared)
+ *
+ * `sides` is supplied by the caller (see {@link resumeCandidateSides}) — the
+ * EXITING side on an exit poll, the still-paused side on an enter/hold poll. An
+ * empty `sides` yields `{}`. Each side is evaluated independently against its own
+ * usage and its own per-side signals, so "both paused, only codex refreshed"
+ * yields `{codex:true, claude:false}`.
+ *
+ * Fully pure: the signals are externally injected, so this function touches no
+ * fs/socket.
+ */
+export function computeResumeCandidate(
+  sides: readonly AgentName[],
+  state: BudgetState,
+  cfg: BudgetConfig,
+  signals: ResumeSignals,
+): ResumeCandidate {
+  const candidate: ResumeCandidate = {};
+  const detail: Partial<Record<AgentName, ResumeCandidateDetail>> = {};
+  for (const agent of sides) {
+    const windowRefreshed = canAgentResume(state.perAgent[agent], cfg, state.now);
+    const ready =
+      windowRefreshed &&
+      signals.pendingExists[agent] &&
+      signals.tuiReady[agent] &&
+      signals.checkpointExists;
+    candidate[agent] = ready;
+    detail[agent] = { ready };
+  }
+  if (sides.length > 0) candidate.detail = detail;
+  return candidate;
 }

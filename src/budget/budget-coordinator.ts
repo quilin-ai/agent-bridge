@@ -1,8 +1,12 @@
 import { computeBudgetState, renderBudgetInterventionDirective } from "./budget-state";
 import {
   classifyPoll,
+  computeResumeCandidate,
+  resumeCandidateSides,
   INITIAL_FINGERPRINT_STATE,
   type FingerprintState,
+  type ResumeCandidate,
+  type ResumeSignals,
 } from "./budget-fingerprint";
 import { agentBurnRates, agentRunway, hasAnyBurnSignal } from "./burn-view";
 import type {
@@ -61,6 +65,14 @@ export interface BudgetCoordinatorOptions {
   now?: () => number;
   scheduler?: BudgetPollScheduler;
   log?: (message: string) => void;
+  /**
+   * PR2 (detection only): daemon-injected readiness signals for the resume
+   * candidate. Pulled once per poll after classifyPoll; the result is exposed
+   * read-only via getResumeCandidate(). Absent → candidate stays empty (no
+   * signals means nothing can be a candidate). The coordinator NEVER acts on
+   * this value (no emit/onPauseChange/inject) — that is PR3/PR4.
+   */
+  resumeSignals?: () => ResumeSignals;
 }
 
 const AGENT_LABEL: Record<AgentName, string> = {
@@ -146,6 +158,7 @@ export class BudgetCoordinator {
   private readonly now: () => number;
   private readonly scheduler: BudgetPollScheduler;
   private readonly log: (message: string) => void;
+  private readonly resumeSignals: (() => ResumeSignals) | null;
 
   private timer: BudgetPollTimer | null = null;
   private running = false;
@@ -153,6 +166,9 @@ export class BudgetCoordinator {
   // / resume bookkeeping). Replaces the former 4 mutable fields
   // (activeSides, lastDirectiveFingerprint, pauseReason, pauseResumeAfterEpoch).
   private fpState: FingerprintState = INITIAL_FINGERPRINT_STATE;
+  // PR2: latest per-side resume candidate (detection only — read-only exposure
+  // via getResumeCandidate(); the coordinator never acts on it).
+  private resumeCandidate: ResumeCandidate = {};
   private latestSnapshot: BudgetSnapshot | null = null;
   private pendingOverrideTier: CodexTier | null = null;
   private pendingOverrides: CodexTurnOverrides | null = null;
@@ -169,6 +185,7 @@ export class BudgetCoordinator {
     this.now = options.now ?? (() => Math.floor(Date.now() / 1000));
     this.scheduler = options.scheduler ?? REAL_BUDGET_POLL_SCHEDULER;
     this.log = options.log ?? (() => {});
+    this.resumeSignals = options.resumeSignals ?? null;
   }
 
   async start(): Promise<void> {
@@ -196,6 +213,30 @@ export class BudgetCoordinator {
 
   getSnapshot(): BudgetSnapshot | null {
     return this.latestSnapshot;
+  }
+
+  /**
+   * PR2 read-only exposure of the latest per-side resume candidate. Returns a
+   * fresh copy so callers cannot mutate the coordinator's internal state. A side
+   * is `true` only when its window refreshed AND all daemon-injected signals
+   * (pending / TUI / checkpoint) held on the last poll. Detection only — the
+   * coordinator takes no action on this value (no emit/inject); PR3/PR4 own that.
+   */
+  getResumeCandidate(): ResumeCandidate {
+    // Deep-copy the per-side detail map AND each nested ResumeCandidateDetail,
+    // so a caller mutating the returned value — including an IN-PLACE flip like
+    // PR3's claim bookkeeping `result.detail.codex.ready = false` — cannot reach
+    // the coordinator's internal resumeCandidate. A shallow `{ ...detail }` would
+    // copy the outer map only, leaving each inner detail shared by reference.
+    const { detail, ...rest } = this.resumeCandidate;
+    return detail
+      ? {
+          ...rest,
+          detail: Object.fromEntries(
+            Object.entries(detail).map(([side, value]) => [side, { ...value }]),
+          ) as ResumeCandidate["detail"],
+        }
+      : { ...rest };
   }
 
   getCodexTurnOverrides(): CodexTurnOverrides | null {
@@ -287,6 +328,21 @@ export class BudgetCoordinator {
   private applyState(state: BudgetState): void {
     const { next, effect } = classifyPoll(this.fpState, state, this.config);
     this.fpState = next;
+
+    // PR2 (detection only): recompute the per-side resume candidate from the
+    // EFFECT, not the post-transition fingerprint. The hysteresis removes a side
+    // from `next.side` on the same poll its window refreshes, so the exit poll —
+    // exactly when a side becomes resumable — carries `next.side = null`.
+    // resumeCandidateSides() reads the recovered side off the exit effect (and
+    // the still-paused side off enter/hold), so the candidate lands on the right
+    // side. When no signal provider is wired the candidate stays empty — nothing
+    // can be a candidate without the readiness signals. This populates state
+    // only; the switch below is untouched, so the 50+ classifyPoll regression
+    // baseline (branch order / outcome shapes) is unaffected. NO emit /
+    // onPauseChange / inject here — that is PR3/PR4.
+    this.resumeCandidate = this.resumeSignals
+      ? computeResumeCandidate(resumeCandidateSides(effect), state, this.config, this.resumeSignals())
+      : {};
 
     switch (effect.kind) {
       case "enter":

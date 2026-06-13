@@ -1,8 +1,11 @@
 #!/usr/bin/env bun
 // @bun
+var __require = import.meta.require;
 
 // src/daemon.ts
-import { rmSync as rmSync2 } from "fs";
+import { existsSync as existsSync7, realpathSync, rmSync as rmSync2 } from "fs";
+import { homedir as homedir4 } from "os";
+import { join as join8 } from "path";
 import { randomUUID as randomUUID4 } from "crypto";
 
 // src/contract-version.ts
@@ -27,10 +30,10 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.16", "0.0.0-source"),
-  commit: defineString("89d4c9a", "source"),
+  commit: defineString("1dc5e4f", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION),
-  codeHash: defineString("1fc975838e46", "source")
+  codeHash: defineString("899ddecd2cf2", "source")
 });
 function daemonStatusBuildInfo() {
   return { ...BUILD_INFO };
@@ -4043,6 +4046,31 @@ function classifyPoll(prev, state, cfg) {
   }
   return { next: prev, effect: { kind: "none" } };
 }
+function resumeCandidateSides(effect) {
+  switch (effect.kind) {
+    case "exit":
+      return sideToAgents(effect.previousSide);
+    case "enter":
+    case "hold-uncertain":
+      return sideToAgents(effect.side);
+    case "advise":
+    case "none":
+      return [];
+  }
+}
+function computeResumeCandidate(sides, state, cfg, signals) {
+  const candidate = {};
+  const detail = {};
+  for (const agent of sides) {
+    const windowRefreshed = canAgentResume(state.perAgent[agent], cfg, state.now);
+    const ready = windowRefreshed && signals.pendingExists[agent] && signals.tuiReady[agent] && signals.checkpointExists;
+    candidate[agent] = ready;
+    detail[agent] = { ready };
+  }
+  if (sides.length > 0)
+    candidate.detail = detail;
+  return candidate;
+}
 
 // src/budget/burn-view.ts
 function windowBurnRate(window) {
@@ -4181,9 +4209,11 @@ class BudgetCoordinator {
   now;
   scheduler;
   log;
+  resumeSignals;
   timer = null;
   running = false;
   fpState = INITIAL_FINGERPRINT_STATE;
+  resumeCandidate = {};
   latestSnapshot = null;
   pendingOverrideTier = null;
   pendingOverrides = null;
@@ -4199,6 +4229,7 @@ class BudgetCoordinator {
     this.now = options.now ?? (() => Math.floor(Date.now() / 1000));
     this.scheduler = options.scheduler ?? REAL_BUDGET_POLL_SCHEDULER;
     this.log = options.log ?? (() => {});
+    this.resumeSignals = options.resumeSignals ?? null;
   }
   async start() {
     if (this.running || !this.config.enabled)
@@ -4223,6 +4254,13 @@ class BudgetCoordinator {
   }
   getSnapshot() {
     return this.latestSnapshot;
+  }
+  getResumeCandidate() {
+    const { detail, ...rest } = this.resumeCandidate;
+    return detail ? {
+      ...rest,
+      detail: Object.fromEntries(Object.entries(detail).map(([side, value]) => [side, { ...value }]))
+    } : { ...rest };
   }
   getCodexTurnOverrides() {
     if (!this.tierControlEnabled())
@@ -4291,6 +4329,7 @@ class BudgetCoordinator {
   applyState(state) {
     const { next, effect } = classifyPoll(this.fpState, state, this.config);
     this.fpState = next;
+    this.resumeCandidate = this.resumeSignals ? computeResumeCandidate(resumeCandidateSides(effect), state, this.config, this.resumeSignals()) : {};
     switch (effect.kind) {
       case "enter":
       case "hold-uncertain": {
@@ -4807,6 +4846,103 @@ function createQuotaSource(options) {
   return new QuotaSource(options);
 }
 
+// src/budget/pending-reader.ts
+import { join as join6 } from "path";
+function nodeFs() {
+  return __require("fs");
+}
+function cwdMatches(entryCwd, optsCwd) {
+  if (entryCwd === optsCwd)
+    return true;
+  try {
+    const fs2 = nodeFs();
+    return fs2.realpathSync(entryCwd) === fs2.realpathSync(optsCwd);
+  } catch {
+    return false;
+  }
+}
+function parsePendingPayload(value) {
+  const record = asRecord(value);
+  if (!record)
+    return null;
+  const sessionId = record.session_id;
+  if (typeof sessionId !== "string" || sessionId === "")
+    return null;
+  const util = asFiniteNumber(record.util);
+  if (util === null)
+    return null;
+  const warnUtil = numberOr(record.warn_util, util);
+  const resetEpoch = numberOr(record.reset_epoch ?? record.reset, 0);
+  const at = numberOr(record.at, 0);
+  const cwd = typeof record.cwd === "string" ? record.cwd : "";
+  const status = typeof record.status === "string" ? record.status : "";
+  const agent = record.agent === "claude" || record.agent === "codex" ? record.agent : null;
+  if (agent === null)
+    return null;
+  return { status, agent, sessionId, cwd, resetEpoch, util, warnUtil, at };
+}
+function resolveStateDir(homeDir) {
+  const override = process.env.BUDGET_STATE_DIR;
+  if (override && override.trim() !== "")
+    return override.trim();
+  return join6(homeDir, ".budget-guard");
+}
+function readPendingFile(path, log) {
+  let raw;
+  try {
+    raw = nodeFs().readFileSync(path, "utf-8");
+  } catch (error) {
+    log(`pending reader: skip unreadable ${path}: ${error instanceof Error ? error.message : String(error)}`);
+    return null;
+  }
+  const text = String(raw).trim();
+  if (text === "")
+    return null;
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    log(`pending reader: skip malformed JSON ${path}`);
+    return null;
+  }
+  return parsePendingPayload(parsed);
+}
+function listScopeFiles(stateDir, agent, log) {
+  const pendingDir = join6(stateDir, "pending");
+  let names;
+  try {
+    names = nodeFs().readdirSync(pendingDir);
+  } catch {
+    return [];
+  }
+  const prefix = `${agent}_`;
+  return names.filter((name) => name.startsWith(prefix) && name.endsWith(".json")).map((name) => join6(pendingDir, name));
+}
+function readGuardPending(opts) {
+  const log = opts.log ?? (() => {});
+  const stateDir = resolveStateDir(opts.homeDir);
+  const paths = [
+    ...listScopeFiles(stateDir, opts.agent, log),
+    join6(stateDir, `pending_${opts.agent}.json`)
+  ];
+  const bySession = new Map;
+  for (const path of paths) {
+    const entry = readPendingFile(path, log);
+    if (!entry)
+      continue;
+    if (entry.agent !== opts.agent)
+      continue;
+    if (entry.status !== "paused")
+      continue;
+    if (opts.cwd !== undefined && !cwdMatches(entry.cwd, opts.cwd))
+      continue;
+    if (!bySession.has(entry.sessionId)) {
+      bySession.set(entry.sessionId, entry);
+    }
+  }
+  return [...bySession.values()];
+}
+
 // src/daemon-identity-ownership.ts
 import { readFileSync as readFileSync5 } from "fs";
 var defaultRead2 = (path) => readFileSync5(path, "utf-8");
@@ -4982,7 +5118,7 @@ import {
   readFileSync as readFileSync6
 } from "fs";
 import { homedir as homedir3 } from "os";
-import { basename as basename2, join as join6 } from "path";
+import { basename as basename2, join as join7 } from "path";
 function nowIso() {
   return new Date().toISOString();
 }
@@ -4991,7 +5127,7 @@ function threadTag(identity) {
   return `abg:${name}:${identity.cwd}`;
 }
 function codexHome(env = process.env) {
-  return env.CODEX_HOME && env.CODEX_HOME.length > 0 ? env.CODEX_HOME : join6(homedir3(), ".codex");
+  return env.CODEX_HOME && env.CODEX_HOME.length > 0 ? env.CODEX_HOME : join7(homedir3(), ".codex");
 }
 function readRawCurrentThread(stateDir) {
   try {
@@ -5003,7 +5139,7 @@ function readRawCurrentThread(stateDir) {
   return null;
 }
 function findCodexRolloutFile(threadId, env = process.env, maxEntries = 20000) {
-  const sessionsDir = join6(codexHome(env), "sessions");
+  const sessionsDir = join7(codexHome(env), "sessions");
   if (!threadId || !existsSync6(sessionsDir))
     return null;
   const exactName = `rollout-${threadId}.jsonl`;
@@ -5019,7 +5155,7 @@ function findCodexRolloutFile(threadId, env = process.env, maxEntries = 20000) {
     }
     for (const entry of entries) {
       visited++;
-      const path = join6(dir, entry.name);
+      const path = join7(dir, entry.name);
       if (entry.isDirectory()) {
         stack.push(path);
         continue;
@@ -5250,6 +5386,49 @@ function createPendingBackpressureBuffer() {
   });
 }
 var budgetCoordinator = null;
+function pairCwd() {
+  const raw = process.cwd();
+  try {
+    return realpathSync(raw);
+  } catch {
+    return raw;
+  }
+}
+function readResumeSignals() {
+  let tuiReadyCodex = false;
+  let tuiReadyClaude = false;
+  try {
+    tuiReadyCodex = tuiConnectionState.canReply();
+  } catch (error) {
+    log(`resume signal: codex tuiReady failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  try {
+    tuiReadyClaude = attachedClaude !== null;
+  } catch (error) {
+    log(`resume signal: claude tuiReady failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  let pendingCodex = false;
+  let pendingClaude = false;
+  try {
+    const home = homedir4();
+    const cwd = pairCwd();
+    pendingCodex = readGuardPending({ homeDir: home, agent: "codex", cwd, log }).length > 0;
+    pendingClaude = readGuardPending({ homeDir: home, agent: "claude", cwd, log }).length > 0;
+  } catch (error) {
+    log(`resume signal: pending read failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  let checkpointExists = false;
+  try {
+    checkpointExists = existsSync7(join8(pairCwd(), ".agent", "checkpoint.md"));
+  } catch (error) {
+    log(`resume signal: checkpoint stat failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  return {
+    tuiReady: { codex: tuiReadyCodex, claude: tuiReadyClaude },
+    pendingExists: { codex: pendingCodex, claude: pendingClaude },
+    checkpointExists
+  };
+}
 function ensureBudgetCoordinatorStarted() {
   if (!BUDGET_CONFIG.enabled)
     return;
@@ -5265,7 +5444,8 @@ function ensureBudgetCoordinatorStarted() {
         log(`Budget intervention ${paused ? "ACTIVE" : "CLEARED"} ` + `(gate ${budgetCoordinator?.isGateClosed() ? "CLOSED" : "OPEN"})`);
       },
       onSnapshot: () => broadcastStatus(),
-      log
+      log,
+      resumeSignals: readResumeSignals
     });
   }
   budgetCoordinator.start();
