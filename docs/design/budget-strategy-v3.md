@@ -258,43 +258,29 @@ runwayHours(agent) = min over decision-grade windows
 - **(b) 实测燃尽率（核心）**：协调器每次 poll 顺手采样，持久化 + 滑动估计（下详）。
 - **(c) 剩余工作时间**：上式，作为 3.4 分配判据与 `abg budget`/`get_budget` 的新展示行（「Claude 约可再工作 ~Xh / Codex ~Yh」）。
 
-#### 采样与估计算法
+#### 分层修正案（2026-06-11，取代本节原"bridge 自采"方案）
 
-```ts
-// 每次 pollOnce() 成功且 decision-grade 时追加样本（每 agent 每窗口一条）
-interface BurnSample { ts: number; util: number; resetEpoch: number; }
+**分工：采集/EWMA/置信/持久化全部下沉到 agent-quota-guard；bridge 是纯消费端。** 原因：guard 已经拥有 probe 数据源、缓存与历史文件（`hist_*.jsonl`），在 bridge 侧重复实现采样与 EWMA 是双写两套估计器——一处口径漂移就会出现两个互相矛盾的"还能干多久"。修正案由用户提出，Claude 与 Codex 双方确认。
 
-// 估计：对相邻样本对 (s1, s2)：
-//  - s2.resetEpoch 与 s1.resetEpoch 差超过一个指纹桶（600s）→ 跨越了窗口重置，丢弃该样本对
-//  - s2.util < s1.util 且未跨重置 → 异常（上游修正/缓存回退），丢弃
-//  - 否则 delta = (s2.util − s1.util) / ((s2.ts − s1.ts)/3600) 为一个瞬时燃尽率
-// 汇聚：EWMA，半衰期 5h 窗口 2h、周窗口 24h（周燃尽率应平滑掉昼夜节律）
-// confident 判据：有效样本 ≥ 6 且时间跨度 ≥ 1h（5h 窗口）/ ≥ 12h（周窗口）
-interface BurnRate { pctPerHour: number; confident: boolean; samples: number; updatedAt: number; }
+**guard probe 字段契约（probe_schema: 2，可选顶层字段，不强依赖）**——每个 bucket 可选追加：
+
+```
+burn_rate_pct_per_hour : number   // EWMA 燃尽率（pct/h），guard 计算
+burn_confident         : boolean  // guard 的置信门槛判定
+runway_seconds         : number   // 中性口径：到 100% 被窗口 reset 截断
+depleted_at_epoch      : number   // 预计耗尽时刻（unix 秒）
 ```
 
-**悲观判定的抖动防护（SUSPECT-5）**：瞬时燃尽率参与暂停判定（R2 的悲观侧）前，不直接取 `max(EWMA, 最近瞬时值)` —— 单点尖峰（一次大 turn 恰好落在采样间隔里）会被放大成误暂停。具体选择：**取「最近 3 个瞬时样本中至少 2 点连续同向（均高于 EWMA）」时的最大瞬时值参与悲观判定；不满足连续同向条件则只用 EWMA**。等效于对单点尖峰做 winsorize（以连续性要求代替 P95 截断，实现更简单且无需分布假设）；展示侧（runway）一律只用 EWMA，不变。
+样本不足时字段省略。bridge 侧（`quota-source.ts` parseBurnFields）严格校验：present-but-invalid（非数值/负值/NaN/非布尔）→ **整组丢弃**，窗口本身保留。
 
-注意：额度是**账号级**的（同机其他会话共享同一池，`render.ts:100` 已有此注脚），所以燃尽率衡量的是「该账号的总体消耗速度」，不只是本 pair —— 这对分配决策恰好是对的口径（分配要看账号还能撑多久，而不是本 pair 用了多少）。
+**Codex 两条验收约束（原文收录）**：
 
-#### 数据结构与持久化
+1. *bridge 对缺字段/旧 schema/非数值/stale/reset-unknown 一律退 conserve（无 runway 即不展示）*——落地在 `burn-view.ts`：`agentRunway` 要求 `!stale && ok && isDecisionGrade && resetEpoch > now && burn_confident === true && runway_seconds 存在`，任一不满足即返回 null，渲染层不出 runway 行。
+2. *bridge 禁止自己重算 burn-rate——只用 guard 给的 decision-grade 字段*——bridge 仅做：字段校验透传（quota-source）、跨窗口取最小 runway 的**选择**（burn-view）、时长/钟点**格式化**（render）。原 `burn-history.ts`（采样/EWMA/SUSPECT-5/持久化）整体删除；展示层的 guard-硬线 clamp 改为**文案注明**（"runway 为中性口径，Claude 会先在硬线被外层停住"），不做等比折算——折算假设线性燃烧且与 reset 截断语义冲突，等价于变相重算。
 
-- 新文件：**pair 状态目录下 `burn-history.json`**（与 `status.json` 同级，`state-dir.ts` 增加一个 path 方法），结构：
+**bridge 消费链**：`quota-source.ts`（解析+严格校验）→ `BudgetWindow.{burnRate,burnConfident,runwaySeconds,depletedAtEpoch}` → `burn-view.ts`（rates 投影 + min-runway 选择）→ `BudgetSnapshot.{burnRate,runway}`（可选字段，旧消费者不破）→ `render.ts`（`燃尽率 ≈X.XX%/h · 约可再工作 X小时Y分钟（至 HH:MM，…窗口为约束）`；runway≈reset 间隔时注"窗口刷新即截断"；非 confident 显"采样中"）。
 
-```json
-{
-  "version": 1,
-  "agents": {
-    "claude": { "fiveHour": { "samples": [...], "ewma": {...} }, "weekly": {...} },
-    "codex":  { ... }
-  }
-}
-```
-
-- 写入复用 `atomicWriteJson`（`src/atomic-json.ts:49`）；ring buffer 截断（每窗口最多 `sampleCap` 默认 500 条，poll 间隔 60~300s 折合 1~2 天密集样本 + EWMA 状态本身已是长记忆）；写频率限制为「每 poll 至多一次」，与 poll 同步无额外定时器。
-- daemon 重启从文件恢复 EWMA 状态（`confident` 不清零）—— 这是把估计放 daemon 而不是 bridge 的原因：daemon 是长命进程 + 单一事实源。
-- 为什么**不**共享一个账号级全局文件：多 pair 时每个 daemon 各自采样同一账号池，数值本就一致（probe 同源），按 pair 各存一份避免跨进程写锁（pair-registry 锁的教训）；代价只是冗余几 KB。列入开放问题 Q5。
-- `~/.budget-guard/hist_*.jsonl`：格式 `{"ts","util"}`，单标量不分窗口、属外部系统所有。**只读、可选**地用于冷启动种子（启动时若本地无历史且 hist 文件存在，导入最近 24h 样本估初值），不写入、不依赖其存在。
+注意：额度仍是**账号级**口径（同机其他会话共享同一池），guard 估出的燃尽率即账号总体消耗速度——对分配决策恰好正确。原 SUSPECT-5 悲观抖动防护、EWMA 半衰期、置信门槛等估计细节随采集一并归属 guard 侧实现。本仓库不再有 `burn-history.json`、`budget.burnRate.{enabled,sampleCap}` 配置键与 `AGENTBRIDGE_BUDGET_BURN_RATE_ENABLED` env。
 
 ### 3.4 分配判据：从 warnUtil 差到剩余工作时间差
 
@@ -487,3 +473,11 @@ interface BudgetConfig {
 | 注入口闸门 | `src/daemon.ts:886-983`（budget 闸 953） |
 | turnPhase | `src/codex-adapter.ts:2236` |
 | 原子写/状态目录 | `src/atomic-json.ts:49` / `src/state-dir.ts` |
+
+### 8.1 分层修正案记录（2026-06-11，用户提出、双方确认）
+
+- **提案**：燃尽率采集/EWMA/持久化从 bridge 下沉到 agent-quota-guard（probe 输出追加 decision-grade 字段），bridge 改纯消费端。由用户提出，Claude 与 Codex 双方确认通过。
+- **动机**：避免双估计器口径漂移；guard 是数据源属主（probe 缓存 + hist 历史），估计放在源头一次做对；bridge 删掉 ~460 行采样/EWMA/持久化代码与 burn-history.json 状态文件。
+- **Codex 验收约束**（已在 §3.3 分层版原文收录）：① 缺字段/旧 schema/非数值/stale/reset-unknown 一律退 conserve，无 runway 即不展示；② bridge 禁止重算 burn-rate，只消费 guard 字段（允许的操作仅限校验、min 选择、格式化）。
+- **接口**：probe_schema: 2（可选、不强依赖）；每 bucket 可选 burn_rate_pct_per_hour / burn_confident / runway_seconds / depleted_at_epoch；guard 侧由另一实施线同步落地，字段名与本稿严格一致。
+- **展示决策**：Claude 侧 guard-硬线 clamp 放弃等比折算（≈变相重算 + 与 reset 截断冲突），改为如实展示中性 runway + 文案注明硬线先生效——最诚实不误导方案。
