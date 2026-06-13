@@ -1,7 +1,9 @@
 #!/usr/bin/env bun
 
 import type { ServerWebSocket } from "bun";
-import { rmSync } from "node:fs";
+import { existsSync, realpathSync, rmSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { BUILD_INFO, daemonStatusBuildInfo } from "./build-info";
 import { portFromUrl, type DaemonRecord } from "./daemon-record";
@@ -19,6 +21,8 @@ import { StateDirResolver } from "./state-dir";
 import { ConfigService, applyBudgetEnvOverrides } from "./config-service";
 import { BudgetCoordinator } from "./budget/budget-coordinator";
 import { createQuotaSource } from "./budget/quota-source";
+import { readGuardPending } from "./budget/pending-reader";
+import type { ResumeSignals } from "./budget/budget-fingerprint";
 import {
   CLOSE_CODE_REPLACED,
   CLOSE_CODE_EVICTED_STALE,
@@ -222,6 +226,83 @@ function createPendingBackpressureBuffer(): BoundedMessageBuffer {
 // claude_to_codex pause gate and snapshot exposure via DaemonStatus.budget.
 let budgetCoordinator: BudgetCoordinator | null = null;
 
+/**
+ * Resolve the current pair's cwd to its realpath for cross-repo pending
+ * isolation. Falls back to the raw cwd when realpath fails (e.g. a path that no
+ * longer exists) so a transient fs error never breaks signal gathering.
+ *
+ * NOTE (multi-pair): `process.cwd()` is the daemon's own working directory,
+ * which today equals the pair's project dir. PR3's injection path must resolve
+ * the cwd from the pair record instead of assuming process.cwd() once multiple
+ * pairs share a daemon.
+ */
+function pairCwd(): string {
+  const raw = process.cwd();
+  try {
+    return realpathSync(raw);
+  } catch {
+    return raw;
+  }
+}
+
+/**
+ * PR2 (detection only): gather the resume-readiness signals the coordinator's
+ * pure reducer needs. ALL IO lives here so the reducer stays pure. Called once
+ * per poll AFTER coordinator construction (first codex `ready`), so the
+ * hoisted-but-later-`const` references (tuiConnectionState / attachedClaude) are
+ * fully initialized by the time this runs. Every probe is fault-isolated: a
+ * transient fs/socket error degrades a SINGLE per-side signal to false rather
+ * than throwing into the poll loop.
+ *
+ * `tuiReady` and `pendingExists` are PER-SIDE (codex vs claude); `pendingExists`
+ * is additionally scoped to THIS pair's cwd so a pending file from an unrelated
+ * repo cannot falsely satisfy the predicate. `checkpointExists` is shared (one
+ * handoff checkpoint per pair).
+ */
+function readResumeSignals(): ResumeSignals {
+  // tuiReady, per side: codex = its TUI can accept a reply; claude = a frontend
+  // is attached. Each read is independently fault-isolated.
+  let tuiReadyCodex = false;
+  let tuiReadyClaude = false;
+  try {
+    tuiReadyCodex = tuiConnectionState.canReply();
+  } catch (error) {
+    log(`resume signal: codex tuiReady failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  try {
+    tuiReadyClaude = attachedClaude !== null;
+  } catch (error) {
+    log(`resume signal: claude tuiReady failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+
+  // pendingExists, per side, scoped to this pair's cwd. readGuardPending never
+  // throws, but the cwd resolution and the call are still fault-isolated.
+  let pendingCodex = false;
+  let pendingClaude = false;
+  try {
+    const home = homedir();
+    const cwd = pairCwd();
+    pendingCodex = readGuardPending({ homeDir: home, agent: "codex", cwd, log }).length > 0;
+    pendingClaude = readGuardPending({ homeDir: home, agent: "claude", cwd, log }).length > 0;
+  } catch (error) {
+    log(`resume signal: pending read failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+
+  // checkpointExists: the handoff checkpoint under the pair's project dir.
+  let checkpointExists = false;
+  try {
+    checkpointExists = existsSync(join(pairCwd(), ".agent", "checkpoint.md"));
+  } catch (error) {
+    log(`resume signal: checkpoint stat failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+
+  return {
+    tuiReady: { codex: tuiReadyCodex, claude: tuiReadyClaude },
+    pendingExists: { codex: pendingCodex, claude: pendingClaude },
+    checkpointExists,
+  };
+}
+
 function ensureBudgetCoordinatorStarted() {
   if (!BUDGET_CONFIG.enabled) return;
   if (!budgetCoordinator) {
@@ -256,6 +337,14 @@ function ensureBudgetCoordinatorStarted() {
       },
       onSnapshot: () => broadcastStatus(),
       log,
+      // PR2 (detection only): daemon-side readiness signals for the resume
+      // candidate. Pure-reducer purity is preserved by gathering all IO here —
+      // the coordinator only reads the returned ResumeSignals. The closure
+      // returns PER-SIDE signals (tuiReady/pendingExists keyed by agent) plus a
+      // shared checkpointExists; per-side independence comes from those per-side
+      // booleans. Each read is fault-isolated so a transient fs error never
+      // breaks the poll loop.
+      resumeSignals: readResumeSignals,
     });
   }
   void budgetCoordinator.start();

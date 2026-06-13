@@ -157,7 +157,7 @@ function argsFor(candidate: ProbeCandidate, agent: AgentName): string[] {
   return ["--agent", agent];
 }
 
-function asFiniteNumber(value: unknown): number | null {
+export function asFiniteNumber(value: unknown): number | null {
   if (typeof value === "number" && Number.isFinite(value)) return value;
   if (typeof value === "string" && value.trim() !== "") {
     const parsed = Number(value);
@@ -166,15 +166,15 @@ function asFiniteNumber(value: unknown): number | null {
   return null;
 }
 
-function numberOr(value: unknown, fallback: number): number {
+export function numberOr(value: unknown, fallback: number): number {
   return asFiniteNumber(value) ?? fallback;
 }
 
-function clamp(value: number, min: number, max: number): number {
+export function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
 }
 
-function asRecord(value: unknown): Record<string, unknown> | null {
+export function asRecord(value: unknown): Record<string, unknown> | null {
   return typeof value === "object" && value !== null && !Array.isArray(value)
     ? value as Record<string, unknown>
     : null;
