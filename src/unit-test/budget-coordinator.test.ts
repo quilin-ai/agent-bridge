@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { BudgetCoordinator, nextBudgetPollDelayMs } from "../budget/budget-coordinator";
+import type { ResumeSignals } from "../budget/budget-fingerprint";
 import type { AgentUsage, BudgetConfig } from "../budget/types";
 
 const NOW = 1_700_000_000;
@@ -95,6 +96,15 @@ function makeCoordinator(source: FakeSource, config: BudgetConfig = CONFIG) {
   });
 
   return { coordinator, emitted, pauseChanges, logs };
+}
+
+function readySignals(overrides: Partial<ResumeSignals> = {}): ResumeSignals {
+  return {
+    tuiReady: { codex: true, claude: true },
+    pendingExists: { codex: true, claude: true },
+    checkpointExists: true,
+    ...overrides,
+  };
 }
 
 function longPollConfig(overrides: Partial<BudgetConfig> = {}): BudgetConfig {
@@ -711,6 +721,7 @@ describe("BudgetCoordinator", () => {
     expect(emitted.map((event) => event.id.replace(/_\d+$/, ""))).toEqual([
       "system_budget_handoff",
       "system_budget_pause",
+      "system_budget_claude_recovered",
       "system_budget_pause",
     ]);
     expect(coordinator.getSnapshot()).toMatchObject({ paused: true, gateClosed: true, pauseSide: "codex" });
@@ -732,9 +743,141 @@ describe("BudgetCoordinator", () => {
 
     expect(emitted.map((event) => event.id.replace(/_\d+$/, ""))).toEqual([
       "system_budget_pause",
+      "system_budget_resume",
       "system_budget_handoff",
     ]);
     expect(coordinator.getSnapshot()).toMatchObject({ paused: true, gateClosed: false, pauseSide: "claude" });
+  });
+
+  test("partial recovery emits Codex resume, calls onResume once, and leaves Claude handoff active", async () => {
+    const source = new FakeSource([
+      {
+        claude: usage({ gateUtil: 91, warnUtil: 91, remaining: 9 }),
+        codex: usage({ gateUtil: 92, warnUtil: 92, remaining: 8 }),
+      },
+      { claude: usage({ gateUtil: 91, warnUtil: 91, remaining: 9 }), codex: usage() },
+      { claude: usage({ gateUtil: 91, warnUtil: 91, remaining: 9 }), codex: usage() },
+    ]);
+    const emitted: Array<{ id: string; content: string }> = [];
+    const resumes: Array<{ side: "claude" | "codex"; directive: string; resumeId: string; gateClosed: boolean; paused: boolean }> = [];
+    let coordinator: BudgetCoordinator;
+    coordinator = new BudgetCoordinator({
+      source,
+      config: longPollConfig(),
+      emit: (id, content) => emitted.push({ id, content }),
+      onPauseChange: () => {},
+      onResume: (side, directive, resumeId) => {
+        resumes.push({ side, directive, resumeId, gateClosed: coordinator.isGateClosed(), paused: coordinator.isPaused() });
+      },
+      now: () => NOW,
+      resumeSignals: () => readySignals(),
+    });
+
+    await coordinator.start();
+    await (coordinator as unknown as { pollOnce: () => Promise<void> }).pollOnce();
+
+    expect(coordinator.isPaused()).toBe(true);
+    expect(coordinator.isGateClosed()).toBe(false);
+    expect(coordinator.getSnapshot()).toMatchObject({ paused: true, gateClosed: false, pauseSide: "claude" });
+    expect(coordinator.getResumeCandidate().codex).toBe(true);
+    expect(coordinator.getResumeCandidate().claude).toBeUndefined();
+    expect(emitted.map((event) => event.id.replace(/_\d+$/, ""))).toEqual([
+      "system_budget_pause",
+      "system_budget_resume",
+      "system_budget_handoff",
+    ]);
+    expect(resumes).toHaveLength(1);
+    expect(resumes[0]).toMatchObject({ side: "codex" });
+    expect(resumes[0].resumeId).toBe(emitted[1].id);
+    expect(resumes[0].directive).toBe(emitted[1].content);
+    expect(resumes[0].gateClosed).toBe(false);
+    expect(resumes[0].paused).toBe(true);
+
+    await (coordinator as unknown as { pollOnce: () => Promise<void> }).pollOnce();
+    coordinator.stop();
+
+    expect(resumes).toHaveLength(1);
+    expect(emitted.map((event) => event.id.replace(/_\d+$/, ""))).toEqual([
+      "system_budget_pause",
+      "system_budget_resume",
+      "system_budget_handoff",
+    ]);
+  });
+
+  test("final recovery after a partial recovery emits the remaining side only", async () => {
+    const source = new FakeSource([
+      {
+        claude: usage({ gateUtil: 91, warnUtil: 91, remaining: 9 }),
+        codex: usage({ gateUtil: 92, warnUtil: 92, remaining: 8 }),
+      },
+      { claude: usage({ gateUtil: 91, warnUtil: 91, remaining: 9 }), codex: usage() },
+      { claude: usage(), codex: usage() },
+    ]);
+    const emitted: Array<{ id: string; content: string }> = [];
+    const resumes: Array<{ side: "claude" | "codex"; directive: string; resumeId: string }> = [];
+    const coordinator = new BudgetCoordinator({
+      source,
+      config: longPollConfig(),
+      emit: (id, content) => emitted.push({ id, content }),
+      onPauseChange: () => {},
+      onResume: (side, directive, resumeId) => resumes.push({ side, directive, resumeId }),
+      now: () => NOW,
+      resumeSignals: () => readySignals(),
+    });
+
+    await coordinator.start();
+    await (coordinator as unknown as { pollOnce: () => Promise<void> }).pollOnce();
+    await (coordinator as unknown as { pollOnce: () => Promise<void> }).pollOnce();
+    coordinator.stop();
+
+    expect(coordinator.isPaused()).toBe(false);
+    expect(coordinator.isGateClosed()).toBe(false);
+    expect(emitted.map((event) => event.id.replace(/_\d+$/, ""))).toEqual([
+      "system_budget_pause",
+      "system_budget_resume",
+      "system_budget_handoff",
+      "system_budget_claude_recovered",
+    ]);
+    expect(resumes.map((resume) => resume.side)).toEqual(["codex", "claude"]);
+    expect(resumes[0].resumeId).toBe(emitted[1].id);
+    expect(resumes[1].resumeId).toBe(emitted[3].id);
+  });
+
+  test("full recovery from joint pause emits both per-side recovery directives", async () => {
+    const source = new FakeSource([
+      {
+        claude: usage({ gateUtil: 91, warnUtil: 91, remaining: 9 }),
+        codex: usage({ gateUtil: 92, warnUtil: 92, remaining: 8 }),
+      },
+      { claude: usage(), codex: usage() },
+    ]);
+    const emitted: Array<{ id: string; content: string }> = [];
+    const resumes: Array<{ side: "claude" | "codex"; directive: string; resumeId: string }> = [];
+    const coordinator = new BudgetCoordinator({
+      source,
+      config: longPollConfig(),
+      emit: (id, content) => emitted.push({ id, content }),
+      onPauseChange: () => {},
+      onResume: (side, directive, resumeId) => resumes.push({ side, directive, resumeId }),
+      now: () => NOW,
+      resumeSignals: () => readySignals(),
+    });
+
+    await coordinator.start();
+    await (coordinator as unknown as { pollOnce: () => Promise<void> }).pollOnce();
+    coordinator.stop();
+
+    expect(emitted.map((event) => event.id.replace(/_\d+$/, ""))).toEqual([
+      "system_budget_pause",
+      "system_budget_claude_recovered",
+      "system_budget_resume",
+    ]);
+    expect(resumes.map(({ side }) => ({ side }))).toEqual([{ side: "claude" }, { side: "codex" }]);
+    expect(resumes[0].resumeId).toBe(emitted[1].id);
+    expect(resumes[1].resumeId).toBe(emitted[2].id);
+    expect(resumes[0].directive).toBe(emitted[1].content);
+    expect(resumes[1].directive).toBe(emitted[2].content);
+    expect(coordinator.getSnapshot()).toMatchObject({ paused: false, gateClosed: false, pauseSide: null });
   });
 
   test("emits distinct recovery events for Codex pause and Claude handoff", async () => {

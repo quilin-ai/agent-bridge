@@ -40,6 +40,7 @@ beforeEach(() => {
 
 afterEach(() => {
   process.chdir(previousCwd);
+  process.exitCode = 0;
   for (const key of ENV_KEYS) {
     const value = savedEnv.get(key);
     if (value === undefined) delete process.env[key];

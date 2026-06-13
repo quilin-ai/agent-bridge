@@ -4,6 +4,7 @@ import {
   classifyPoll,
   directiveFingerprint,
   INITIAL_FINGERPRINT_STATE,
+  resumeCandidateSides,
   type FingerprintState,
 } from "../budget/budget-fingerprint";
 import type { AgentUsage, BudgetConfig, BudgetState } from "../budget/types";
@@ -69,7 +70,7 @@ function runPolls(
 describe("classifyPoll reducer — event coverage", () => {
   test("none: both sides healthy, no directive, from idle", () => {
     const { final, effects } = runPolls([state(usage(), usage({ gateUtil: 21, warnUtil: 21 }))]);
-    expect(effects[0]).toEqual({ kind: "none" });
+    expect(effects[0]).toEqual({ kind: "none", recoveredSides: [] });
     expect(final.side).toBeNull();
     expect(final.fingerprint).toBeNull();
   });
@@ -134,7 +135,7 @@ describe("classifyPoll reducer — event coverage", () => {
     const recovered = state(usage(), usage({ gateUtil: 20, warnUtil: 20, remaining: 80 }));
     const { effects, final } = runPolls([paused, recovered]);
     expect(effects[0].kind).toBe("enter");
-    expect(effects[1]).toEqual({ kind: "exit", previousSide: "codex" });
+    expect(effects[1]).toEqual({ kind: "exit", previousSide: "codex", recoveredSides: ["codex"] });
     expect(final.side).toBeNull();
     expect(final.fingerprint).toBeNull();
     expect(final.resumeEpoch).toBeNull();
@@ -145,7 +146,7 @@ describe("classifyPoll reducer — event coverage", () => {
     const drifted = state(usage({ gateUtil: 35, warnUtil: 45 }), usage({ gateUtil: 20, warnUtil: 20 }));
     expect(drifted.phase).toBe("balance");
     const { effects, final } = runPolls([drifted]);
-    expect(effects[0]).toEqual({ kind: "advise", phase: "balance" });
+    expect(effects[0]).toEqual({ kind: "advise", phase: "balance", recoveredSides: [] });
     expect(final.side).toBeNull();
     expect(final.fingerprint).not.toBeNull();
   });
@@ -153,8 +154,8 @@ describe("classifyPoll reducer — event coverage", () => {
   test("advise dedup: identical drift on the next poll → none (no re-emit)", () => {
     const drifted = state(usage({ gateUtil: 35, warnUtil: 45 }), usage({ gateUtil: 20, warnUtil: 20 }));
     const { effects } = runPolls([drifted, drifted]);
-    expect(effects[0]).toEqual({ kind: "advise", phase: "balance" });
-    expect(effects[1]).toEqual({ kind: "none" });
+    expect(effects[0]).toEqual({ kind: "advise", phase: "balance", recoveredSides: [] });
+    expect(effects[1]).toEqual({ kind: "none", recoveredSides: [] });
   });
 
   test("advise: parallel phase emits with phase=parallel", () => {
@@ -164,7 +165,7 @@ describe("classifyPoll reducer — event coverage", () => {
     );
     expect(parallel.phase).toBe("parallel");
     const { effects } = runPolls([parallel]);
-    expect(effects[0]).toEqual({ kind: "advise", phase: "parallel" });
+    expect(effects[0]).toEqual({ kind: "advise", phase: "parallel", recoveredSides: [] });
   });
 
   test("reset: advising → directive disappears (decision-grade) clears fingerprint", () => {
@@ -174,7 +175,7 @@ describe("classifyPoll reducer — event coverage", () => {
     const { effects, final } = runPolls([drifted, calm]);
     expect(effects[0].kind).toBe("advise");
     // null-directive on decision-grade data → effect none, but fingerprint reset.
-    expect(effects[1]).toEqual({ kind: "none" });
+    expect(effects[1]).toEqual({ kind: "none", recoveredSides: [] });
     expect(final.fingerprint).toBeNull();
     expect(final.side).toBeNull();
   });
@@ -195,12 +196,12 @@ describe("classifyPoll reducer — branch-order sensitivity", () => {
 
     const afterPhantom = classifyPoll(afterDrift.next, phantom, CONFIG);
     // Phantom branch runs first → none effect, fingerprint held (NOT reset).
-    expect(afterPhantom.effect).toEqual({ kind: "none" });
+    expect(afterPhantom.effect).toEqual({ kind: "none", recoveredSides: [] });
     expect(afterPhantom.next.fingerprint).toBe(afterDrift.next.fingerprint);
 
     // Recovery to the same real drift must re-emit NOTHING (fingerprint match).
     const afterRecovery = classifyPoll(afterPhantom.next, drifted, CONFIG);
-    expect(afterRecovery.effect).toEqual({ kind: "none" });
+    expect(afterRecovery.effect).toEqual({ kind: "none", recoveredSides: [] });
   });
 
   test("phantom that inflates the heavier side still holds (no spurious re-emit)", () => {
@@ -251,7 +252,7 @@ describe("classifyPoll reducer — branch-order sensitivity", () => {
       }),
     );
     const { effects, final } = runPolls([stale]);
-    expect(effects[0]).toEqual({ kind: "none" });
+    expect(effects[0]).toEqual({ kind: "none", recoveredSides: [] });
     expect(final.side).toBeNull();
   });
 
@@ -295,6 +296,55 @@ describe("classifyPoll reducer — hysteresis side transitions", () => {
     const { effects, final } = runPolls([s1, s2]);
     expect(effects.map((e) => (e.kind === "enter" ? e.side : e.kind))).toEqual(["both", "claude"]);
     expect(final.side).toBe("claude");
+  });
+
+  test("joint pause downgrades to claude handoff and marks codex recovered", () => {
+    const s1 = state(
+      usage({ gateUtil: 91, warnUtil: 91, remaining: 9 }),
+      usage({ gateUtil: 92, warnUtil: 92, remaining: 8 }),
+    );
+    const s2 = state(usage({ gateUtil: 91, warnUtil: 91, remaining: 9 }), usage());
+    const { effects } = runPolls([s1, s2]);
+
+    expect(effects[1]).toMatchObject({
+      kind: "enter",
+      side: "claude",
+      recoveredSides: ["codex"],
+    });
+    expect(resumeCandidateSides(effects[1])).toEqual(["codex"]);
+  });
+
+  test("joint pause downgrades to codex pause and marks claude recovered", () => {
+    const s1 = state(
+      usage({ gateUtil: 91, warnUtil: 91, remaining: 9 }),
+      usage({ gateUtil: 92, warnUtil: 92, remaining: 8 }),
+    );
+    const s2 = state(usage(), usage({ gateUtil: 92, warnUtil: 92, remaining: 8 }));
+    const { effects } = runPolls([s1, s2]);
+
+    expect(effects[1]).toMatchObject({
+      kind: "enter",
+      side: "codex",
+      recoveredSides: ["claude"],
+    });
+    expect(resumeCandidateSides(effects[1])).toEqual(["claude"]);
+  });
+
+  test("joint pause full exit marks both sides recovered", () => {
+    const s1 = state(
+      usage({ gateUtil: 91, warnUtil: 91, remaining: 9 }),
+      usage({ gateUtil: 92, warnUtil: 92, remaining: 8 }),
+    );
+    const s2 = state(usage(), usage());
+    const { effects, final } = runPolls([s1, s2]);
+
+    expect(effects[1]).toEqual({
+      kind: "exit",
+      previousSide: "both",
+      recoveredSides: ["claude", "codex"],
+    });
+    expect(resumeCandidateSides(effects[1])).toEqual(["claude", "codex"]);
+    expect(final.side).toBeNull();
   });
 
   test("resumeEpoch is sticky on same side, reset on side change", () => {
