@@ -86,21 +86,29 @@ export type CoordinatorEffect =
       emit: boolean;
       /** True only on the first poll that enters a pause (drives onPauseChange(true)). */
       pauseChanged: boolean;
+      /** Agents removed from the active pause set on this committed transition. */
+      recoveredSides: AgentName[];
     }
   | {
       /** Leaving an intervention back to idle. */
       kind: "exit";
       previousSide: ActivePauseSide;
+      /** Agents removed from the active pause set on this committed transition. */
+      recoveredSides: AgentName[];
     }
   | {
       /** Drift/parallel advisory emitted (gate stays open). */
       kind: "advise";
       phase: BudgetState["phase"];
+      /** Agents removed from the active pause set on this committed transition. */
+      recoveredSides: AgentName[];
     }
   | {
       /** No directive to emit; covers phantom holds, dedup no-ops, and the
        * null-directive fingerprint reset. */
       kind: "none";
+      /** Agents removed from the active pause set on this committed transition. */
+      recoveredSides: AgentName[];
     };
 
 export interface ClassifyResult {
@@ -202,6 +210,11 @@ function nextActiveSide(prevSide: PauseSide, state: BudgetState, cfg: BudgetConf
   return agentsToSide(active);
 }
 
+function removedAgents(prevSide: PauseSide, currentSide: PauseSide): AgentName[] {
+  const current = new Set<AgentName>(sideToAgents(currentSide));
+  return sideToAgents(prevSide).filter((agent) => !current.has(agent));
+}
+
 function activeSideReason(agent: AgentName, usage: AgentUsage | null, cfg: BudgetConfig, now: number): string {
   if (!usage) return `${AGENT_LABEL[agent]} 探测暂时不可用，保持上一轮预算干预`;
   if (usage.rateLimitedUntil > now) {
@@ -301,6 +314,7 @@ export function directiveFingerprint(state: BudgetState, activeSide?: ActivePaus
 export function classifyPoll(prev: FingerprintState, state: BudgetState, cfg: BudgetConfig): ClassifyResult {
   const previousSide = prev.side;
   const currentSide = nextActiveSide(previousSide, state, cfg);
+  const recoveredSides = removedAgents(previousSide, currentSide);
 
   // --- Paused branch (intervention active) ---
   if (currentSide) {
@@ -324,6 +338,7 @@ export function classifyPoll(prev: FingerprintState, state: BudgetState, cfg: Bu
         resumeEpoch,
         emit,
         pauseChanged,
+        recoveredSides,
       },
     };
   }
@@ -332,7 +347,7 @@ export function classifyPoll(prev: FingerprintState, state: BudgetState, cfg: Bu
   if (previousSide) {
     return {
       next: { side: null, fingerprint: null, resumeEpoch: null, reason: null },
-      effect: { kind: "exit", previousSide },
+      effect: { kind: "exit", previousSide, recoveredSides },
     };
   }
 
@@ -343,14 +358,14 @@ export function classifyPoll(prev: FingerprintState, state: BudgetState, cfg: Bu
     !isDecisionGrade(state.perAgent.claude, state.now) ||
     !isDecisionGrade(state.perAgent.codex, state.now)
   ) {
-    return { next: prev, effect: { kind: "none" } };
+    return { next: prev, effect: { kind: "none", recoveredSides: [] } };
   }
 
   // --- Null-directive reset: decision-grade but nothing to advise. ---
   if (!state.directiveToClaude) {
     return {
       next: { side: null, fingerprint: null, resumeEpoch: null, reason: null },
-      effect: { kind: "none" },
+      effect: { kind: "none", recoveredSides: [] },
     };
   }
 
@@ -359,10 +374,10 @@ export function classifyPoll(prev: FingerprintState, state: BudgetState, cfg: Bu
   if (fingerprint !== prev.fingerprint) {
     return {
       next: { side: null, fingerprint, resumeEpoch: null, reason: null },
-      effect: { kind: "advise", phase: state.phase },
+      effect: { kind: "advise", phase: state.phase, recoveredSides: [] },
     };
   }
-  return { next: prev, effect: { kind: "none" } };
+  return { next: prev, effect: { kind: "none", recoveredSides: [] } };
 }
 
 /**
@@ -387,6 +402,9 @@ export function classifyPoll(prev: FingerprintState, state: BudgetState, cfg: Bu
  * branch internals.
  */
 export function resumeCandidateSides(effect: CoordinatorEffect): AgentName[] {
+  if (effect.recoveredSides.length > 0) {
+    return effect.recoveredSides;
+  }
   switch (effect.kind) {
     case "exit":
       return sideToAgents(effect.previousSide);

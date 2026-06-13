@@ -112,6 +112,22 @@ describe("computeResumeCandidate — single side exits a pause (refresh poll)", 
   });
 });
 
+describe("computeResumeCandidate — partial recovery from joint pause", () => {
+  test("both paused, then codex refreshes first → only codex is evaluated as recovered", () => {
+    const paused = enterPause("both");
+    // Claude remains above pauseAt, Codex has refreshed below resumeBelow. The
+    // reducer stays paused on Claude, but Codex is a committed recovered side and
+    // must become the sole resume-candidate source for this poll.
+    const { sides, candidate, next } = pollCandidate(paused, over, healthy, signals());
+
+    expect(next.side).toBe("claude");
+    expect(sides).toEqual(["codex"]);
+    expect(candidate.codex).toBe(true);
+    expect(candidate.claude).toBeUndefined();
+    expect(candidate.detail?.codex?.ready).toBe(true);
+  });
+});
+
 describe("computeResumeCandidate — still paused (no refresh) → not a candidate", () => {
   test("codex paused and still over threshold → enter/hold poll, codex ready=false", () => {
     const paused = enterPause("codex");

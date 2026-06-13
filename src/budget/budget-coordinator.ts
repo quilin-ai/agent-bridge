@@ -65,6 +65,7 @@ export interface BudgetCoordinatorOptions {
   now?: () => number;
   scheduler?: BudgetPollScheduler;
   log?: (message: string) => void;
+  onResume?: (side: AgentName, directive: string, resumeId: string) => void;
   /**
    * PR2 (detection only): daemon-injected readiness signals for the resume
    * candidate. Pulled once per poll after classifyPoll; the result is exposed
@@ -158,6 +159,7 @@ export class BudgetCoordinator {
   private readonly now: () => number;
   private readonly scheduler: BudgetPollScheduler;
   private readonly log: (message: string) => void;
+  private readonly onResume: (side: AgentName, directive: string, resumeId: string) => void;
   private readonly resumeSignals: (() => ResumeSignals) | null;
 
   private timer: BudgetPollTimer | null = null;
@@ -185,6 +187,7 @@ export class BudgetCoordinator {
     this.now = options.now ?? (() => Math.floor(Date.now() / 1000));
     this.scheduler = options.scheduler ?? REAL_BUDGET_POLL_SCHEDULER;
     this.log = options.log ?? (() => {});
+    this.onResume = options.onResume ?? (() => {});
     this.resumeSignals = options.resumeSignals ?? null;
   }
 
@@ -337,12 +340,15 @@ export class BudgetCoordinator {
     // the still-paused side off enter/hold), so the candidate lands on the right
     // side. When no signal provider is wired the candidate stays empty — nothing
     // can be a candidate without the readiness signals. This populates state
-    // only; the switch below is untouched, so the 50+ classifyPoll regression
-    // baseline (branch order / outcome shapes) is unaffected. NO emit /
-    // onPauseChange / inject here — that is PR3/PR4.
+    // only; committed recovered sides emit below, but injection remains PR3/PR4.
     this.resumeCandidate = this.resumeSignals
       ? computeResumeCandidate(resumeCandidateSides(effect), state, this.config, this.resumeSignals())
       : {};
+
+    for (const side of effect.recoveredSides) {
+      const { id, directive } = this.emitRecovery(side, state);
+      this.onResume(side, directive, id);
+    }
 
     switch (effect.kind) {
       case "enter":
@@ -358,7 +364,6 @@ export class BudgetCoordinator {
       }
       case "exit": {
         this.onPauseChange(false);
-        this.emitDirective(this.recoveryPrefix(effect.previousSide), this.recoveryDirective(state, effect.previousSide));
         return;
       }
       case "advise": {
@@ -408,16 +413,24 @@ export class BudgetCoordinator {
     this.pendingOverrides = { ...overrides };
   }
 
-  private emitDirective(prefix: string, content: string): void {
-    this.emit(`${prefix}_${this.sequence++}`, content);
+  private emitDirective(prefix: string, content: string): string {
+    const id = `${prefix}_${this.sequence++}`;
+    this.emit(id, content);
+    return id;
   }
 
   private interventionPrefix(side: Exclude<PauseSide, null>): string {
     return side === "claude" ? "system_budget_handoff" : "system_budget_pause";
   }
 
-  private recoveryPrefix(previousSide: Exclude<PauseSide, null>): string {
-    return previousSide === "claude" ? "system_budget_claude_recovered" : "system_budget_resume";
+  private recoveryPrefix(side: AgentName): string {
+    return side === "claude" ? "system_budget_claude_recovered" : "system_budget_resume";
+  }
+
+  private emitRecovery(side: AgentName, state: BudgetState): { id: string; directive: string } {
+    const directive = this.recoveryDirective(state, side);
+    const id = this.emitDirective(this.recoveryPrefix(side), directive);
+    return { id, directive };
   }
 
   private interventionDirective(
@@ -441,8 +454,8 @@ export class BudgetCoordinator {
     );
   }
 
-  private recoveryDirective(state: BudgetState, previousSide: Exclude<PauseSide, null>): string {
-    if (previousSide === "claude") {
+  private recoveryDirective(state: BudgetState, side: AgentName): string {
+    if (side === "claude") {
       return [
         "【预算协调 · 账号级】Claude 侧预算已恢复。",
         `${usageLine("claude", state.perAgent.claude)}；${usageLine("codex", state.perAgent.codex)}。`,
@@ -451,19 +464,10 @@ export class BudgetCoordinator {
       ].join("\n");
     }
 
-    if (previousSide === "codex") {
-      return [
-        "【预算协调 · 账号级】Codex 侧预算闸门解除。",
-        `${usageLine("claude", state.perAgent.claude)}；${usageLine("codex", state.perAgent.codex)}。`,
-        `闸门已放开：Codex gateUtil 低于 ${pct(this.config.resumeBelow)}，且没有有效 rate_limit。`,
-        "建议 Claude 用 reply 带上当前目标、checkpoint 和下一步，唤醒 Codex 接续执行。",
-      ].join("\n");
-    }
-
     return [
-      "【预算协调 · 账号级】联合暂停解除。",
+      "【预算协调 · 账号级】Codex 侧预算闸门解除。",
       `${usageLine("claude", state.perAgent.claude)}；${usageLine("codex", state.perAgent.codex)}。`,
-      `闸门已放开：双方 gateUtil 均低于 ${pct(this.config.resumeBelow)}，且没有有效 rate_limit。`,
+      `闸门已放开：Codex gateUtil 低于 ${pct(this.config.resumeBelow)}，且没有有效 rate_limit。`,
       "建议 Claude 用 reply 带上当前目标、checkpoint 和下一步，唤醒 Codex 接续执行。",
     ].join("\n");
   }

@@ -30,10 +30,10 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.16", "0.0.0-source"),
-  commit: defineString("1dc5e4f", "source"),
+  commit: defineString("95223ff", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION),
-  codeHash: defineString("899ddecd2cf2", "source")
+  codeHash: defineString("1680b1c1e99c", "source")
 });
 function daemonStatusBuildInfo() {
   return { ...BUILD_INFO };
@@ -3953,6 +3953,10 @@ function nextActiveSide(prevSide, state, cfg) {
   }
   return agentsToSide(active);
 }
+function removedAgents(prevSide, currentSide) {
+  const current = new Set(sideToAgents(currentSide));
+  return sideToAgents(prevSide).filter((agent) => !current.has(agent));
+}
 function activeSideReason(agent, usage, cfg, now) {
   if (!usage)
     return `${AGENT_LABEL2[agent]} \u63A2\u6D4B\u6682\u65F6\u4E0D\u53EF\u7528\uFF0C\u4FDD\u6301\u4E0A\u4E00\u8F6E\u9884\u7B97\u5E72\u9884`;
@@ -4002,6 +4006,7 @@ function directiveFingerprint(state, activeSide) {
 function classifyPoll(prev, state, cfg) {
   const previousSide = prev.side;
   const currentSide = nextActiveSide(previousSide, state, cfg);
+  const recoveredSides = removedAgents(previousSide, currentSide);
   if (currentSide) {
     const reason = interventionReason(currentSide, state, cfg);
     const nextResumeRaw = resumeAfterEpoch2(currentSide, state, cfg);
@@ -4018,35 +4023,39 @@ function classifyPoll(prev, state, cfg) {
         reason,
         resumeEpoch,
         emit,
-        pauseChanged
+        pauseChanged,
+        recoveredSides
       }
     };
   }
   if (previousSide) {
     return {
       next: { side: null, fingerprint: null, resumeEpoch: null, reason: null },
-      effect: { kind: "exit", previousSide }
+      effect: { kind: "exit", previousSide, recoveredSides }
     };
   }
   if (!isDecisionGrade(state.perAgent.claude, state.now) || !isDecisionGrade(state.perAgent.codex, state.now)) {
-    return { next: prev, effect: { kind: "none" } };
+    return { next: prev, effect: { kind: "none", recoveredSides: [] } };
   }
   if (!state.directiveToClaude) {
     return {
       next: { side: null, fingerprint: null, resumeEpoch: null, reason: null },
-      effect: { kind: "none" }
+      effect: { kind: "none", recoveredSides: [] }
     };
   }
   const fingerprint = directiveFingerprint(state);
   if (fingerprint !== prev.fingerprint) {
     return {
       next: { side: null, fingerprint, resumeEpoch: null, reason: null },
-      effect: { kind: "advise", phase: state.phase }
+      effect: { kind: "advise", phase: state.phase, recoveredSides: [] }
     };
   }
-  return { next: prev, effect: { kind: "none" } };
+  return { next: prev, effect: { kind: "none", recoveredSides: [] } };
 }
 function resumeCandidateSides(effect) {
+  if (effect.recoveredSides.length > 0) {
+    return effect.recoveredSides;
+  }
   switch (effect.kind) {
     case "exit":
       return sideToAgents(effect.previousSide);
@@ -4209,6 +4218,7 @@ class BudgetCoordinator {
   now;
   scheduler;
   log;
+  onResume;
   resumeSignals;
   timer = null;
   running = false;
@@ -4229,6 +4239,7 @@ class BudgetCoordinator {
     this.now = options.now ?? (() => Math.floor(Date.now() / 1000));
     this.scheduler = options.scheduler ?? REAL_BUDGET_POLL_SCHEDULER;
     this.log = options.log ?? (() => {});
+    this.onResume = options.onResume ?? (() => {});
     this.resumeSignals = options.resumeSignals ?? null;
   }
   async start() {
@@ -4330,6 +4341,10 @@ class BudgetCoordinator {
     const { next, effect } = classifyPoll(this.fpState, state, this.config);
     this.fpState = next;
     this.resumeCandidate = this.resumeSignals ? computeResumeCandidate(resumeCandidateSides(effect), state, this.config, this.resumeSignals()) : {};
+    for (const side of effect.recoveredSides) {
+      const { id, directive } = this.emitRecovery(side, state);
+      this.onResume(side, directive, id);
+    }
     switch (effect.kind) {
       case "enter":
       case "hold-uncertain": {
@@ -4342,7 +4357,6 @@ class BudgetCoordinator {
       }
       case "exit": {
         this.onPauseChange(false);
-        this.emitDirective(this.recoveryPrefix(effect.previousSide), this.recoveryDirective(state, effect.previousSide));
         return;
       }
       case "advise": {
@@ -4388,19 +4402,26 @@ class BudgetCoordinator {
     this.pendingOverrides = { ...overrides };
   }
   emitDirective(prefix, content) {
-    this.emit(`${prefix}_${this.sequence++}`, content);
+    const id = `${prefix}_${this.sequence++}`;
+    this.emit(id, content);
+    return id;
   }
   interventionPrefix(side) {
     return side === "claude" ? "system_budget_handoff" : "system_budget_pause";
   }
-  recoveryPrefix(previousSide) {
-    return previousSide === "claude" ? "system_budget_claude_recovered" : "system_budget_resume";
+  recoveryPrefix(side) {
+    return side === "claude" ? "system_budget_claude_recovered" : "system_budget_resume";
+  }
+  emitRecovery(side, state) {
+    const directive = this.recoveryDirective(state, side);
+    const id = this.emitDirective(this.recoveryPrefix(side), directive);
+    return { id, directive };
   }
   interventionDirective(state, side, reason, resumeEpoch) {
     return renderBudgetInterventionDirective(state.perAgent.claude, state.perAgent.codex, side, reason || "\u9884\u7B97\u63A5\u8FD1\u8017\u5C3D", resumeEpoch, this.config);
   }
-  recoveryDirective(state, previousSide) {
-    if (previousSide === "claude") {
+  recoveryDirective(state, side) {
+    if (side === "claude") {
       return [
         "\u3010\u9884\u7B97\u534F\u8C03 \xB7 \u8D26\u53F7\u7EA7\u3011Claude \u4FA7\u9884\u7B97\u5DF2\u6062\u590D\u3002",
         `${usageLine("claude", state.perAgent.claude)}\uFF1B${usageLine("codex", state.perAgent.codex)}\u3002`,
@@ -4409,19 +4430,10 @@ class BudgetCoordinator {
       ].join(`
 `);
     }
-    if (previousSide === "codex") {
-      return [
-        "\u3010\u9884\u7B97\u534F\u8C03 \xB7 \u8D26\u53F7\u7EA7\u3011Codex \u4FA7\u9884\u7B97\u95F8\u95E8\u89E3\u9664\u3002",
-        `${usageLine("claude", state.perAgent.claude)}\uFF1B${usageLine("codex", state.perAgent.codex)}\u3002`,
-        `\u95F8\u95E8\u5DF2\u653E\u5F00\uFF1ACodex gateUtil \u4F4E\u4E8E ${pct3(this.config.resumeBelow)}\uFF0C\u4E14\u6CA1\u6709\u6709\u6548 rate_limit\u3002`,
-        "\u5EFA\u8BAE Claude \u7528 reply \u5E26\u4E0A\u5F53\u524D\u76EE\u6807\u3001checkpoint \u548C\u4E0B\u4E00\u6B65\uFF0C\u5524\u9192 Codex \u63A5\u7EED\u6267\u884C\u3002"
-      ].join(`
-`);
-    }
     return [
-      "\u3010\u9884\u7B97\u534F\u8C03 \xB7 \u8D26\u53F7\u7EA7\u3011\u8054\u5408\u6682\u505C\u89E3\u9664\u3002",
+      "\u3010\u9884\u7B97\u534F\u8C03 \xB7 \u8D26\u53F7\u7EA7\u3011Codex \u4FA7\u9884\u7B97\u95F8\u95E8\u89E3\u9664\u3002",
       `${usageLine("claude", state.perAgent.claude)}\uFF1B${usageLine("codex", state.perAgent.codex)}\u3002`,
-      `\u95F8\u95E8\u5DF2\u653E\u5F00\uFF1A\u53CC\u65B9 gateUtil \u5747\u4F4E\u4E8E ${pct3(this.config.resumeBelow)}\uFF0C\u4E14\u6CA1\u6709\u6709\u6548 rate_limit\u3002`,
+      `\u95F8\u95E8\u5DF2\u653E\u5F00\uFF1ACodex gateUtil \u4F4E\u4E8E ${pct3(this.config.resumeBelow)}\uFF0C\u4E14\u6CA1\u6709\u6709\u6548 rate_limit\u3002`,
       "\u5EFA\u8BAE Claude \u7528 reply \u5E26\u4E0A\u5F53\u524D\u76EE\u6807\u3001checkpoint \u548C\u4E0B\u4E00\u6B65\uFF0C\u5524\u9192 Codex \u63A5\u7EED\u6267\u884C\u3002"
     ].join(`
 `);
