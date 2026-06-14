@@ -303,6 +303,17 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
     return pending;
   }
 
+  /**
+   * Forward Claude's budget-resume acknowledgement to the daemon (PR4). A
+   * fire-and-forget control-plane message (the daemon does not reply): it
+   * resolves the daemon's ResumeAckTracker entry, stopping the re-push loop.
+   * DELIBERATELY separate from sendReply — an ack is NOT a Claude→Codex message
+   * and must never travel the claude_to_codex path.
+   */
+  sendAckResume(resumeId: string, status: string): void {
+    this.send({ type: "ack_resume", resumeId, status });
+  }
+
   private attachSocketHandlers(ws: WebSocket, socketId: number) {
     ws.onmessage = (event) => {
       const raw = typeof event.data === "string" ? event.data : event.data.toString();

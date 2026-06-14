@@ -7,6 +7,14 @@ export interface BridgeMessage {
   source: MessageSource;
   content: string;
   timestamp: number;
+  /**
+   * Stable budget-resume correlation id (PR4, additive). Present ONLY on Claude
+   * channel resume pushes (system_budget_resume directives). When set, the
+   * Claude adapter surfaces it as `meta.resume_id` so Claude can echo it back
+   * via the `ack_resume` MCP tool. Does NOT affect the source-never-forwarded
+   * invariant — it is an opaque payload field, not a routing key.
+   */
+  resumeId?: string;
 }
 
 // ===== JSON-RPC 2.0 =====

@@ -119,6 +119,24 @@ claude.setReplySender(async (
   return daemonClient.sendReply(msg, requireReply, onBusy, idempotencyKey);
 });
 
+// PR4: forward Claude's budget-resume ack to the daemon's ResumeAckTracker.
+// DELIBERATELY separate from setReplySender — an ack is a Claude→bridge
+// control-plane signal, NOT a Claude→Codex message. It must never travel
+// sendReply (no pause gate, no idempotency machine, no Codex turn injection).
+claude.setResumeAckHandler((resumeId: string, status: string) => {
+  if (daemonDisabled) {
+    log(`Resume ack ${resumeId} (${status}) dropped — daemon disabled (${daemonDisabledReason ?? "killed"})`);
+    return;
+  }
+  try {
+    daemonClient.sendAckResume(resumeId, status);
+  } catch (err: any) {
+    // Best-effort: a lost ack just means the daemon keeps re-pushing until it
+    // times out into degraded — no crash, no double-injection.
+    log(`Resume ack ${resumeId} (${status}) send failed: ${err?.message ?? err}`);
+  }
+});
+
 // turn_started ACK (protocol v2 PR B): logged for correlation forensics. The
 // reply tool's synchronous result already told the model its message was
 // accepted; the ACK confirms the turn actually started (the "Claude saw a

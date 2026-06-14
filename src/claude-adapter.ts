@@ -92,6 +92,12 @@ export class ClaudeAdapter extends EventEmitter {
   private readonly notificationIdPrefix: string;
   private readonly instanceId: string;
   private replySender: ReplySender | null = null;
+  // PR4: budget-resume ack callback, DELIBERATELY isolated from replySender.
+  // ack_resume is a Claude→bridge control-plane signal (acknowledging a
+  // system_budget_resume directive), NOT a Claude→Codex message — it must never
+  // route through the reply path (no idempotency/replyTracker pollution, no
+  // budget pause gate, no turn injection into Codex).
+  private resumeAckHandler: ((resumeId: string, status: string) => void) | null = null;
   private readonly logFile: string;
   private readonly logger: ProcessLogger;
 
@@ -170,6 +176,16 @@ export class ClaudeAdapter extends EventEmitter {
     this.replySender = sender;
   }
 
+  /**
+   * Register the budget-resume ack callback (PR4). Wired by bridge.ts to forward
+   * an `ack_resume` control message to the daemon's ResumeAckTracker. Kept fully
+   * separate from the reply sender so ack_resume can never be confused with a
+   * Claude→Codex message.
+   */
+  setResumeAckHandler(handler: (resumeId: string, status: string) => void) {
+    this.resumeAckHandler = handler;
+  }
+
   /** Returns the number of messages waiting in the fallback queue. */
   getPendingMessageCount(): number {
     return this.pendingMessages.length;
@@ -205,6 +221,10 @@ export class ClaudeAdapter extends EventEmitter {
             user_id: "codex",
             ts,
             source_type: "codex",
+            // PR4: budget-resume correlation id. Only present on resume pushes;
+            // omitted entirely for normal Codex messages so the meta shape is
+            // unchanged for the common path.
+            ...(message.resumeId ? { resume_id: message.resumeId } : {}),
           },
         },
       });
@@ -421,6 +441,27 @@ export class ClaudeAdapter extends EventEmitter {
             required: [],
           },
         },
+        {
+          name: "ack_resume",
+          description:
+            "ONLY for acknowledging a system_budget_resume directive (the budget window refreshed). NOT a general channel to Codex (use reply for that). This is an acknowledgement that you RECEIVED the resume directive — call it as soon as you see the notice, then continue the work; do NOT wait until the task is finished.",
+          inputSchema: {
+            type: "object" as const,
+            properties: {
+              resume_id: {
+                type: "string",
+                description: "The resume_id from the system_budget_resume notice (meta.resume_id).",
+              },
+              status: {
+                type: "string",
+                enum: ["resumed", "declined", "already_running"],
+                description:
+                  "Acknowledgement outcome, recorded for observability only — all three values stop the resume re-push identically (the bridge takes no different downstream action for \"declined\"). \"resumed\" (default): you are resuming the task. \"declined\": you are not resuming. \"already_running\": you were already working and need no resume.",
+              },
+            },
+            required: ["resume_id"],
+          },
+        },
       ],
     }));
 
@@ -439,11 +480,66 @@ export class ClaudeAdapter extends EventEmitter {
         return this.handleGetBudget();
       }
 
+      if (name === "ack_resume") {
+        return this.handleAckResume(args as Record<string, unknown>);
+      }
+
       return {
         content: [{ type: "text" as const, text: `Unknown tool: ${name}` }],
         isError: true,
       };
     });
+  }
+
+  /**
+   * Handle ack_resume (PR4): Claude acknowledging a system_budget_resume
+   * directive. Mirrors handleReply's boundary checks, but routes through the
+   * dedicated resumeAckHandler — NEVER the replySender. Validation failures
+   * never invoke the handler.
+   */
+  private async handleAckResume(args: Record<string, unknown>) {
+    const resumeIdRaw = args?.resume_id;
+    if (typeof resumeIdRaw !== "string" || resumeIdRaw.length === 0) {
+      return {
+        content: [{ type: "text" as const, text: "Error: missing required parameter 'resume_id'" }],
+        isError: true,
+      };
+    }
+    if (resumeIdRaw.length > 128) {
+      return {
+        content: [{ type: "text" as const, text: `Error: resume_id is too long (${resumeIdRaw.length} chars, max 128).` }],
+        isError: true,
+      };
+    }
+
+    const statusRaw = args?.status;
+    if (
+      statusRaw !== undefined &&
+      statusRaw !== "resumed" &&
+      statusRaw !== "declined" &&
+      statusRaw !== "already_running"
+    ) {
+      return {
+        content: [{ type: "text" as const, text: `Error: invalid status value ${JSON.stringify(statusRaw)} — use "resumed", "declined" or "already_running".` }],
+        isError: true,
+      };
+    }
+    const status: string = typeof statusRaw === "string" ? statusRaw : "resumed";
+
+    if (!this.resumeAckHandler) {
+      this.log("No resume ack handler registered");
+      return {
+        content: [{ type: "text" as const, text: "Error: bridge not initialized, cannot acknowledge resume." }],
+        isError: true,
+      };
+    }
+
+    this.log(`ack_resume received (resume_id=${resumeIdRaw}, status=${status}, instance=${this.instanceId})`);
+    this.resumeAckHandler(resumeIdRaw, status);
+
+    return {
+      content: [{ type: "text" as const, text: `Resume acknowledged (resume_id=${resumeIdRaw}, status=${status}).` }],
+    };
   }
 
   private handleGetBudget() {

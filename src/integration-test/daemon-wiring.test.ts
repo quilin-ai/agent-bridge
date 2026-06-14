@@ -20,7 +20,7 @@ import { portsForSlot, type PairPorts } from "../pair-registry";
 import { readControlToken, resolveControlTokenPath } from "../control-token";
 import { CONTRACT_VERSION } from "../contract-version";
 import { installFakeCodex } from "./fixtures/fake-codex-install";
-import { RESUME_PROMPT } from "../budget/resume-prompt";
+import { RESUME_PROMPT, claudeResumePrompt } from "../budget/resume-prompt";
 
 const DAEMON_PATH = join(process.cwd(), "src", "daemon.ts");
 const DEFAULT_TEST_SLOT_START = 2500 + (process.pid % 500);
@@ -51,6 +51,8 @@ interface Harness {
     text: string,
     opts?: { onBusy?: "reject" | "steer" | "interrupt"; requireReply?: boolean; idempotencyKey?: string },
   ) => void;
+  /** Send an ack_resume control message over the attached control socket (PR4). */
+  sendAckResume: (resumeId: string, status: string) => void;
 }
 
 const harnesses: Harness[] = [];
@@ -463,6 +465,109 @@ describe("daemon wiring", () => {
         80,
         50,
       );
+    } finally {
+      rmSync(fixtureRoot, { recursive: true, force: true });
+    }
+  }, 60000);
+
+  // --- PR4: Claude-side auto-resume via a REAL daemon (mirrors the Codex E2E) ---
+  //
+  // Drives an end-to-end Claude recovery through the real daemon process: the
+  // budget probe pauses the CLAUDE side (handoff), then refreshes it → the
+  // coordinator's onResume("claude", …) calls the SHARED routeResume →
+  // claudeResumeTracker.start → a `system_budget_resume_*` channel push carrying
+  // the stable resumeId. The test then sends an `ack_resume` control message and
+  // asserts the tracker resolved (no further re-push beyond the single delivery).
+  test("Claude-side recovery pushes system_budget_resume with resumeId; ack_resume stops the re-push", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "agentbridge-claude-resume-fixture-"));
+    const probePath = join(fixtureRoot, "probe.sh");
+    const writeUsage = (agent: "claude" | "codex", gateUtil: number) => {
+      writeFileSync(
+        join(fixtureRoot, `usage-${agent}.json`),
+        JSON.stringify({
+          ok: true,
+          util: gateUtil,
+          warn_util: gateUtil,
+          fetched_at: Math.floor(Date.now() / 1000),
+          buckets: [
+            { id: "five_hour", util: gateUtil, reset_epoch: Math.floor(Date.now() / 1000) + 600 },
+          ],
+        }),
+      );
+    };
+    writeUsage("claude", 95); // Claude-only trip → handoff (gate stays open)
+    writeUsage("codex", 10);
+    writeFileSync(probePath, `#!/bin/sh\ncat "${fixtureRoot}/usage-$2.json"\n`, "utf-8");
+    chmodSync(probePath, 0o755);
+
+    try {
+      const harness = await startHarness({
+        pairId: "main-clauderes",
+        pairName: "main",
+        extraEnv: {
+          AGENTBRIDGE_BUDGET_ENABLED: "1",
+          AGENTBRIDGE_QUOTA_PROBE: probePath,
+          AGENTBRIDGE_BUDGET_POLL_SECONDS: "5",
+          // A compressed (but not razor-thin) ack window: long enough that the
+          // ack control message round-trips before the first re-push timer could
+          // fire (so the count we capture at ack time is stable), yet short
+          // enough that a STILL-armed timer after the ack would fire inside the
+          // post-ack wait below — turning a broken ack into a visible re-push.
+          AGENTBRIDGE_RESUME_ACK_TIMEOUT_MS: "3000",
+          AGENTBRIDGE_RESUME_ACK_RETRIES: "3",
+        },
+      });
+
+      await harness.attachClaude();
+      await harness.connectTui();
+
+      // Claude side trips first → a handoff directive (NOT a pause), gate open.
+      await waitForMessage(
+        harness.messages,
+        (message) => message.id.startsWith("system_budget_handoff_"),
+        "system_budget_handoff before Claude recovery",
+      );
+
+      // Refresh the Claude window → next poll (≤5s) recovers it. The recovery
+      // surfaces as BOTH the coordinator directive (system_budget_claude_recovered_*)
+      // and the ack-tracker channel push (system_budget_resume_*, carrying resumeId).
+      writeUsage("claude", 5);
+      const isResumePush = (m: BridgeMessage) =>
+        m.id.startsWith("system_budget_resume_") && typeof m.resumeId === "string";
+      // Recovery fires on the NEXT coordinator poll (≤5s), so wait well past one
+      // poll cycle — generous for slow CI (300 × 50ms = 15s).
+      await waitFor(
+        () => harness.messages.some(isResumePush),
+        "Claude-side system_budget_resume channel push with resumeId",
+        300,
+        50,
+      );
+      const push = harness.messages.find(isResumePush)!;
+
+      const resumeId = push.resumeId!;
+      expect(resumeId.startsWith("system_budget_claude_recovered_")).toBe(true);
+      // The push content carries the ack instruction (claudeResumePrompt), which
+      // embeds the stable resumeId so Claude's echo correlates.
+      expect(push.content).toBe(claudeResumePrompt(resumeId));
+      expect(push.content).toContain(`ack_resume(resume_id="${resumeId}"`);
+
+      // Record how many resume pushes (for THIS resumeId) we've seen so we can
+      // prove the ack stops the loop rather than a later poll incidentally quieting.
+      const pushesForResume = () =>
+        harness.messages.filter(
+          (m) => m.id.startsWith("system_budget_resume_") && m.resumeId === resumeId,
+        );
+      const countAtAck = pushesForResume().length;
+      expect(countAtAck).toBeGreaterThanOrEqual(1);
+
+      // Ack it via the control plane (exactly what the ack_resume MCP tool does).
+      harness.sendAckResume(resumeId, "resumed");
+
+      // After the ack, no further re-push for this resumeId may arrive — wait out
+      // more than one full ack window (3000ms) to give a (wrongly) still-armed
+      // timer time to fire.
+      await sleep(4000);
+      expect(pushesForResume().length).toBe(countAtAck);
     } finally {
       rmSync(fixtureRoot, { recursive: true, force: true });
     }
@@ -1665,6 +1770,9 @@ async function startHarness(opts: {
         ...(sendOpts?.onBusy && sendOpts.onBusy !== "reject" ? { onBusy: sendOpts.onBusy } : {}),
         ...(sendOpts?.idempotencyKey ? { idempotencyKey: sendOpts.idempotencyKey } : {}),
       }));
+    },
+    sendAckResume: (resumeId: string, status: string) => {
+      harness.controlWs?.send(JSON.stringify({ type: "ack_resume", resumeId, status }));
     },
   };
   harnesses.push(harness);
