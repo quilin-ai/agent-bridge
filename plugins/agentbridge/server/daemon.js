@@ -5,7 +5,7 @@ var __require = import.meta.require;
 // src/daemon.ts
 import { existsSync as existsSync8, realpathSync as realpathSync2, rmSync as rmSync2 } from "fs";
 import { homedir as homedir4 } from "os";
-import { join as join9 } from "path";
+import { join as join10 } from "path";
 import { randomUUID as randomUUID4 } from "crypto";
 
 // src/contract-version.ts
@@ -30,10 +30,10 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.16", "0.0.0-source"),
-  commit: defineString("2c8dc86", "source"),
+  commit: defineString("305fb62", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION),
-  codeHash: defineString("907116a9cd8c", "source")
+  codeHash: defineString("6e6ae2f59324", "source")
 });
 function daemonStatusBuildInfo() {
   return { ...BUILD_INFO };
@@ -4980,6 +4980,9 @@ import { join as join7 } from "path";
 
 // src/budget/resume-prompt.ts
 var RESUME_PROMPT = "\u989D\u5EA6\u7A97\u53E3\u5DF2\u5237\u65B0\uFF0C\u7EE7\u7EED\u4E0A\u6B21\u672A\u5B8C\u6210\u7684\u4EFB\u52A1\uFF1A\u4ECE .agent/checkpoint.md \u7684\u300C\u4E0B\u4E00\u6B65\u300D\u63A5\u7740\u505A\uFF1B\u5B8C\u6210\u540E\u505C\u4E0B\u5E76\u6807 DONE\u3002";
+function claudeResumePrompt(resumeId) {
+  return "\u989D\u5EA6\u7A97\u53E3\u5DF2\u5237\u65B0\u3002" + `\u8BF7\u5148\u8C03\u7528 ack_resume(resume_id="${resumeId}", status="resumed") \u786E\u8BA4\u5DF2\u6536\u5230\u672C\u901A\u77E5\uFF08ACK = \u5DF2\u63A5\u6536\uFF0C\u4E0D\u662F\u5B8C\u6210\uFF0C\u8BF7\u7ACB\u5373\u8C03\u7528\uFF0C\u4E0D\u8981\u7B49\u4EFB\u52A1\u505A\u5B8C\uFF09\uFF0C` + "\u518D\u4ECE .agent/checkpoint.md \u7684\u300C\u4E0B\u4E00\u6B65\u300D\u63A5\u7740\u505A\uFF1B\u5B8C\u6210\u540E\u505C\u4E0B\u5E76\u6807 DONE\u3002";
+}
 
 // src/budget/resume-injection-queue.ts
 var DEFAULT_RETRY_MS = 5000;
@@ -5300,6 +5303,124 @@ function tryClaimPendingResume(opts) {
   };
 }
 
+// src/budget/resume-ack-tracker.ts
+function finitePositive2(value, fallback) {
+  return Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
+}
+
+class ResumeAckTracker {
+  push;
+  scheduler;
+  timeoutMs;
+  retries;
+  onDegraded;
+  entries = new Map;
+  deliverySeq = 0;
+  constructor(options) {
+    this.push = options.push;
+    this.scheduler = options.scheduler;
+    this.timeoutMs = finitePositive2(options.timeoutMs, 60000);
+    this.retries = finitePositive2(options.retries, 3);
+    this.onDegraded = options.onDegraded ?? (() => {});
+  }
+  get size() {
+    return this.entries.size;
+  }
+  get(resumeId) {
+    const entry = this.entries.get(resumeId);
+    if (!entry)
+      return;
+    const { timer: _timer, ...publicEntry } = entry;
+    return { ...publicEntry };
+  }
+  start(resumeId) {
+    if (this.entries.has(resumeId))
+      return;
+    const entry = { resumeId, attempts: 0, state: "awaiting_ack" };
+    this.entries.set(resumeId, entry);
+    this.pushAttempt(entry);
+    this.armTimer(entry);
+  }
+  ack(resumeId) {
+    const entry = this.entries.get(resumeId);
+    if (!entry)
+      return;
+    this.clearTimer(entry);
+    entry.state = "resumed";
+    this.entries.delete(resumeId);
+  }
+  stop() {
+    for (const entry of this.entries.values()) {
+      this.clearTimer(entry);
+    }
+    this.entries.clear();
+  }
+  pushAttempt(entry) {
+    const deliveryId = `${entry.resumeId}_retry${entry.attempts}_${++this.deliverySeq}`;
+    this.push({ resumeId: entry.resumeId, deliveryId, attempt: entry.attempts });
+  }
+  armTimer(entry) {
+    this.clearTimer(entry);
+    entry.timer = this.scheduler.setTimeout(() => {
+      delete entry.timer;
+      this.onTimeout(entry);
+    }, this.timeoutMs);
+    entry.timer?.unref?.();
+  }
+  onTimeout(entry) {
+    if (entry.state !== "awaiting_ack" || !this.entries.has(entry.resumeId))
+      return;
+    entry.attempts += 1;
+    if (entry.attempts >= this.retries) {
+      entry.state = "degraded";
+      this.entries.delete(entry.resumeId);
+      this.onDegraded(entry.resumeId);
+      return;
+    }
+    this.pushAttempt(entry);
+    this.armTimer(entry);
+  }
+  clearTimer(entry) {
+    if (entry.timer === undefined)
+      return;
+    this.scheduler.clearTimeout(entry.timer);
+    delete entry.timer;
+  }
+}
+
+// src/budget/route-resume.ts
+function routeResume(side, resumeId, deps) {
+  if (side === "codex") {
+    deps.enqueueCodex(resumeId);
+    return;
+  }
+  deps.claudeTracker.start(resumeId);
+}
+
+// src/budget/resume-ack-sentinel.ts
+import { renameSync as renameSync3, writeFileSync as writeFileSync4 } from "fs";
+import { join as join8 } from "path";
+var RESUME_ACK_DEGRADED_SENTINEL = "resume-ack-degraded.json";
+function resumeAckSentinelPath(stateDir) {
+  return join8(stateDir, RESUME_ACK_DEGRADED_SENTINEL);
+}
+function writeResumeAckDegradedSentinel(opts) {
+  const now = opts.now ?? (() => Date.now());
+  const payload = {
+    resumeId: opts.resumeId,
+    degradedAt: now()
+  };
+  const target = resumeAckSentinelPath(opts.stateDir);
+  const tmp = `${target}.${process.pid}.tmp`;
+  try {
+    writeFileSync4(tmp, JSON.stringify(payload, null, 2), { mode: 384 });
+    renameSync3(tmp, target);
+    opts.log?.(`Resume-ack degraded sentinel written: ${opts.resumeId}`);
+  } catch (err) {
+    opts.log?.(`Resume-ack degraded sentinel write failed (${opts.resumeId}): ${err?.message ?? err}`);
+  }
+}
+
 // src/daemon-identity-ownership.ts
 import { readFileSync as readFileSync6 } from "fs";
 var defaultRead2 = (path) => readFileSync6(path, "utf-8");
@@ -5475,7 +5596,7 @@ import {
   readFileSync as readFileSync7
 } from "fs";
 import { homedir as homedir3 } from "os";
-import { basename as basename2, join as join8 } from "path";
+import { basename as basename2, join as join9 } from "path";
 function nowIso() {
   return new Date().toISOString();
 }
@@ -5484,7 +5605,7 @@ function threadTag(identity) {
   return `abg:${name}:${identity.cwd}`;
 }
 function codexHome(env = process.env) {
-  return env.CODEX_HOME && env.CODEX_HOME.length > 0 ? env.CODEX_HOME : join8(homedir3(), ".codex");
+  return env.CODEX_HOME && env.CODEX_HOME.length > 0 ? env.CODEX_HOME : join9(homedir3(), ".codex");
 }
 function readRawCurrentThread(stateDir) {
   try {
@@ -5496,7 +5617,7 @@ function readRawCurrentThread(stateDir) {
   return null;
 }
 function findCodexRolloutFile(threadId, env = process.env, maxEntries = 20000) {
-  const sessionsDir = join8(codexHome(env), "sessions");
+  const sessionsDir = join9(codexHome(env), "sessions");
   if (!threadId || !existsSync7(sessionsDir))
     return null;
   const exactName = `rollout-${threadId}.jsonl`;
@@ -5512,7 +5633,7 @@ function findCodexRolloutFile(threadId, env = process.env, maxEntries = 20000) {
     }
     for (const entry of entries) {
       visited++;
-      const path = join8(dir, entry.name);
+      const path = join9(dir, entry.name);
       if (entry.isDirectory()) {
         stack.push(path);
         continue;
@@ -5704,6 +5825,8 @@ var BUDGET_CONFIG = applyBudgetEnvOverrides(config.budget);
 var RESUME_INJECT_RETRY_MS = parsePositiveIntEnv("AGENTBRIDGE_RESUME_INJECT_RETRY_MS", 5000, log);
 var RESUME_CONFIRM_TIMEOUT_MS = parsePositiveIntEnv("AGENTBRIDGE_RESUME_CONFIRM_TIMEOUT_MS", 60000, log);
 var RESUME_INJECT_MAX_ATTEMPTS = parsePositiveIntEnv("AGENTBRIDGE_RESUME_INJECT_MAX_ATTEMPTS", 5, log);
+var RESUME_ACK_TIMEOUT_MS = parsePositiveIntEnv("AGENTBRIDGE_RESUME_ACK_TIMEOUT_MS", 60000, log);
+var RESUME_ACK_RETRIES = parsePositiveIntEnv("AGENTBRIDGE_RESUME_ACK_RETRIES", 3, log);
 var daemonLifecycle = new DaemonLifecycle({ stateDir, controlPort: CONTROL_PORT, log });
 var DAEMON_NONCE = randomUUID4();
 var DAEMON_STARTED_AT = Date.now();
@@ -5743,6 +5866,30 @@ var resumeInjectionQueue = new ResumeInjectionQueue({
     log(`Budget resume injection abandoned: ${resumeId}: ${reason}`);
   }
 });
+var claudeResumeTracker = new ResumeAckTracker({
+  push: ({ resumeId, deliveryId, attempt }) => {
+    const message = {
+      id: `system_budget_resume_${SYSTEM_MSG_SALT}_${deliveryId}`,
+      source: "codex",
+      content: claudeResumePrompt(resumeId),
+      timestamp: Date.now(),
+      resumeId
+    };
+    log(`Budget resume push to Claude: ${resumeId} (attempt ${attempt}, delivery ${deliveryId})`);
+    emitToClaude(message);
+  },
+  scheduler: globalThis,
+  timeoutMs: RESUME_ACK_TIMEOUT_MS,
+  retries: RESUME_ACK_RETRIES,
+  onDegraded: (resumeId) => {
+    log(`Budget resume ${resumeId} degraded: no ack from Claude after ${RESUME_ACK_RETRIES} attempts`);
+    try {
+      writeResumeAckDegradedSentinel({ stateDir: stateDir.dir, resumeId, log });
+    } catch (err) {
+      log(`Resume degraded sentinel write failed (${resumeId}): ${err?.message ?? err}`);
+    }
+  }
+});
 var pendingSteerDispatches = new Map;
 var BUSY_RETRY_ADVISORY_MS = 15000;
 var shuttingDown = false;
@@ -5780,7 +5927,7 @@ function budgetGuardStateDir() {
   const override = process.env.BUDGET_STATE_DIR;
   if (override && override.trim() !== "")
     return override.trim();
-  return join9(homedir4(), ".budget-guard");
+  return join10(homedir4(), ".budget-guard");
 }
 function resumeClaimTtlSec() {
   const totalMs = RESUME_CONFIRM_TIMEOUT_MS * RESUME_INJECT_MAX_ATTEMPTS + RESUME_INJECT_RETRY_MS * Math.max(0, RESUME_INJECT_MAX_ATTEMPTS - 1);
@@ -5816,7 +5963,7 @@ function readResumeSignals() {
   let checkpointExists = false;
   let checkpointPath;
   try {
-    checkpointPath = join9(pairCwd(), ".agent", "checkpoint.md");
+    checkpointPath = join10(pairCwd(), ".agent", "checkpoint.md");
     checkpointExists = existsSync8(checkpointPath);
   } catch (error) {
     log(`resume signal: checkpoint stat failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -5879,11 +6026,13 @@ function ensureBudgetCoordinatorStarted() {
       onSnapshot: () => broadcastStatus(),
       log,
       onResume: (side, _directive, resumeId) => {
-        if (side === "codex") {
-          enqueueCodexBudgetResume(resumeId);
-          return;
+        if (side === "claude") {
+          log(`Budget resume ${resumeId} for Claude side \u2192 arming ack tracker`);
         }
-        log(`Budget resume ${resumeId} for Claude side deferred to PR4`);
+        routeResume(side, resumeId, {
+          claudeTracker: claudeResumeTracker,
+          enqueueCodex: enqueueCodexBudgetResume
+        });
       },
       resumeSignals: readResumeSignals
     });
@@ -6219,6 +6368,10 @@ function handleControlMessage(ws, raw) {
       return;
     case "status":
       sendStatus(ws);
+      return;
+    case "ack_resume":
+      log(`Received ack_resume from Claude #${ws.data.clientId}: ${message.resumeId} (${message.status})`);
+      claudeResumeTracker.ack(message.resumeId);
       return;
     case "probe_incumbent":
       handleProbeIncumbent(ws).catch((err) => {
@@ -6874,6 +7027,7 @@ function shutdown(reason, exitCode = 0) {
   log(`Shutting down daemon (${reason})...`);
   clearBootDeadline();
   resumeInjectionQueue.stop();
+  claudeResumeTracker.stop();
   stopBudgetCoordinator();
   idempotencyTracker.dispose();
   tuiConnectionState.dispose(`daemon shutdown (${reason})`);

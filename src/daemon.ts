@@ -24,7 +24,10 @@ import { createQuotaSource } from "./budget/quota-source";
 import { readGuardPending } from "./budget/pending-reader";
 import type { ResumeSignals } from "./budget/budget-fingerprint";
 import { ResumeInjectionQueue, tryClaimPendingResume } from "./budget/resume-injection-queue";
-import { RESUME_PROMPT } from "./budget/resume-prompt";
+import { ResumeAckTracker } from "./budget/resume-ack-tracker";
+import { routeResume } from "./budget/route-resume";
+import { RESUME_PROMPT, claudeResumePrompt } from "./budget/resume-prompt";
+import { writeResumeAckDegradedSentinel } from "./budget/resume-ack-sentinel";
 import {
   CLOSE_CODE_REPLACED,
   CLOSE_CODE_EVICTED_STALE,
@@ -128,6 +131,9 @@ const BUDGET_CONFIG = applyBudgetEnvOverrides(config.budget);
 const RESUME_INJECT_RETRY_MS = parsePositiveIntEnv("AGENTBRIDGE_RESUME_INJECT_RETRY_MS", 5000, log);
 const RESUME_CONFIRM_TIMEOUT_MS = parsePositiveIntEnv("AGENTBRIDGE_RESUME_CONFIRM_TIMEOUT_MS", 60000, log);
 const RESUME_INJECT_MAX_ATTEMPTS = parsePositiveIntEnv("AGENTBRIDGE_RESUME_INJECT_MAX_ATTEMPTS", 5, log);
+// PR4 Claude-side ack/retry window (spec S4: resumeAckTimeoutMs=60_000, resumeAckRetries=3).
+const RESUME_ACK_TIMEOUT_MS = parsePositiveIntEnv("AGENTBRIDGE_RESUME_ACK_TIMEOUT_MS", 60000, log);
+const RESUME_ACK_RETRIES = parsePositiveIntEnv("AGENTBRIDGE_RESUME_ACK_RETRIES", 3, log);
 
 const daemonLifecycle = new DaemonLifecycle({ stateDir, controlPort: CONTROL_PORT, log });
 
@@ -189,6 +195,36 @@ const resumeInjectionQueue = new ResumeInjectionQueue({
   },
   onAbandoned: ({ resumeId, reason }) => {
     log(`Budget resume injection abandoned: ${resumeId}: ${reason}`);
+  },
+});
+// PR4 Claude-side resume ack/retry tracker (daemon-owned single source of truth).
+// Push delivers a system_budget_resume channel notification carrying the stable
+// resumeId; the per-attempt `deliveryId` becomes the BridgeMessage.id so the
+// adapter's LRU dedup never drops a re-push, while resumeId stays stable so
+// Claude's ack_resume echo still correlates. After RESUME_ACK_RETRIES timeouts
+// with no ack it degrades and drops a SessionStart escape-hatch sentinel.
+const claudeResumeTracker = new ResumeAckTracker({
+  push: ({ resumeId, deliveryId, attempt }) => {
+    const message: BridgeMessage = {
+      id: `system_budget_resume_${SYSTEM_MSG_SALT}_${deliveryId}`,
+      source: "codex",
+      content: claudeResumePrompt(resumeId),
+      timestamp: Date.now(),
+      resumeId,
+    };
+    log(`Budget resume push to Claude: ${resumeId} (attempt ${attempt}, delivery ${deliveryId})`);
+    emitToClaude(message);
+  },
+  scheduler: globalThis,
+  timeoutMs: RESUME_ACK_TIMEOUT_MS,
+  retries: RESUME_ACK_RETRIES,
+  onDegraded: (resumeId) => {
+    log(`Budget resume ${resumeId} degraded: no ack from Claude after ${RESUME_ACK_RETRIES} attempts`);
+    try {
+      writeResumeAckDegradedSentinel({ stateDir: stateDir.dir, resumeId, log });
+    } catch (err: any) {
+      log(`Resume degraded sentinel write failed (${resumeId}): ${err?.message ?? err}`);
+    }
   },
 });
 // Transport-accepted steers awaiting their JSON-RPC verdict, keyed by the
@@ -422,12 +458,18 @@ function ensureBudgetCoordinatorStarted() {
       onSnapshot: () => broadcastStatus(),
       log,
       onResume: (side, _directive, resumeId) => {
-        if (side === "codex") {
-          enqueueCodexBudgetResume(resumeId);
-          return;
+        // Side-aware routing lives in the pure, exported routeResume so the
+        // daemon and its wiring test share ONE implementation (no re-impl drift).
+        // `side` is an AgentName — the coordinator iterates recoveredSides and
+        // calls this once per concrete side, so "both" is NEVER passed (a joint
+        // recovery arrives as two calls: codex → PR3 queue, claude → ack tracker).
+        if (side === "claude") {
+          log(`Budget resume ${resumeId} for Claude side → arming ack tracker`);
         }
-        // PR4 wires Claude channel resume + ack_resume. PR3 only owns Codex turn/start.
-        log(`Budget resume ${resumeId} for Claude side deferred to PR4`);
+        routeResume(side, resumeId, {
+          claudeTracker: claudeResumeTracker,
+          enqueueCodex: enqueueCodexBudgetResume,
+        });
       },
       // PR2 (detection only): daemon-side readiness signals for the resume
       // candidate. Pure-reducer purity is preserved by gathering all IO here —
@@ -982,6 +1024,13 @@ function handleControlMessage(ws: ServerWebSocket<ControlSocketData>, raw: strin
       return;
     case "status":
       sendStatus(ws);
+      return;
+    case "ack_resume":
+      // PR4: Claude acked a budget-resume directive. Resolve the tracker entry
+      // (stops the re-push loop). DELIBERATELY does NOT touch the Codex queue,
+      // idempotency machine, or reply path — it is a pure control-plane ack.
+      log(`Received ack_resume from Claude #${ws.data.clientId}: ${message.resumeId} (${message.status})`);
+      claudeResumeTracker.ack(message.resumeId);
       return;
     case "probe_incumbent":
       handleProbeIncumbent(ws).catch((err) => {
@@ -2048,6 +2097,7 @@ function shutdown(reason: string, exitCode = 0) {
   log(`Shutting down daemon (${reason})...`);
   clearBootDeadline();
   resumeInjectionQueue.stop();
+  claudeResumeTracker.stop();
   stopBudgetCoordinator();
   idempotencyTracker.dispose();
   tuiConnectionState.dispose(`daemon shutdown (${reason})`);

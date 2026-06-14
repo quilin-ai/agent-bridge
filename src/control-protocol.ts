@@ -100,6 +100,16 @@ export type ControlClientMessage =
       idempotencyKey?: string;
     }
   | { type: "status" }
+  /**
+   * Claude acknowledged a budget-resume directive (PR4). A Claude→bridge
+   * control-plane signal forwarded from the `ack_resume` MCP tool: it resolves
+   * the daemon's ResumeAckTracker entry for `resumeId` (stopping the re-push
+   * retry loop). DELIBERATELY distinct from claude_to_codex — an ack must never
+   * be injected into the Codex thread as a turn (see ResumeAckTracker docs).
+   * `status` mirrors the MCP tool's enum ("resumed" | "declined" |
+   * "already_running").
+   */
+  | { type: "ack_resume"; resumeId: string; status: string }
   // Non-attaching probe: ask the daemon whether it already has a LIVE Claude
   // frontend attached, WITHOUT contesting/attaching this socket. Used by the
   // `abg claude` CLI conflict guard so a second session in the same pair errors

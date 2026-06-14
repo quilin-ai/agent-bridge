@@ -14118,6 +14118,7 @@ class ClaudeAdapter extends EventEmitter {
   notificationIdPrefix;
   instanceId;
   replySender = null;
+  resumeAckHandler = null;
   logFile;
   logger;
   pendingMessages = [];
@@ -14168,6 +14169,9 @@ class ClaudeAdapter extends EventEmitter {
   setReplySender(sender) {
     this.replySender = sender;
   }
+  setResumeAckHandler(handler) {
+    this.resumeAckHandler = handler;
+  }
   getPendingMessageCount() {
     return this.pendingMessages.length;
   }
@@ -14195,7 +14199,8 @@ class ClaudeAdapter extends EventEmitter {
             user: "Codex",
             user_id: "codex",
             ts,
-            source_type: "codex"
+            source_type: "codex",
+            ...message.resumeId ? { resume_id: message.resumeId } : {}
           }
         }
       });
@@ -14368,6 +14373,25 @@ chat_id: ${this.sessionId}`);
             properties: {},
             required: []
           }
+        },
+        {
+          name: "ack_resume",
+          description: "ONLY for acknowledging a system_budget_resume directive (the budget window refreshed). NOT a general channel to Codex (use reply for that). This is an acknowledgement that you RECEIVED the resume directive \u2014 call it as soon as you see the notice, then continue the work; do NOT wait until the task is finished.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              resume_id: {
+                type: "string",
+                description: "The resume_id from the system_budget_resume notice (meta.resume_id)."
+              },
+              status: {
+                type: "string",
+                enum: ["resumed", "declined", "already_running"],
+                description: 'Acknowledgement outcome, recorded for observability only \u2014 all three values stop the resume re-push identically (the bridge takes no different downstream action for "declined"). "resumed" (default): you are resuming the task. "declined": you are not resuming. "already_running": you were already working and need no resume.'
+              }
+            },
+            required: ["resume_id"]
+          }
         }
       ]
     }));
@@ -14382,11 +14406,49 @@ chat_id: ${this.sessionId}`);
       if (name === "get_budget") {
         return this.handleGetBudget();
       }
+      if (name === "ack_resume") {
+        return this.handleAckResume(args);
+      }
       return {
         content: [{ type: "text", text: `Unknown tool: ${name}` }],
         isError: true
       };
     });
+  }
+  async handleAckResume(args) {
+    const resumeIdRaw = args?.resume_id;
+    if (typeof resumeIdRaw !== "string" || resumeIdRaw.length === 0) {
+      return {
+        content: [{ type: "text", text: "Error: missing required parameter 'resume_id'" }],
+        isError: true
+      };
+    }
+    if (resumeIdRaw.length > 128) {
+      return {
+        content: [{ type: "text", text: `Error: resume_id is too long (${resumeIdRaw.length} chars, max 128).` }],
+        isError: true
+      };
+    }
+    const statusRaw = args?.status;
+    if (statusRaw !== undefined && statusRaw !== "resumed" && statusRaw !== "declined" && statusRaw !== "already_running") {
+      return {
+        content: [{ type: "text", text: `Error: invalid status value ${JSON.stringify(statusRaw)} \u2014 use "resumed", "declined" or "already_running".` }],
+        isError: true
+      };
+    }
+    const status = typeof statusRaw === "string" ? statusRaw : "resumed";
+    if (!this.resumeAckHandler) {
+      this.log("No resume ack handler registered");
+      return {
+        content: [{ type: "text", text: "Error: bridge not initialized, cannot acknowledge resume." }],
+        isError: true
+      };
+    }
+    this.log(`ack_resume received (resume_id=${resumeIdRaw}, status=${status}, instance=${this.instanceId})`);
+    this.resumeAckHandler(resumeIdRaw, status);
+    return {
+      content: [{ type: "text", text: `Resume acknowledged (resume_id=${resumeIdRaw}, status=${status}).` }]
+    };
   }
   handleGetBudget() {
     this.log(`get_budget called (instance=${this.instanceId}, hasSnapshot=${this.budgetSnapshot !== null})`);
@@ -14512,10 +14574,10 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.16", "0.0.0-source"),
-  commit: defineString("2c8dc86", "source"),
+  commit: defineString("305fb62", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION),
-  codeHash: defineString("907116a9cd8c", "source")
+  codeHash: defineString("6e6ae2f59324", "source")
 });
 function sameRuntimeContract(a, b) {
   if (!a || !b)
@@ -14780,6 +14842,9 @@ class DaemonClient extends EventEmitter2 {
       ...idempotencyKey ? { idempotencyKey } : {}
     });
     return pending;
+  }
+  sendAckResume(resumeId, status) {
+    this.send({ type: "ack_resume", resumeId, status });
   }
   attachSocketHandlers(ws, socketId) {
     ws.onmessage = (event) => {
@@ -16208,6 +16273,17 @@ claude.setReplySender(async (msg, requireReply, onBusy, idempotencyKey) => {
     };
   }
   return daemonClient.sendReply(msg, requireReply, onBusy, idempotencyKey);
+});
+claude.setResumeAckHandler((resumeId, status) => {
+  if (daemonDisabled) {
+    log(`Resume ack ${resumeId} (${status}) dropped \u2014 daemon disabled (${daemonDisabledReason ?? "killed"})`);
+    return;
+  }
+  try {
+    daemonClient.sendAckResume(resumeId, status);
+  } catch (err) {
+    log(`Resume ack ${resumeId} (${status}) send failed: ${err?.message ?? err}`);
+  }
 });
 daemonClient.on("turnStarted", ({ requestId, idempotencyKey, threadId, turnId }) => {
   log(`Codex turn started for reply ${requestId} (turn=${turnId}, thread=${threadId}` + `${idempotencyKey ? `, idempotencyKey=${idempotencyKey}` : ""})`);
