@@ -28,6 +28,16 @@ When Claude Code closes, the foreground MCP process exits while the background d
 - A generic orchestration framework for arbitrary agent backends
 - A hardened security boundary between tools you do not trust
 
+## Features
+
+- **Bidirectional Claude ↔ Codex messaging** in one working session — Codex output is intercepted and pushed to Claude as channel notifications; Claude replies via the `reply` MCP tool, injected into the Codex thread as a `turn/start`.
+- **Push delivery with fallback** — messages arrive as channel notifications; a failed push falls back to an in-memory queue drained by `get_messages`. Loop prevention via the per-message `source` field.
+- **Turn coordination** — a busy-guard rejects replies during an active Codex turn; a per-turn inactivity watchdog stops a lost `turn/completed` from locking injection forever; noisy intermediate events are collapsed so only meaningful `agentMessage` payloads reach Claude.
+- **Multiple pairs side by side** — one Claude+Codex pair per project directory, ports allocated per pair in +10 strides from 4500. Pair-aware `claude` / `codex` / `resume` / `kill` / `doctor` / `budget` via `--pair`.
+- **Resilient lifecycle** — a persistent background daemon survives Claude Code restarts (auto-reconnect with backoff); orphan-process cleanup; `abg doctor` read-only diagnostics; `abg pairs prune` reclaims stranded state.
+- **Thread auto-resume** — bare `abg codex` resumes the pair's last Codex thread; `abg resume` prints/performs the resume commands for both sides.
+- **Budget coordination, slowdown-line & fully-automatic resume** — keep a long task moving across subscription-quota windows instead of dying at a limit. See [Budget Coordination & Auto-Resume](#budget-coordination--auto-resume).
+
 ## Architecture
 
 ```
@@ -161,12 +171,13 @@ After modifying AgentBridge source code, re-run `agentbridge dev` to sync change
 | `abg pairs` | List registered pairs; `abg pairs rm <name\|id>` removes one; `abg pairs prune` previews reclaimable orphan dirs + stranded registry entries (cwd-gone, dead, >1 day), `abg pairs prune --apply` deletes them |
 | `abg doctor [--json]` | Read-only diagnosis: env, daemon health/readiness, build drift, artifact alignment, TUI attachment, logs |
 | `abg budget [--json]` | Both agents' subscription quota snapshot (5h/weekly windows, drift, pause state) |
+| `abg logs [--codex] [-f] [-n N]` | Tail this pair's daemon log (or the Codex wrapper log with `--codex`); `-f` follows, `-n N` sets the line count (default 100) |
 | `abg kill` | Gracefully stop this pair's daemon and managed Codex TUI, write killed sentinel; `abg kill --all` stops every pair |
 | `abg dev` | (Dev only) Register local marketplace + force-sync plugin to cache |
 | `abg --help` | Show help |
 | `abg --version` | Show version |
 
-The pair-aware commands (`claude`, `codex`, `resume`, `kill`, `doctor`, `budget`) accept `--pair <name>` to target a specific pair — one pair per project directory by default, with ports allocated per pair in +10 strides from 4500.
+The pair-aware commands (`claude`, `codex`, `resume`, `kill`, `doctor`, `budget`, `logs`) accept `--pair <name>` to target a specific pair — one pair per project directory by default, with ports allocated per pair in +10 strides from 4500.
 
 ### Owned flags
 
@@ -303,6 +314,22 @@ The bridge can enter several dormant states when it cannot accept new MCP replie
 | `evicted` | A newer session evicted this one after the incumbent failed a liveness probe (issue #68). | Close this session and start a fresh one with `agentbridge claude`. |
 | `probe_in_progress` | A liveness probe is currently checking the incumbent — contention window. Transient (auto-recovers within `DISABLED_RECOVERY_INTERVAL_MS` × cap, ~30 s). | None needed; the recovery poller reconnects automatically when the slot clears. |
 | `auto_recovery_exhausted` | The auto-recovery poller for `probe_in_progress` ran its full retry budget (6 attempts, ~30 s) without succeeding. Terminal. | Retry manually with `agentbridge claude`. |
+
+## Budget Coordination & Auto-Resume
+
+AgentBridge can keep a long task moving across subscription-quota windows instead of letting it die when one agent hits its limit. This whole capability is driven by the companion **agent-quota-guard** tool: the bridge reads its quota probe and its `pending` records — install the guard to enable it.
+
+The daemon's budget coordinator polls **both** agents' account-level 5h/weekly quota (via the guard's probe) and coordinates the two sides; `abg budget [--json]` prints the live snapshot (both windows, drift, pause state). With the guard installed, two further capabilities activate:
+
+- **Slowdown-line — no mid-task cut.** Near the quota hard-line the guard does NOT deny mid-tool-call. Instead it surfaces a reminder, lets the current turn finish, then stops cleanly at the turn boundary, writes a `.agent/checkpoint.md`, and drops a `pending` record the bridge detects.
+- **Fully-automatic resume after the window refreshes.** When a paused side's quota window refreshes, the bridge resumes the task **in the original interactive TUI** — no headless background process, no manual step:
+  - **Codex** — a queued `turn/start` injection (`ResumeInjectionQueue`) opens a fresh turn that continues from the checkpoint. Fully automatic.
+  - **Claude** — a channel push carrying a stable `resume_id`; Claude echoes it back via the `ack_resume` MCP tool. Unacked pushes retry with a fresh delivery id (stable `resume_id`); after retries are exhausted a `SessionStart` degrade-sentinel surfaces a recovery hint the next session reads.
+  - **Idempotency** — per-pending claim/consumed tombstones (a sha256 of agent + session + cwd + content hash) ensure a given resume is injected at most once, even across daemon restarts; stale tombstones are TTL-pruned.
+
+Coordination directives the bridge may emit while a task runs: **balance** (route more work to the lighter side), **parallel** (split more subtasks when quota is plentiful near a reset), and **pause / handoff / resume**.
+
+> Slowdown-line + auto-resume are an opt-in, companion-guard feature. The Claude-side resume is best-effort (ack + retry + a SessionStart fallback): channel pushes to a fully idle session have known upstream variability, so the bridge only marks a side resumed once it sees a real `ack_resume`.
 
 ## Current Limitations
 
