@@ -30,10 +30,10 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.16", "0.0.0-source"),
-  commit: defineString("de7098c", "source"),
+  commit: defineString("69d8dc1", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION),
-  codeHash: defineString("1289c3349277", "source")
+  codeHash: defineString("091c4809fd1c", "source")
 });
 function daemonStatusBuildInfo() {
   return { ...BUILD_INFO };
@@ -4975,7 +4975,7 @@ function readGuardPending(opts) {
 
 // src/budget/resume-injection-queue.ts
 import { createHash as createHash2 } from "crypto";
-import { closeSync as closeSync3, existsSync as existsSync6, mkdirSync as mkdirSync5, openSync as openSync3, readFileSync as readFileSync5, realpathSync, unlinkSync as unlinkSync4, writeFileSync as writeFileSync3 } from "fs";
+import { closeSync as closeSync3, existsSync as existsSync6, mkdirSync as mkdirSync5, openSync as openSync3, readdirSync, readFileSync as readFileSync5, realpathSync, unlinkSync as unlinkSync4, writeFileSync as writeFileSync3 } from "fs";
 import { join as join7 } from "path";
 
 // src/budget/resume-prompt.ts
@@ -4989,6 +4989,7 @@ var DEFAULT_RETRY_MS = 5000;
 var DEFAULT_CONFIRM_TIMEOUT_MS = 60000;
 var DEFAULT_MAX_ATTEMPTS = 5;
 var DEFAULT_STALE_CLAIM_TTL_SEC = 300;
+var DEFAULT_CONSUMED_TTL_SEC = 7 * 24 * 3600;
 function finitePositive(value, fallback) {
   return Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
 }
@@ -5232,9 +5233,32 @@ function readClaimedAt(path) {
     return null;
   }
 }
+function pruneStaleResumeArtifacts(dir, tsField, ttlSec, nowSec, log) {
+  let names;
+  try {
+    names = readdirSync(dir);
+  } catch {
+    return;
+  }
+  for (const name of names) {
+    if (!name.endsWith(".json"))
+      continue;
+    const p = join7(dir, name);
+    try {
+      const parsed = JSON.parse(readFileSync5(p, "utf-8"));
+      const ts = parsed?.[tsField];
+      if (typeof ts === "number" && Number.isFinite(ts) && nowSec - ts > ttlSec) {
+        unlinkIfExists(p);
+      }
+    } catch (error) {
+      log?.(`resume artifact prune skipped ${p}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+}
 function tryClaimPendingResume(opts) {
   const now = opts.now ?? (() => Math.floor(Date.now() / 1000));
   const claimTtlSec = finitePositive(opts.claimTtlSec, DEFAULT_STALE_CLAIM_TTL_SEC);
+  const consumedTtlSec = finitePositive(opts.consumedTtlSec, DEFAULT_CONSUMED_TTL_SEC);
   const cwd = realpathOrRaw(opts.pending.cwd);
   const sourcePath = opts.pending.sourcePath ?? "";
   const contentHash = opts.pending.contentHash ?? "";
@@ -5250,9 +5274,11 @@ function tryClaimPendingResume(opts) {
   const consumedPath = join7(consumedDir, `${identity}.json`);
   mkdirSync5(claimsDir, { recursive: true });
   mkdirSync5(consumedDir, { recursive: true });
+  const nowSec = now();
+  pruneStaleResumeArtifacts(consumedDir, "consumed_at", consumedTtlSec, nowSec, opts.log);
+  pruneStaleResumeArtifacts(claimsDir, "claimed_at", claimTtlSec, nowSec, opts.log);
   if (existsSync6(consumedPath))
     return { ok: false, reason: "consumed" };
-  const nowSec = now();
   if (existsSync6(claimPath)) {
     const claimedAt = readClaimedAt(claimPath);
     if (claimedAt !== null && nowSec - claimedAt > claimTtlSec) {
@@ -5592,7 +5618,7 @@ class ReplyRequiredTracker {
 // src/thread-state.ts
 import {
   existsSync as existsSync7,
-  readdirSync,
+  readdirSync as readdirSync2,
   readFileSync as readFileSync7
 } from "fs";
 import { homedir as homedir3 } from "os";
@@ -5627,7 +5653,7 @@ function findCodexRolloutFile(threadId, env = process.env, maxEntries = 20000) {
     const dir = stack.pop();
     let entries;
     try {
-      entries = readdirSync(dir, { withFileTypes: true });
+      entries = readdirSync2(dir, { withFileTypes: true });
     } catch {
       continue;
     }
