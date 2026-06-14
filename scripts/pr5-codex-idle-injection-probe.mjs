@@ -117,6 +117,12 @@ function parseArgs(argv) {
     }
   }
 
+  // --help short-circuits the post-loop VALIDATION (scenario/control-port/timeout)
+  // so `--help --control-port abc` prints usage instead of erroring on the value.
+  // (The arg loop above still runs, so an unknown flag or a value-flag missing its
+  // operand still errors during parsing — --help only bypasses the checks below.)
+  if (opts.help) return opts;
+
   if (!SCENARIOS.has(opts.scenario)) {
     throw new Error(`Invalid --scenario ${opts.scenario}; expected one of ${[...SCENARIOS].join(", ")}`);
   }

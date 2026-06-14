@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { closeSync, existsSync, mkdirSync, openSync, readFileSync, realpathSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { PendingEntry } from "./pending-reader";
 import type { AgentName } from "./types";
@@ -55,6 +55,12 @@ const DEFAULT_RETRY_MS = 5_000;
 const DEFAULT_CONFIRM_TIMEOUT_MS = 60_000;
 const DEFAULT_MAX_ATTEMPTS = 5;
 const DEFAULT_STALE_CLAIM_TTL_SEC = 300;
+// consumed/ markers are idempotency tombstones: they keep the SAME pending
+// (identity = agent+session+cwd+contentHash) from being re-injected after a
+// confirmed resume. A new degrade rewrites the guard pending with a fresh
+// contentHash, so a marker is moot once superseded — 7 days is far beyond any
+// plausible pending lifetime yet bounds unbounded growth.
+const DEFAULT_CONSUMED_TTL_SEC = 7 * 24 * 3600;
 
 function finitePositive(value: number | undefined, fallback: number): number {
   return Number.isFinite(value) && value! > 0 ? Math.floor(value!) : fallback;
@@ -327,17 +333,56 @@ function readClaimedAt(path: string): number | null {
   }
 }
 
+/**
+ * Best-effort GC of stale resume idempotency artifacts: removes `<dir>/*.json`
+ * whose `tsField` timestamp (epoch seconds) is older than `ttlSec`. Unreadable /
+ * corrupt / timestamp-less files are LEFT untouched (never aggressively delete
+ * what we can't reason about). Called opportunistically on each claim attempt —
+ * claims happen only on budget recovery, so this keeps `consumed/` and orphaned
+ * `claims/` from growing without bound on a long-lived daemon, with no extra
+ * timer or startup wiring.
+ */
+function pruneStaleResumeArtifacts(
+  dir: string,
+  tsField: string,
+  ttlSec: number,
+  nowSec: number,
+  log?: (message: string) => void,
+): void {
+  let names: string[];
+  try {
+    names = readdirSync(dir);
+  } catch {
+    return; // dir absent yet — nothing to prune
+  }
+  for (const name of names) {
+    if (!name.endsWith(".json")) continue;
+    const p = join(dir, name);
+    try {
+      const parsed = JSON.parse(readFileSync(p, "utf-8"));
+      const ts = parsed?.[tsField];
+      if (typeof ts === "number" && Number.isFinite(ts) && nowSec - ts > ttlSec) {
+        unlinkIfExists(p);
+      }
+    } catch (error) {
+      log?.(`resume artifact prune skipped ${p}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+}
+
 export function tryClaimPendingResume(opts: {
   stateDir: string;
   agent: AgentName;
   pending: PendingEntry;
   checkpointPath: string;
   claimTtlSec?: number;
+  consumedTtlSec?: number;
   now?: () => number;
   log?: (message: string) => void;
 }): ResumeClaimResult {
   const now = opts.now ?? (() => Math.floor(Date.now() / 1000));
   const claimTtlSec = finitePositive(opts.claimTtlSec, DEFAULT_STALE_CLAIM_TTL_SEC);
+  const consumedTtlSec = finitePositive(opts.consumedTtlSec, DEFAULT_CONSUMED_TTL_SEC);
   const cwd = realpathOrRaw(opts.pending.cwd);
   const sourcePath = opts.pending.sourcePath ?? "";
   const contentHash = opts.pending.contentHash ?? "";
@@ -354,8 +399,14 @@ export function tryClaimPendingResume(opts: {
   mkdirSync(claimsDir, { recursive: true });
   mkdirSync(consumedDir, { recursive: true });
 
-  if (existsSync(consumedPath)) return { ok: false, reason: "consumed" };
   const nowSec = now();
+  // GC stale idempotency artifacts first so a long-lived daemon's consumed/ and
+  // orphaned claims/ stay bounded. Uses the same claimTtlSec the per-identity
+  // stale-claim reclaim below already trusts, so the risk profile is unchanged.
+  pruneStaleResumeArtifacts(consumedDir, "consumed_at", consumedTtlSec, nowSec, opts.log);
+  pruneStaleResumeArtifacts(claimsDir, "claimed_at", claimTtlSec, nowSec, opts.log);
+
+  if (existsSync(consumedPath)) return { ok: false, reason: "consumed" };
 
   if (existsSync(claimPath)) {
     const claimedAt = readClaimedAt(claimPath);

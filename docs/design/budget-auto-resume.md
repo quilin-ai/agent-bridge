@@ -104,3 +104,15 @@ budget 协调器（`budget-coordinator.ts` + `daemon.ts`）：
 - **bash↔TS 一致性**：`src/integration-test/health-check-resume-sentinel.test.ts` spawn 真实 `health-check.sh` + 真实 `writeResumeAckDegradedSentinel`，端到端钉死「TS 写 → bash 读」（resumeId 提取、charset guard、TTL 门、消费一次）。非 bash 平台（Windows）自动 skip。
 - **`ack_resume` 不做 token 闸门 = 有意为之**：`daemon.ts` 控制开关里 `ack_resume` 与 `status`/`probe_incumbent` 同级、均不过 `validateClaudeClientIdentity`；只有消息注入路径 `claude_to_codex` 是特权。边界 = localhost + Origin/CSWSH 守卫；`ack_resume` 是纯控制面信号、非注入，符合既有信任模型。最坏情形仅「本地进程在 ack 窗口内猜中低熵 resumeId、压掉一次自动续接」，可手动续，影响有界。
 - **Codex 注入 confirm 时序（PR3）**：`ResumeInjectionQueue.onBridgeTurnStarted` 在确认后调 `tryInjectNext()`——此刻 Codex 刚开新 turn，可能与之竞争（codex-rs 不保证 turn/start 响应早于 turn/started 通知）。**保留为自纠正**而非改 drain-only：单飞门挡并发、busy→null→retry 不丢续接、且恢复流每侧至多 1 个 pending。Option B（仅 onTurnDrained 注入）更紧但未采纳——`turnAborted` 目前不 drain，drain-only 会在起的 turn 中止时卡住下一个 pending。待 PR5 probe 实测 codex-rs 时序后再定（采 Option B 需同时给 turnAborted 补 drain）。
+
+## 9. 续接幂等契约 + 状态生命周期（backlog 清理，2026-06-14）
+
+**幂等身份（R6 atomic claim）**：续接注入的去重身份 = `sha256(agent \0 sessionId \0 realpath(cwd) \0 contentHash)`（`tryClaimPendingResume`）。`contentHash` 取自 guard pending 文件内容——guard 每次降级用新内容重写 pending → 新 contentHash → 新身份。
+
+**落盘位置（重要）**：`claims/` 与 `consumed/` 写在 **guard 共享状态目录** `budgetGuardStateDir()` = `$BUDGET_STATE_DIR ?? ~/.budget-guard`（`daemon.ts` 调 `tryClaimPendingResume({ stateDir: budgetGuardStateDir() })`），**全机所有 pair 共享同一目录**——隔离靠**文件名 = identity sha256**（不是 per-pair 子目录）。唯一 per-pair 的是降级 sentinel `resume-ack-degraded.json`（写在 AgentBridge per-pair state dir）。
+- `~/.budget-guard/claims/<identity>.json`：**在途锁**（`claimed_at`，秒）。`writeJsonWx`（`O_EXCL`）保证跨进程/跨重启同一身份只有一个在途注入；`consume()` 成功即删，`release()` 在 abandon/dedup/stop 删。超过 `claimTtlSec`（默认 300s）的为 stale 可回收（进程死了没 release 的孤儿）。
+- `~/.budget-guard/consumed/<identity>.json`：**幂等墓碑**（`consumed_at`，秒）。确认续接后写，挡住同一 pending 再次注入。**必须跨重启/跨 kill 存活**——否则 `abg kill` + 重开会把升级/重启前已消费的续接重新注入。
+
+**状态 GC / 清理**：
+- `tryClaimPendingResume` 每次（仅预算恢复时触发，频率极低）顺手 prune：`consumed/` 超 `DEFAULT_CONSUMED_TTL_SEC`（默认 **7 天**，远超任何 pending 相关期；daemon 不传 `consumedTtlSec` 故用此默认）+ `claims/` 超 `claimTtlSec` 的孤儿 → 长寿 daemon 不会无限增长。注意 daemon 传的 `claimTtlSec = resumeClaimTtlSec()`（默认时序下 ≈ **320s** = ⌈(60000×5 + 5000×4)/1000⌉，**非** `DEFAULT_STALE_CLAIM_TTL_SEC=300` 默认），与同身份 stale-claim reclaim 用同一 TTL，故 ≤320s 的在途 claim 永不被误扫，只回收真孤儿。损坏 / 无时间戳 / 非 `.json` 文件一律不动（不激进删——绝不误删幂等墓碑）。
+- **`abg kill` 有意 NOT 清 `claims/`/`consumed/`**：① 它们在**共享** `~/.budget-guard`，per-pair kill 盲删会误伤其它在跑 pair 的墓碑；② `consumed/` 是**幂等墓碑，本就该跨 kill 存活**（删了会重注入已消费续接）；③ `claims/` 孤儿由上面的 TTL prune 自动回收。故无界增长问题已被 TTL prune 解决，kill 不需也不应动它们。降级 sentinel 是 per-pair 且有 24h TTL（见 §8），kill 也不删——保留跨会话续接连续性，陈旧由 TTL 兜底。

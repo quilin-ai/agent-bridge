@@ -116,6 +116,38 @@ describe("ResumeInjectionQueue", () => {
     expect(released).toEqual(["claim-dedup"]);
   });
 
+  test("dedup still drops the duplicate (and does not throw) when its claim.release throws", () => {
+    const logs: string[] = [];
+    const queue = new ResumeInjectionQueue({
+      inject: () => null,
+      scheduler: new FakeScheduler(),
+      retryMs: 5_000,
+      confirmTimeoutMs: 60_000,
+      maxAttempts: 2,
+      log: (m) => logs.push(m),
+    });
+
+    queue.enqueue({ resumeId: "rid-dup", prompt: "first" });
+    expect(() =>
+      queue.enqueue({
+        resumeId: "rid-dup",
+        prompt: "second",
+        claim: {
+          identity: "boom",
+          claimPath: "/tmp/boom.json",
+          consumedPath: "/tmp/boom-consumed.json",
+          consume: () => {},
+          release: () => {
+            throw new Error("release boom");
+          },
+        },
+      }),
+    ).not.toThrow();
+
+    expect(queue.size).toBe(1); // duplicate never added
+    expect(logs.some((m) => m.includes("release failed") && m.includes("dedup"))).toBe(true);
+  });
+
   test("bridgeTurnStarted confirms the matching injection once and consumes the claim", () => {
     const scheduler = new FakeScheduler();
     const consumed: string[] = [];
@@ -575,6 +607,134 @@ describe("tryClaimPendingResume", () => {
       if (!second.ok) throw new Error("expected stale claim recovery");
       expect(second.claim.identity).toBe(first.claim.identity);
       expect(readFileSync(second.claim.claimPath, "utf-8")).toContain("1700000011");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("prunes a consumed tombstone older than consumedTtlSec so the same pending can resume again", () => {
+    const root = mkdtempSync(join(tmpdir(), "abg-resume-consumed-prune-"));
+    const project = join(root, "project");
+    mkdirSync(project, { recursive: true });
+    try {
+      const pending = entry({ cwd: project, sessionId: "sess-cprune", contentHash: "hash-cprune" });
+      const checkpointPath = join(project, ".agent", "checkpoint.md");
+      // Claim + consume at t0 → writes a consumed tombstone (consumed_at = 1_700_000_000).
+      const first = tryClaimPendingResume({
+        stateDir: root,
+        agent: "codex",
+        pending,
+        checkpointPath,
+        now: () => 1_700_000_000,
+      });
+      expect(first.ok).toBe(true);
+      if (!first.ok) throw new Error("expected claim");
+      first.claim.consume();
+      expect(existsSync(first.claim.consumedPath)).toBe(true);
+
+      // Within consumedTtlSec the tombstone still blocks re-claim.
+      const blocked = tryClaimPendingResume({
+        stateDir: root,
+        agent: "codex",
+        pending,
+        checkpointPath,
+        consumedTtlSec: 3600,
+        now: () => 1_700_000_100,
+      });
+      expect(blocked.ok).toBe(false);
+      if (blocked.ok) throw new Error("expected consumed block");
+      expect(blocked.reason).toBe("consumed");
+      expect(existsSync(first.claim.consumedPath)).toBe(true);
+
+      // Exactly AT the TTL boundary (age === consumedTtlSec) the strict `>` keeps it.
+      const boundary = tryClaimPendingResume({
+        stateDir: root,
+        agent: "codex",
+        pending,
+        checkpointPath,
+        consumedTtlSec: 3600,
+        now: () => 1_700_000_000 + 3600,
+      });
+      expect(boundary.ok).toBe(false);
+      if (boundary.ok) throw new Error("expected consumed block at exact TTL boundary");
+      expect(boundary.reason).toBe("consumed");
+      expect(existsSync(first.claim.consumedPath)).toBe(true);
+
+      // Past consumedTtlSec the tombstone is pruned → the same pending can resume.
+      const reclaim = tryClaimPendingResume({
+        stateDir: root,
+        agent: "codex",
+        pending,
+        checkpointPath,
+        consumedTtlSec: 3600,
+        now: () => 1_700_000_000 + 3601,
+      });
+      expect(reclaim.ok).toBe(true);
+      if (!reclaim.ok) throw new Error("expected reclaim after consumed prune");
+      expect(reclaim.claim.identity).toBe(first.claim.identity);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("prunes orphaned claims from OTHER identities on the next claim attempt", () => {
+    const root = mkdtempSync(join(tmpdir(), "abg-resume-orphan-prune-"));
+    const project = join(root, "project");
+    const claimsDir = join(root, "claims");
+    mkdirSync(project, { recursive: true });
+    mkdirSync(claimsDir, { recursive: true });
+    // An orphaned claim from a crashed claimant of a DIFFERENT identity, stale.
+    const orphan = join(claimsDir, "deadbeefdeadbeef.json");
+    writeFileSync(orphan, JSON.stringify({ identity: "deadbeefdeadbeef", claimed_at: 1_700_000_000 }), "utf-8");
+    try {
+      const pending = entry({ cwd: project, sessionId: "sess-oprune", contentHash: "hash-oprune" });
+      const res = tryClaimPendingResume({
+        stateDir: root,
+        agent: "codex",
+        pending,
+        checkpointPath: join(project, ".agent", "checkpoint.md"),
+        claimTtlSec: 10,
+        now: () => 1_700_000_100, // 100s later → orphan (>10s) pruned
+      });
+      expect(res.ok).toBe(true);
+      if (!res.ok) throw new Error("expected claim");
+      // The unrelated stale orphan was swept, not just our own identity.
+      expect(existsSync(orphan)).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("prune leaves corrupt / timestamp-less / non-json artifacts untouched (never aggressively delete)", () => {
+    const root = mkdtempSync(join(tmpdir(), "abg-resume-corrupt-keep-"));
+    const project = join(root, "project");
+    const consumedDir = join(root, "consumed");
+    mkdirSync(project, { recursive: true });
+    mkdirSync(consumedDir, { recursive: true });
+    const corruptJson = join(consumedDir, "corrupt.json");
+    const noTs = join(consumedDir, "no-ts.json");
+    const nonJson = join(consumedDir, "keep.txt");
+    writeFileSync(corruptJson, "not json at all", "utf-8");
+    writeFileSync(noTs, JSON.stringify({ identity: "no-ts" }), "utf-8"); // no consumed_at
+    writeFileSync(nonJson, "whatever", "utf-8");
+    try {
+      const pending = entry({ cwd: project, sessionId: "sess-corrupt", contentHash: "hash-corrupt" });
+      // Tiny TTL + far-future now: a parseable+timestamped tombstone WOULD be pruned
+      // here, so survival proves each file is kept by its own guard (corrupt JSON →
+      // catch; missing consumed_at → non-number; non-.json → skipped).
+      const res = tryClaimPendingResume({
+        stateDir: root,
+        agent: "codex",
+        pending,
+        checkpointPath: join(project, ".agent", "checkpoint.md"),
+        consumedTtlSec: 1,
+        now: () => 9_999_999_999,
+      });
+      expect(res.ok).toBe(true);
+      // §9 safety contract: never aggressively delete what we can't reason about.
+      expect(existsSync(corruptJson)).toBe(true);
+      expect(existsSync(noTs)).toBe(true);
+      expect(existsSync(nonJson)).toBe(true);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
