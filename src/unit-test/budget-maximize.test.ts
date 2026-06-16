@@ -43,6 +43,7 @@ const MAXIMIZE: BudgetConfig = {
     finishingHorizonMinutes: 30,
     resumeHysteresisPct: 5,
   },
+  allocation: { minRunwayRatio: 50, minRunwayGapHours: 2 },
 };
 
 /** Build a window resetting `tHours` from NOW, optionally with a guard burn rate. */

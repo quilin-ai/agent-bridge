@@ -1,6 +1,6 @@
 # Budget 策略 v3 设计稿 — 窗口利用率最大化 + 任务完整性保护
 
-> 状态：**v3.1 实施中**。Codex 对抗审 2026-06-11（4 REAL + 2 SUSPECT + 2 RECOMMEND 全采纳，Q1-Q10 共识）已落定为实施基线。**进度：P1（燃尽率展示 + Q7 doctor）已上线 master；P2（时间感知暂停线 / maximize）已实现并通过 cross-review（见 §6 P2 实现落点）；P3（三态闸门）/ P4（runway 分配判据）待实施。** 原稿基于 master dfc093b。
+> 状态：**v3.1 实施中**。Codex 对抗审 2026-06-11（4 REAL + 2 SUSPECT + 2 RECOMMEND 全采纳，Q1-Q10 共识）已落定为实施基线。**进度：P1（燃尽率展示 + Q7 doctor）已上线 master；P2（时间感知暂停线 / maximize）已实现并通过 cross-review（见 §6 P2 实现落点）；P4（runway 分配判据 + underutilization 加速建议）已实现并通过 cross-review（见 §6 P4 实现落点，分支 feat/budget-v3-p4-runway-allocation）；P3（三态闸门）待实施。** 原稿基于 master dfc093b。
 > 作者：Claude；评审：Codex（对抗审记录见 §8，开放问题共识见 §7）。
 
 > **v3.2 修订（2026-06-15，用户指令 + Codex 双方共识）—— 见下方 addendum**：删除 `conserve|maximize` 二选一，时间感知动态线成为**唯一默认策略**；`targetUtil` 97→**98**；外层 guard `BUDGET_HARD` 92→**99**（最后保险丝，bridge pacing 停 ~98 为主）；新增 guard `BUDGET_CHECKPOINT_LEAD≈95` 早写 checkpoint + provider rate-limit/429 也写 pending（强制停可恢复）。
@@ -438,7 +438,9 @@ interface BudgetConfig {
 - **测试要点**：admission-closed 下新 turn 拒 / steer 放 / wrap-up 配额内放、超额拒；running turn 不被打断、完成后才发 directive；closed 优先于 admission-closed；5h 重置后秒级回 open；协议兼容（旧 bridge 不带 wrapUp 字段 → 默认 false）；weekly runway 下限触发 admission（RECOMMEND-7）；closed 态 system-initiated checkpoint baton（REAL-2：每窗口恰好 1 次、`turnPhase=idle` 前提、放行记日志、用过即拒）；wrap-up/baton 配额持久化跨 daemon 重启（Q9 共识，resetEpoch 跳变清零与 R6 抖动护栏共存）。
 - **风险**：中。涉及协议与注入口；wrap-up 配额防后门是验收重点。
 
-### P4 — 分配指令改剩余工作时间判据 — ❑ 待实施（v3.2 refreshed 2026-06-16）
+### P4 — 分配指令改剩余工作时间判据 — ✅ 已实施（分支 feat/budget-v3-p4-runway-allocation；v3.2 refreshed 2026-06-16）
+
+> **实现落点**：`allocationDrift`/`runwayBalance`/`underutilizationState`/`adviceEligible` 落在 `budget-state.ts`（runway 由 coordinator 注入 `computeBudgetState` 防环）；结构化 `dynamicWindowVerdict` 在 `budget-decision.ts`（will-not-fill = `projectedAtReset ≤ targetUtil`，不用 effectiveDynamicLine）；账号级 cooldown 落盘新模块 `advice-cooldown.ts`（coordinator 在 `system_budget_underutilized` 发射前 gate）；config 新增 `allocation.{minRunwayRatio=50,minRunwayGapHours=2}`。退役 `parallelState`（`parallelRecommended` 恒 false 保兼容），新增 phase `underutilized`。不变量⑥ 由 `adviceEligible`（gate open + 双侧 decision-grade + 非 rateLimited）本地强制。验收①-⑧ 全覆盖于 `budget-allocation.test.ts`/`advice-cooldown.test.ts`/`budget-coordinator.test.ts`/`config-service.test.ts`。经 Codex 跨引擎 sign-off + 多轮 cross-review（含 6 维对抗式 Workflow）0 真实 issue。
 
 > **基线声明**：P4 一律以 **§0 v3.2 addendum** 为准 —— 唯一策略（时间感知动态线，无 conserve/maximize 选择）、`targetUtil=98`、外层 guard `BUDGET_HARD=99`、`pauseAt(90)`/`resumeBelow(30)` 已是「无 burn 数据兜底线」。§3.1/§4/§7-Q7 等存档段里的 `strategy/conserve/97/92` 是 v3.2 前原值，**不要据此实现**。
 

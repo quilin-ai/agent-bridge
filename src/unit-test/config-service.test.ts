@@ -392,6 +392,7 @@ describe("ConfigService — budget section", () => {
         eco: { effort: "low" },
       },
       maximize: { targetUtil: 98, reserveSlopePctPerHour: 0.4, reserveMaxPct: 7, finishingHorizonMinutes: 30, resumeHysteresisPct: 5 },
+      allocation: { minRunwayRatio: 50, minRunwayGapHours: 2 },
     });
   });
 
@@ -445,6 +446,7 @@ describe("ConfigService — budget section", () => {
       },
       // v3 P1 keys absent in the raw file normalize to defaults.
       maximize: { targetUtil: 98, reserveSlopePctPerHour: 0.4, reserveMaxPct: 7, finishingHorizonMinutes: 30, resumeHysteresisPct: 5 },
+      allocation: { minRunwayRatio: 50, minRunwayGapHours: 2 },
     });
   });
 
@@ -607,6 +609,7 @@ describe("applyBudgetEnvOverrides", () => {
       eco: { effort: "low" },
     },
     maximize: { targetUtil: 97, reserveSlopePctPerHour: 0.4, reserveMaxPct: 7, finishingHorizonMinutes: 30, resumeHysteresisPct: 5 },
+    allocation: { minRunwayRatio: 50, minRunwayGapHours: 2 },
   };
 
   test("env values override the base config", () => {
@@ -662,6 +665,7 @@ describe("applyBudgetEnvOverrides — boolean spellings", () => {
       eco: { effort: "low" },
     },
     maximize: { targetUtil: 97, reserveSlopePctPerHour: 0.4, reserveMaxPct: 7, finishingHorizonMinutes: 30, resumeHysteresisPct: 5 },
+    allocation: { minRunwayRatio: 50, minRunwayGapHours: 2 },
   };
 
   test('accepts "0"/"1" alongside "true"/"false"', () => {
@@ -757,6 +761,7 @@ describe("applyBudgetEnvOverrides — v3 P1 keys", () => {
       eco: { effort: "low" },
     },
     maximize: { targetUtil: 97, reserveSlopePctPerHour: 0.4, reserveMaxPct: 7, finishingHorizonMinutes: 30, resumeHysteresisPct: 5 },
+    allocation: { minRunwayRatio: 50, minRunwayGapHours: 2 },
   };
 
   test("v3 env keys leave the rest of the config untouched", () => {
@@ -865,5 +870,69 @@ describe("normalizeBudgetConfig — v3 P2 maximize block", () => {
   test("non-object maximize block fails loud as corrupt", () => {
     writeRawConfig({ budget: { maximize: 42 } });
     expect(new ConfigService(tempDir).load().state).toBe("corrupt");
+  });
+});
+
+describe("ConfigService — v3 P4 allocation block", () => {
+  let tempDir: string;
+  beforeEach(() => {
+    tempDir = mkdtempSync(join(tmpdir(), "abg-config-alloc-"));
+  });
+  afterEach(() => {
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+  function writeRawConfig(raw: unknown): void {
+    writeFileSync(join(tempDir, ".agentbridge", "config.json"), JSON.stringify(raw), "utf-8");
+    return;
+  }
+
+  test("defaults present when absent", () => {
+    expect(DEFAULT_CONFIG.budget.allocation).toEqual({ minRunwayRatio: 50, minRunwayGapHours: 2 });
+  });
+
+  test("custom in-range values are honored", () => {
+    mkdirSync(join(tempDir, ".agentbridge"), { recursive: true });
+    writeRawConfig({ budget: { allocation: { minRunwayRatio: 40, minRunwayGapHours: 5 } } });
+    const result = new ConfigService(tempDir).load();
+    expect(result.state).toBe("parsed");
+    if (result.state === "parsed") {
+      expect(result.config.budget.allocation).toEqual({ minRunwayRatio: 40, minRunwayGapHours: 5 });
+    }
+  });
+
+  test("one valid + one out-of-range key → ONLY the bad key resets (independent, no whole-block reset)", () => {
+    // A valid minRunwayRatio:40 must be KEPT while the out-of-range
+    // minRunwayGapHours:999 falls back to its default 2. If allocation were reset
+    // as a whole block, minRunwayRatio would wrongly become 50 — so keeping 40
+    // is what proves the per-key independence the name claims.
+    mkdirSync(join(tempDir, ".agentbridge"), { recursive: true });
+    writeRawConfig({ budget: { allocation: { minRunwayRatio: 40, minRunwayGapHours: 999 } } });
+    const result = new ConfigService(tempDir).load();
+    expect(result.state).toBe("parsed");
+    if (result.state === "parsed") {
+      expect(result.config.budget.allocation).toEqual({ minRunwayRatio: 40, minRunwayGapHours: 2 });
+    }
+  });
+
+  test("present-but-garbage numeric fails loud as corrupt", () => {
+    mkdirSync(join(tempDir, ".agentbridge"), { recursive: true });
+    writeRawConfig({ budget: { allocation: { minRunwayRatio: "ninety" } } });
+    const result = new ConfigService(tempDir).load();
+    expect(result.state).toBe("corrupt");
+    if (result.state === "corrupt") expect(result.reason).toContain("budget.allocation.minRunwayRatio");
+  });
+
+  test("non-object allocation block fails loud as corrupt", () => {
+    mkdirSync(join(tempDir, ".agentbridge"), { recursive: true });
+    writeRawConfig({ budget: { allocation: 42 } });
+    expect(new ConfigService(tempDir).load().state).toBe("corrupt");
+  });
+
+  test("env overrides allocation thresholds", () => {
+    const result = applyBudgetEnvOverrides(DEFAULT_CONFIG.budget, {
+      AGENTBRIDGE_BUDGET_MIN_RUNWAY_RATIO: "70",
+      AGENTBRIDGE_BUDGET_MIN_RUNWAY_GAP_HOURS: "4",
+    });
+    expect(result.allocation).toEqual({ minRunwayRatio: 70, minRunwayGapHours: 4 });
   });
 });

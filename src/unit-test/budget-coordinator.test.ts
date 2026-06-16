@@ -1,5 +1,9 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { BudgetCoordinator, nextBudgetPollDelayMs } from "../budget/budget-coordinator";
+import { AdviceCooldown } from "../budget/advice-cooldown";
 import type { ResumeSignals } from "../budget/budget-fingerprint";
 import type { AgentUsage, BudgetConfig } from "../budget/types";
 
@@ -22,6 +26,7 @@ const CONFIG: BudgetConfig = {
     eco: { effort: "low" },
   },
   maximize: { targetUtil: 97, reserveSlopePctPerHour: 0.4, reserveMaxPct: 7, finishingHorizonMinutes: 30, resumeHysteresisPct: 5 },
+  allocation: { minRunwayRatio: 50, minRunwayGapHours: 2 },
 };
 
 type FetchResult = { claude: AgentUsage | null; codex: AgentUsage | null } | null;
@@ -82,7 +87,11 @@ class FakeScheduler {
   }
 }
 
-function makeCoordinator(source: FakeSource, config: BudgetConfig = CONFIG) {
+function makeCoordinator(
+  source: FakeSource,
+  config: BudgetConfig = CONFIG,
+  adviceCooldown?: AdviceCooldown,
+) {
   const emitted: Array<{ id: string; content: string }> = [];
   const pauseChanges: boolean[] = [];
   const logs: string[] = [];
@@ -93,9 +102,19 @@ function makeCoordinator(source: FakeSource, config: BudgetConfig = CONFIG) {
     onPauseChange: (paused) => pauseChanges.push(paused),
     now: () => NOW,
     log: (message) => logs.push(message),
+    adviceCooldown,
   });
 
   return { coordinator, emitted, pauseChanges, logs };
+}
+
+/** Weekly window with a confident low burn rate → will-not-fill → underutilized. */
+function underutilizedUsage(): AgentUsage {
+  return usage({
+    gateUtil: 20,
+    warnUtil: 20,
+    weekly: { util: 20, resetEpoch: NOW + 500_000, burnRate: 0.1, burnConfident: true },
+  });
 }
 
 function readySignals(overrides: Partial<ResumeSignals> = {}): ResumeSignals {
@@ -1292,5 +1311,41 @@ describe("BudgetCoordinator — guard burn-field passthrough (v3 P1, layered ame
     const snapshot = coordinator.getSnapshot();
     expect(snapshot!.burnRate?.claude.fiveHour).toEqual({ pctPerHour: 1.2, confident: true });
     expect(snapshot!.runway?.claude).toBeNull();
+  });
+});
+
+describe("BudgetCoordinator — v3 P4 underutilization cooldown gate", () => {
+  let home: string;
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), "abg-coord-cooldown-"));
+  });
+  afterEach(() => {
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  test("emits system_budget_underutilized when the cooldown allows", async () => {
+    const source = new FakeSource([{ claude: underutilizedUsage(), codex: underutilizedUsage() }]);
+    const cooldown = new AdviceCooldown({ homeDir: home, cooldownSec: 1800 });
+    const { coordinator, emitted } = makeCoordinator(source, longPollConfig(), cooldown);
+    await coordinator.start();
+    coordinator.stop();
+
+    expect(coordinator.getSnapshot()!.phase).toBe("underutilized");
+    expect(emitted.some((e) => e.id.startsWith("system_budget_underutilized"))).toBe(true);
+  });
+
+  test("suppresses the emit when the cross-pair cooldown is already held", async () => {
+    // Another pair (same state dir) already emitted: pre-seed the cooldown.
+    new AdviceCooldown({ homeDir: home, cooldownSec: 1800 }).tryAcquire("underutilization", NOW);
+
+    const source = new FakeSource([{ claude: underutilizedUsage(), codex: underutilizedUsage() }]);
+    const cooldown = new AdviceCooldown({ homeDir: home, cooldownSec: 1800 });
+    const { coordinator, emitted } = makeCoordinator(source, longPollConfig(), cooldown);
+    await coordinator.start();
+    coordinator.stop();
+
+    // The phase is still computed (snapshot reflects it), but emission is gated.
+    expect(coordinator.getSnapshot()!.phase).toBe("underutilized");
+    expect(emitted.some((e) => e.id.startsWith("system_budget_underutilized"))).toBe(false);
   });
 });

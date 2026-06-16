@@ -14029,13 +14029,14 @@ function formatDynamicLineLine(snapshot) {
 var PHASE_LABELS = {
   normal: "normal\uFF08\u6B63\u5E38\uFF09",
   balance: "balance\uFF08\u9700\u5747\u8861\uFF09",
-  parallel: "parallel\uFF08\u5EFA\u8BAE\u5E76\u884C\u63D0\u901F\uFF09",
+  parallel: "parallel\uFF08\u5DF2\u9000\u5F79\uFF09",
+  underutilized: "underutilized\uFF08\u989D\u5EA6\u6B20\u8F7D\uFF0C\u5EFA\u8BAE\u63D0\u901F\uFF09",
   paused: "paused\uFF08\u9884\u7B97\u5E72\u9884\u4E2D\uFF09"
 };
 function renderBudgetSnapshot(snapshot, options = {}) {
   const guardHardPct = options.guardHardPct ?? resolveGuardHardHint();
   const lines = [];
-  lines.push(`\u3010\u9884\u7B97\u5FEB\u7167 \xB7 \u8D26\u53F7\u7EA7\u3011\u9636\u6BB5\uFF1A${PHASE_LABELS[snapshot.phase]} \xB7 \u66F4\u65B0\u4E8E ${formatEpoch(snapshot.updatedAt)}`);
+  lines.push(`\u3010\u9884\u7B97\u5FEB\u7167 \xB7 \u8D26\u53F7\u7EA7\u3011\u9636\u6BB5\uFF1A${PHASE_LABELS[snapshot.phase] ?? snapshot.phase} \xB7 \u66F4\u65B0\u4E8E ${formatEpoch(snapshot.updatedAt)}`);
   lines.push(formatAgent("Claude", snapshot.claude, snapshot.updatedAt));
   lines.push(formatAgent("Codex", snapshot.codex, snapshot.updatedAt));
   if (snapshot.burnRate) {
@@ -14596,10 +14597,10 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.16", "0.0.0-source"),
-  commit: defineString("9861512", "source"),
+  commit: defineString("ad365c0", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION),
-  codeHash: defineString("0c4f360df15e", "source")
+  codeHash: defineString("050e098bfb0c", "source")
 });
 function sameRuntimeContract(a, b) {
   if (!a || !b)
@@ -15640,6 +15641,10 @@ var DEFAULT_BUDGET_CONFIG = {
     reserveMaxPct: 7,
     finishingHorizonMinutes: 30,
     resumeHysteresisPct: 5
+  },
+  allocation: {
+    minRunwayRatio: 50,
+    minRunwayGapHours: 2
   }
 };
 var DEFAULT_CONFIG = {
@@ -15710,6 +15715,17 @@ function findShapeViolation(raw) {
         }
       }
     }
+    if ("allocation" in budget) {
+      const allocation = budget.allocation;
+      if (!isRecord(allocation)) {
+        return "budget.allocation is present but not an object";
+      }
+      for (const key of ["minRunwayRatio", "minRunwayGapHours"]) {
+        if (key in allocation && !isCoercibleNumber(allocation[key])) {
+          return `budget.allocation.${key} is present but not a number`;
+        }
+      }
+    }
   }
   return null;
 }
@@ -15717,7 +15733,7 @@ function hasCustomDecisionValues(config2) {
   const d = DEFAULT_CONFIG;
   const b = config2.budget;
   const db = d.budget;
-  return config2.idleShutdownSeconds !== d.idleShutdownSeconds || config2.turnCoordination.attentionWindowSeconds !== d.turnCoordination.attentionWindowSeconds || config2.codex.appPort !== d.codex.appPort || config2.codex.proxyPort !== d.codex.proxyPort || b.enabled !== db.enabled || b.pollSeconds !== db.pollSeconds || b.pauseAt !== db.pauseAt || b.resumeBelow !== db.resumeBelow || b.syncDriftPct !== db.syncDriftPct || b.parallel.minRemainingPct !== db.parallel.minRemainingPct || b.parallel.timeWindowSec !== db.parallel.timeWindowSec || b.codexTierControl !== db.codexTierControl || b.maximize.targetUtil !== db.maximize.targetUtil || b.maximize.reserveSlopePctPerHour !== db.maximize.reserveSlopePctPerHour || b.maximize.reserveMaxPct !== db.maximize.reserveMaxPct || b.maximize.finishingHorizonMinutes !== db.maximize.finishingHorizonMinutes || b.maximize.resumeHysteresisPct !== db.maximize.resumeHysteresisPct;
+  return config2.idleShutdownSeconds !== d.idleShutdownSeconds || config2.turnCoordination.attentionWindowSeconds !== d.turnCoordination.attentionWindowSeconds || config2.codex.appPort !== d.codex.appPort || config2.codex.proxyPort !== d.codex.proxyPort || b.enabled !== db.enabled || b.pollSeconds !== db.pollSeconds || b.pauseAt !== db.pauseAt || b.resumeBelow !== db.resumeBelow || b.syncDriftPct !== db.syncDriftPct || b.parallel.minRemainingPct !== db.parallel.minRemainingPct || b.parallel.timeWindowSec !== db.parallel.timeWindowSec || b.codexTierControl !== db.codexTierControl || b.maximize.targetUtil !== db.maximize.targetUtil || b.maximize.reserveSlopePctPerHour !== db.maximize.reserveSlopePctPerHour || b.maximize.reserveMaxPct !== db.maximize.reserveMaxPct || b.maximize.finishingHorizonMinutes !== db.maximize.finishingHorizonMinutes || b.maximize.resumeHysteresisPct !== db.maximize.resumeHysteresisPct || b.allocation.minRunwayRatio !== db.allocation.minRunwayRatio || b.allocation.minRunwayGapHours !== db.allocation.minRunwayGapHours;
 }
 function normalizeInteger(value, fallback) {
   if (typeof value === "number" && Number.isFinite(value))
@@ -15763,6 +15779,13 @@ function normalizeMaximizeConfig(raw, pauseAt, fallback = DEFAULT_BUDGET_CONFIG.
     return { ...DEFAULT_BUDGET_CONFIG.maximize };
   }
   return normalized;
+}
+function normalizeAllocationConfig(raw, fallback = DEFAULT_BUDGET_CONFIG.allocation) {
+  const a = isRecord(raw) ? raw : {};
+  return {
+    minRunwayRatio: normalizeBoundedInteger(a.minRunwayRatio, fallback.minRunwayRatio, 10, 100),
+    minRunwayGapHours: normalizeBoundedInteger(a.minRunwayGapHours, fallback.minRunwayGapHours, 1, 168)
+  };
 }
 function normalizeBoolean(value, fallback) {
   if (typeof value === "boolean")
@@ -15813,7 +15836,8 @@ function normalizeBudgetConfig(raw, fallback = DEFAULT_BUDGET_CONFIG) {
     },
     codexTierControl: normalizeBoolean(budget.codexTierControl, fallback.codexTierControl) && codexTiers.full !== null,
     codexTiers,
-    maximize: normalizeMaximizeConfig(budget.maximize, pauseAt, fallback.maximize)
+    maximize: normalizeMaximizeConfig(budget.maximize, pauseAt, fallback.maximize),
+    allocation: normalizeAllocationConfig(budget.allocation, fallback.allocation)
   };
 }
 function normalizeConfig(raw) {

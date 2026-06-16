@@ -1,5 +1,8 @@
+import { homedir } from "node:os";
 import { computeBudgetState, renderBudgetInterventionDirective } from "./budget-state";
+import type { RunwayInput } from "./budget-state";
 import { effectiveDynamicLine } from "./budget-decision";
+import { AdviceCooldown, resolveAdviceCooldownSec } from "./advice-cooldown";
 import {
   classifyPoll,
   computeResumeCandidate,
@@ -75,6 +78,12 @@ export interface BudgetCoordinatorOptions {
    * this value (no emit/onPauseChange/inject) — that is PR3/PR4.
    */
   resumeSignals?: () => ResumeSignals;
+  /**
+   * v3 P4: cross-pair cooldown for the underutilization advice. Injected so tests
+   * isolate to a temp dir; defaults to a real one rooted at the account-level
+   * guard state dir (BUDGET_STATE_DIR ?? ~/.budget-guard), shared across pairs.
+   */
+  adviceCooldown?: AdviceCooldown;
 }
 
 const AGENT_LABEL: Record<AgentName, string> = {
@@ -162,6 +171,7 @@ export class BudgetCoordinator {
   private readonly log: (message: string) => void;
   private readonly onResume: (side: AgentName, directive: string, resumeId: string) => void;
   private readonly resumeSignals: (() => ResumeSignals) | null;
+  private readonly adviceCooldown: AdviceCooldown;
 
   private timer: BudgetPollTimer | null = null;
   private running = false;
@@ -190,6 +200,13 @@ export class BudgetCoordinator {
     this.log = options.log ?? (() => {});
     this.onResume = options.onResume ?? (() => {});
     this.resumeSignals = options.resumeSignals ?? null;
+    this.adviceCooldown =
+      options.adviceCooldown ??
+      new AdviceCooldown({
+        homeDir: homedir(),
+        cooldownSec: resolveAdviceCooldownSec(),
+        log: this.log,
+      });
   }
 
   async start(): Promise<void> {
@@ -317,10 +334,19 @@ export class BudgetCoordinator {
       return;
     }
 
-    const state = computeBudgetState(usage.claude, usage.codex, this.config, this.now());
+    // v3 P4: compute runway ONCE here (from the guard's verbatim probe fields)
+    // and inject it into both the decision (computeBudgetState — breaks the
+    // budget-state → burn-view import cycle) and the snapshot, so the two never
+    // diverge on a different now().
+    const now = this.now();
+    const runway: RunwayInput = {
+      claude: agentRunway(usage.claude, now),
+      codex: agentRunway(usage.codex, now),
+    };
+    const state = computeBudgetState(usage.claude, usage.codex, this.config, now, runway);
     this.updatePendingOverrides(state.effort.codexTier);
     this.applyState(state);
-    this.setSnapshot(this.toSnapshot(state));
+    this.setSnapshot(this.toSnapshot(state, runway));
   }
 
   private setSnapshot(snapshot: BudgetSnapshot | null): void {
@@ -374,9 +400,28 @@ export class BudgetCoordinator {
         return;
       }
       case "advise": {
-        const prefix = effect.phase === "balance" ? "system_budget_balance" : "system_budget_parallel";
         // state.directiveToClaude is non-null whenever the reducer emits advise.
-        this.emitDirective(prefix, state.directiveToClaude!);
+        if (effect.phase === "underutilized") {
+          // v3 P4: the accelerate/underutilization advice is account-level — gate
+          // EMISSION behind the cross-pair disk cooldown so multiple daemons do
+          // not collectively nag "split more parallel work" (R8). The in-memory
+          // fingerprint already deduped within this coordinator; the cooldown is
+          // the cross-pair brake. Denied → emit nothing this poll.
+          //
+          // INTENTIONAL: a denied acquire does not retry later in the same
+          // episode. classifyPoll only emits `advise` when the fingerprint
+          // CHANGES; the first underutilized poll already advanced it, so a
+          // denial here leaves the losing pair silent for this episode (the pair
+          // that won the cooldown emits once). That is the design intent —
+          // underutilization is a one-shot "you could parallelize more" nudge,
+          // not a repeating alarm — and is the collective-nagging suppression R8
+          // asks for.
+          if (!this.adviceCooldown.tryAcquire("underutilization", state.now)) return;
+          this.emitDirective("system_budget_underutilized", state.directiveToClaude!);
+          return;
+        }
+        // The only other advise phase is balance (parallel is retired).
+        this.emitDirective("system_budget_balance", state.directiveToClaude!);
         return;
       }
       case "none":
@@ -482,7 +527,7 @@ export class BudgetCoordinator {
     ].join("\n");
   }
 
-  private toSnapshot(state: BudgetState): BudgetSnapshot {
+  private toSnapshot(state: BudgetState, runway: RunwayInput): BudgetSnapshot {
     const paused = this.isPaused();
     return {
       phase: paused ? "paused" : state.phase,
@@ -498,7 +543,7 @@ export class BudgetCoordinator {
       parallelRecommended: paused ? false : state.parallel.recommended,
       codexTier: state.effort.codexTier,
       claudeAdvice: state.effort.claudeAdvice,
-      ...this.burnRateSnapshotFields(state),
+      ...this.burnRateSnapshotFields(state, runway),
       ...this.dynamicLineSnapshotFields(state),
     };
   }
@@ -525,14 +570,13 @@ export class BudgetCoordinator {
    * carries no burn signal (old guard / not enough samples), keeping the
    * legacy snapshot shape for old consumers.
    */
-  private burnRateSnapshotFields(state: BudgetState): Pick<BudgetSnapshot, "burnRate" | "runway"> | Record<never, never> {
+  private burnRateSnapshotFields(
+    state: BudgetState,
+    runway: RunwayInput,
+  ): Pick<BudgetSnapshot, "burnRate" | "runway"> | Record<never, never> {
     const rates = {
       claude: agentBurnRates(state.perAgent.claude),
       codex: agentBurnRates(state.perAgent.codex),
-    };
-    const runway = {
-      claude: agentRunway(state.perAgent.claude, state.now),
-      codex: agentRunway(state.perAgent.codex, state.now),
     };
     if (!hasAnyBurnSignal(rates, runway)) return {};
     return { burnRate: rates, runway };

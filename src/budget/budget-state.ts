@@ -1,6 +1,39 @@
 import { matchingGateReset } from "./budget-gate";
-import { agentShouldPause, isDecisionGrade, resumeBlockingEpochFor } from "./budget-decision";
-import type { AgentName, AgentUsage, BudgetConfig, BudgetState, CodexTier } from "./types";
+import {
+  agentShouldPause,
+  dynamicWindowVerdict,
+  isDecisionGrade,
+  resumeBlockingEpochFor,
+} from "./budget-decision";
+import type {
+  AgentName,
+  AgentUsage,
+  BudgetConfig,
+  BudgetState,
+  CodexTier,
+  RunwayEstimate,
+} from "./types";
+
+/**
+ * Per-agent runway passed INTO computeBudgetState (v3 P4). The coordinator
+ * computes these from the guard probe (burn-view `agentRunway`) and injects them
+ * here, so budget-state never imports burn-view — which would close an import
+ * cycle (burn-view → budget-state for isDecisionGrade). Both null on legacy
+ * callers / no burn data → the balance criterion falls back to warnUtil drift.
+ */
+export interface RunwayInput {
+  claude: RunwayEstimate | null;
+  codex: RunwayEstimate | null;
+}
+
+const NO_RUNWAY: RunwayInput = { claude: null, codex: null };
+
+/**
+ * Minimum projected waste (targetUtil − projectedAtReset, in percent) before the
+ * underutilization advice fires. A window projected at 97.5 vs a 98 target is
+ * barely underutilizing and not worth a nag; only flag a materially idle account.
+ */
+const UNDERUTILIZATION_MIN_WASTE_PCT = 10;
 
 // isDecisionGrade moved to budget-decision.ts (the strategy-aware decision
 // module needs it too); re-export keeps existing importers (budget-fingerprint,
@@ -80,28 +113,111 @@ function driftFor(
   };
 }
 
-function parallelState(
+/**
+ * v3 P4 (§3.4) runway-difference balance criterion. Returns the heavier/lighter
+ * pair ONLY when both gates trip: the shorter/longer ratio is below
+ * `minRunwayRatio` AND the absolute gap is at least `minRunwayGapHours`. The
+ * shorter-runway side is `heavier` (route work AWAY from it). `null` means
+ * balanced enough — no balance directive. Pure runway arithmetic; the guard's
+ * `seconds` are passed through verbatim (§3.3 #2: no burn-rate recomputation).
+ *
+ * Today's live case (Codex util high but near reset → runway truncated to ~6.5h,
+ * Claude ~9h) lands inside [50%, 2h] tolerance → balanced → NOT flagged, which
+ * is the whole point of moving off warnUtil.
+ */
+function runwayBalance(
+  claudeRunway: RunwayEstimate,
+  codexRunway: RunwayEstimate,
+  cfg: BudgetConfig,
+): { heavier: AgentName; lighter: AgentName } | null {
+  const ch = claudeRunway.seconds / 3600;
+  const xh = codexRunway.seconds / 3600;
+  const lo = Math.min(ch, xh);
+  const hi = Math.max(ch, xh);
+  // hi <= 0 (both depleted) is not an imbalance the balance lever can fix; the
+  // pause/gate layer owns that. Treat as balanced to avoid a divide-by-zero.
+  const ratioPct = hi <= 0 ? 100 : Math.round((100 * lo) / hi);
+  const gapHours = Math.abs(ch - xh);
+  if (ratioPct < cfg.allocation.minRunwayRatio && gapHours >= cfg.allocation.minRunwayGapHours) {
+    const shorter: AgentName = ch < xh ? "claude" : "codex";
+    return { heavier: shorter, lighter: shorter === "claude" ? "codex" : "claude" };
+  }
+  return null;
+}
+
+/** How the balance heavier/lighter pair was chosen — drives the directive text. */
+type AllocationBasis = "warn" | "runway";
+
+/**
+ * The balance routing decision. `drift.pct` is ALWAYS the warnUtil diff (stable
+ * display contract for `snapshot.driftPct` and the 漂移 readout); only
+ * heavier/lighter switch to the runway criterion when BOTH sides have a
+ * confident runway. Otherwise it is exactly the legacy `driftFor` (§3.4 #2/#3).
+ */
+function allocationDrift(
+  claude: AgentUsage | null,
+  codex: AgentUsage | null,
+  runway: RunwayInput,
+  cfg: BudgetConfig,
+): { drift: BudgetState["drift"]; basis: AllocationBasis } {
+  const warnDrift = driftFor(claude, codex, cfg);
+  if (!claude || !codex || !runway.claude || !runway.codex) {
+    return { drift: warnDrift, basis: "warn" };
+  }
+  const balance = runwayBalance(runway.claude, runway.codex, cfg);
+  return {
+    drift: {
+      pct: warnDrift.pct,
+      heavier: balance?.heavier ?? null,
+      lighter: balance?.lighter ?? null,
+    },
+    basis: "runway",
+  };
+}
+
+/** Format a duration in seconds as 「~X.Xh」 for the runway balance directive. */
+function runwayHoursText(runway: RunwayEstimate | null): string {
+  if (!runway) return "未知";
+  return `~${(runway.seconds / 3600).toFixed(1)}h`;
+}
+
+/**
+ * v3 P4 (§3.4) underutilization signal: the account will not use its WEEKLY
+ * quota before reset (the weekly window's `will-not-fill` verdict), with at
+ * least `UNDERUTILIZATION_MIN_WASTE_PCT` of headroom going to waste. Picks the
+ * side wasting the most. 5h underutilization is intentionally NOT a driver
+ * (Q3 consensus: display-only). Advisory-only; never gates.
+ */
+function underutilizationState(
   claude: AgentUsage | null,
   codex: AgentUsage | null,
   cfg: BudgetConfig,
   now: number,
-): BudgetState["parallel"] {
-  if (!claude || !codex) return { recommended: false, reason: null };
-  if (claude.remaining <= cfg.parallel.minRemainingPct || codex.remaining <= cfg.parallel.minRemainingPct) {
-    return { recommended: false, reason: null };
+): BudgetState["underutilization"] {
+  let top: { agent: AgentName; projected: number; waste: number; resetEpoch: number } | null = null;
+  for (const [agent, usage] of [["claude", claude], ["codex", codex]] as const) {
+    const weekly = usage?.weekly;
+    if (!weekly) continue;
+    const verdict = dynamicWindowVerdict(weekly, cfg, now);
+    if (verdict.kind !== "will-not-fill") continue;
+    // Round to 1 decimal before the threshold compare so a projected-at-reset
+    // float error (util + rate×tH) cannot drop a genuine 10.0% waste to
+    // 9.9999…% and silently skip the boundary case (display-only, never gates).
+    const waste = Math.round((cfg.maximize.targetUtil - verdict.projectedAtReset) * 10) / 10;
+    if (waste < UNDERUTILIZATION_MIN_WASTE_PCT) continue;
+    if (top === null || waste > top.waste) {
+      top = { agent, projected: verdict.projectedAtReset, waste, resetEpoch: weekly.resetEpoch };
+    }
   }
-  const claudeReset = claude.fiveHour?.resetEpoch ?? 0;
-  const codexReset = codex.fiveHour?.resetEpoch ?? 0;
-  if (claudeReset <= now || codexReset <= now) return { recommended: false, reason: null };
-
-  const nearestResetSec = Math.min(claudeReset - now, codexReset - now);
-  if (nearestResetSec >= cfg.parallel.timeWindowSec) return { recommended: false, reason: null };
-
-  const minutes = Math.ceil(nearestResetSec / 60);
-  return {
-    recommended: true,
-    reason: `双方剩余额度均高于 ${pct(cfg.parallel.minRemainingPct)}，最近 5h 桶约 ${minutes} 分钟后重置`,
-  };
+  if (top === null) return { recommended: false, reason: null };
+  const hoursToReset = Math.max(0, (top.resetEpoch - now) / 3600);
+  const reason = [
+    "【预算协调 · 账号级】额度将欠载，建议提高并行/委派密度。",
+    `${AGENT_LABEL[top.agent]} 按当前燃尽率周窗口刷新时只会用到 ~${pct(top.projected)}，` +
+      `距刷新还有 ~${hoursToReset.toFixed(1)}h —— 建议拆更多并行子任务/提高委派密度，` +
+      `否则约 ${pct(top.waste)} 周额度将作废。`,
+  ].join("\n");
+  return { recommended: true, reason };
 }
 
 export function renderBudgetInterventionDirective(
@@ -151,30 +267,24 @@ function balanceDirective(
   claude: AgentUsage,
   codex: AgentUsage,
   drift: BudgetState["drift"],
-  parallel: BudgetState["parallel"],
+  basis: AllocationBasis,
+  runway: RunwayInput,
 ): string {
   const heavier = drift.heavier ? AGENT_LABEL[drift.heavier] : "未知";
   const lighter = drift.lighter ? AGENT_LABEL[drift.lighter] : "未知";
-  const lines = [
+  if (basis === "runway") {
+    return [
+      "【预算协调 · 账号级】按剩余可工作时间需要均衡。",
+      `${usageSummary("claude", claude)}；${usageSummary("codex", codex)}。`,
+      `Claude 按当前燃尽率约可再工作 ${runwayHoursText(runway.claude)}、` +
+        `Codex ${runwayHoursText(runway.codex)}（窗口为约束）；` +
+        `runway 较短的一侧是 ${heavier}，请把后续可拆分任务优先派给 ${lighter}。`,
+    ].join("\n");
+  }
+  return [
     "【预算协调 · 账号级】检测到双方用量比例漂移。",
     `${usageSummary("claude", claude)}；${usageSummary("codex", codex)}。`,
     `${heavier} 比 ${lighter} 高 ${pct(Math.abs(drift.pct))}，请优先把后续可拆分任务分给 ${lighter}，直到 warnUtil 接近。`,
-  ];
-  if (parallel.recommended && parallel.reason) {
-    lines.push(`${parallel.reason}；可让 ${lighter} 承担更多并行子任务，兼顾均衡与提速。`);
-  }
-  return lines.join("\n");
-}
-
-function parallelDirective(
-  claude: AgentUsage,
-  codex: AgentUsage,
-  parallel: BudgetState["parallel"],
-): string {
-  return [
-    "【预算协调 · 账号级】当前额度富余且临近 5h 结算，建议动态并行。",
-    `${usageSummary("claude", claude)}；${usageSummary("codex", codex)}。`,
-    `${parallel.reason}；可以拆更多独立子任务并行推进。`,
   ].join("\n");
 }
 
@@ -201,14 +311,45 @@ export function computeBudgetState(
   codex: AgentUsage | null,
   cfg: BudgetConfig,
   now: number,
+  runway: RunwayInput = NO_RUNWAY,
 ): BudgetState {
   const triggers = [
     pauseTrigger("claude", claude, cfg, now),
     pauseTrigger("codex", codex, cfg, now),
   ].filter((trigger): trigger is PauseTrigger => trigger !== null);
   const paused = triggers.length > 0;
-  const drift = driftFor(claude, codex, cfg);
-  const parallel = paused ? { recommended: false, reason: null } : parallelState(claude, codex, cfg, now);
+  const { drift, basis } = allocationDrift(claude, codex, runway, cfg);
+  // v3 P4: the parallel directive is retired; underutilization advice replaces
+  // it. The field is kept (always false) so snapshot.parallelRecommended has a
+  // source for back-compat consumers.
+  const parallel = { recommended: false, reason: null };
+  // §3.4 invariant 6: balance / underutilization advice fires only when the gate
+  // is OPEN and NEITHER side is rate-limited. (The coordinator's phantom-hold
+  // already suppresses advise on non-decision-grade data; this adds the
+  // non-rate-limited guard and keeps the rendered phase honest — never advise
+  // toward an account whose probes are being rate-limited.) `drift` is still
+  // computed regardless so snapshot.driftPct stays the raw warnUtil readout.
+  const adviceEligible =
+    !paused &&
+    claude !== null &&
+    codex !== null &&
+    claude.rateLimitedUntil <= now &&
+    codex.rateLimitedUntil <= now &&
+    // H1: enforce "decision-grade(fresh)" LOCALLY too. The coordinator's
+    // classifyPoll phantom-hold already gates EMISSION on decision-grade, so
+    // this is not a send-path fix — it keeps the rendered snapshot.phase honest
+    // (no balance/underutilized label on stale data via get_budget / abg budget).
+    isDecisionGrade(claude, now) &&
+    isDecisionGrade(codex, now);
+  const balanceActive = adviceEligible && drift.heavier !== null && drift.lighter !== null;
+  // Compute underutilization only when it could actually become the phase (not
+  // paused, advice-eligible, and balance has not already claimed the advise
+  // slot) — keeps BudgetState internally consistent: no stale underutilization
+  // flag while phase is balance/paused.
+  const underutilization =
+    adviceEligible && !balanceActive
+      ? underutilizationState(claude, codex, cfg, now)
+      : { recommended: false, reason: null };
   const resetEpochs = {
     claude: matchingGateReset(claude),
     codex: matchingGateReset(codex),
@@ -217,8 +358,8 @@ export function computeBudgetState(
 
   let phase: BudgetState["phase"] = "normal";
   if (paused) phase = "paused";
-  else if (drift.heavier && drift.lighter) phase = "balance";
-  else if (parallel.recommended) phase = "parallel";
+  else if (balanceActive) phase = "balance";
+  else if (underutilization.recommended) phase = "underutilized";
 
   const pauseSide = !paused
     ? null
@@ -237,9 +378,9 @@ export function computeBudgetState(
       cfg,
     );
   } else if (phase === "balance" && claude && codex) {
-    directiveToClaude = balanceDirective(claude, codex, drift, parallel);
-  } else if (phase === "parallel" && claude && codex) {
-    directiveToClaude = parallelDirective(claude, codex, parallel);
+    directiveToClaude = balanceDirective(claude, codex, drift, basis, runway);
+  } else if (phase === "underutilized") {
+    directiveToClaude = underutilization.reason;
   }
 
   return {
@@ -256,6 +397,7 @@ export function computeBudgetState(
       resetEpochs,
     },
     parallel,
+    underutilization,
     effort: { claudeAdvice: claudeAdviceFor(claude, now), codexTier: codexTierFor(codex, now) },
     directiveToClaude,
   };

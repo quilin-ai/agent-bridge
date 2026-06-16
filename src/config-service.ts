@@ -1,7 +1,7 @@
 import { readFileSync, mkdirSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { atomicWriteJson } from "./atomic-json";
-import type { BudgetConfig, CodexTierMap, CodexTurnOverrides, MaximizeConfig } from "./budget/types";
+import type { AllocationConfig, BudgetConfig, CodexTierMap, CodexTurnOverrides, MaximizeConfig } from "./budget/types";
 
 /** Machine-readable project config schema. */
 export interface AgentBridgeConfig {
@@ -51,6 +51,14 @@ const DEFAULT_BUDGET_CONFIG: BudgetConfig = {
     reserveMaxPct: 7,
     finishingHorizonMinutes: 30,
     resumeHysteresisPct: 5,
+  },
+  // v3 P4 (§3.4): runway-difference balance double gate. A balance directive
+  // fires only when the shorter/longer runway ratio is below minRunwayRatio AND
+  // the gap is at least minRunwayGapHours — keeps the criterion from being
+  // over-sensitive (Codex acceptance). Advisory-only.
+  allocation: {
+    minRunwayRatio: 50,
+    minRunwayGapHours: 2,
   },
 };
 
@@ -195,6 +203,18 @@ function findShapeViolation(raw: Record<string, unknown>): string | null {
         }
       }
     }
+    if ("allocation" in budget) {
+      const allocation = budget.allocation;
+      if (!isRecord(allocation)) {
+        return "budget.allocation is present but not an object";
+      }
+      // Symmetric to budget.maximize: decision-grade numerics fail loud on garbage.
+      for (const key of ["minRunwayRatio", "minRunwayGapHours"] as const) {
+        if (key in allocation && !isCoercibleNumber(allocation[key])) {
+          return `budget.allocation.${key} is present but not a number`;
+        }
+      }
+    }
   }
   return null;
 }
@@ -229,7 +249,11 @@ function hasCustomDecisionValues(config: AgentBridgeConfig): boolean {
     b.maximize.reserveSlopePctPerHour !== db.maximize.reserveSlopePctPerHour ||
     b.maximize.reserveMaxPct !== db.maximize.reserveMaxPct ||
     b.maximize.finishingHorizonMinutes !== db.maximize.finishingHorizonMinutes ||
-    b.maximize.resumeHysteresisPct !== db.maximize.resumeHysteresisPct
+    b.maximize.resumeHysteresisPct !== db.maximize.resumeHysteresisPct ||
+    // v3 P4: allocation thresholds are decision-grade (they gate the balance
+    // directive), so a tuned value should report as "custom values in effect".
+    b.allocation.minRunwayRatio !== db.allocation.minRunwayRatio ||
+    b.allocation.minRunwayGapHours !== db.allocation.minRunwayGapHours
   );
 }
 
@@ -323,6 +347,22 @@ function normalizeMaximizeConfig(
     return { ...DEFAULT_BUDGET_CONFIG.maximize };
   }
   return normalized;
+}
+
+/**
+ * Normalize the v3 P4 allocation block. Both keys are integers, independently
+ * bounds-checked (out-of-range → fallback); there is no cross-field relation to
+ * enforce (unlike maximize's targetUtil > pauseAt), so no whole-block reset.
+ */
+function normalizeAllocationConfig(
+  raw: unknown,
+  fallback: AllocationConfig = DEFAULT_BUDGET_CONFIG.allocation,
+): AllocationConfig {
+  const a = isRecord(raw) ? raw : {};
+  return {
+    minRunwayRatio: normalizeBoundedInteger(a.minRunwayRatio, fallback.minRunwayRatio, 10, 100),
+    minRunwayGapHours: normalizeBoundedInteger(a.minRunwayGapHours, fallback.minRunwayGapHours, 1, 168),
+  };
 }
 
 function normalizeBoolean(value: unknown, fallback: boolean): boolean {
@@ -422,6 +462,7 @@ function normalizeBudgetConfig(
     // Pass the already-resolved pauseAt (post pauseAt<=resumeBelow reset) so the
     // targetUtil > pauseAt relation is checked against the effective floor.
     maximize: normalizeMaximizeConfig(budget.maximize, pauseAt, fallback.maximize),
+    allocation: normalizeAllocationConfig(budget.allocation, fallback.allocation),
   };
 }
 
@@ -458,6 +499,12 @@ export function applyBudgetEnvOverrides(
         env.AGENTBRIDGE_BUDGET_FINISHING_HORIZON_MINUTES ?? budget.maximize.finishingHorizonMinutes,
       resumeHysteresisPct:
         env.AGENTBRIDGE_BUDGET_RESUME_HYSTERESIS_PCT ?? budget.maximize.resumeHysteresisPct,
+    },
+    allocation: {
+      minRunwayRatio:
+        env.AGENTBRIDGE_BUDGET_MIN_RUNWAY_RATIO ?? budget.allocation.minRunwayRatio,
+      minRunwayGapHours:
+        env.AGENTBRIDGE_BUDGET_MIN_RUNWAY_GAP_HOURS ?? budget.allocation.minRunwayGapHours,
     },
   };
   return normalizeBudgetConfig(overlay, budget);

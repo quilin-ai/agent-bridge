@@ -219,7 +219,10 @@ function formatDynamicLineLine(snapshot: BudgetSnapshot): string | null {
 const PHASE_LABELS: Record<BudgetSnapshot["phase"], string> = {
   normal: "normal（正常）",
   balance: "balance（需均衡）",
-  parallel: "parallel（建议并行提速）",
+  // v3 P4: `parallel` is retired (never produced); kept for legacy snapshot
+  // deserialization. `underutilized` is the current advise phase.
+  parallel: "parallel（已退役）",
+  underutilized: "underutilized（额度欠载，建议提速）",
   // Side-neutral: the detail line below distinguishes handoff / codex-only / joint.
   paused: "paused（预算干预中）",
 };
@@ -231,7 +234,10 @@ export function renderBudgetSnapshot(
 ): string {
   const guardHardPct = options.guardHardPct ?? resolveGuardHardHint();
   const lines: string[] = [];
-  lines.push(`【预算快照 · 账号级】阶段：${PHASE_LABELS[snapshot.phase]} · 更新于 ${formatEpoch(snapshot.updatedAt)}`);
+  // `?? snapshot.phase` degrades an unknown phase (cross-version skew / a future
+  // phase a stale bundle has not learned) to its raw string instead of rendering
+  // "undefined".
+  lines.push(`【预算快照 · 账号级】阶段：${PHASE_LABELS[snapshot.phase] ?? snapshot.phase} · 更新于 ${formatEpoch(snapshot.updatedAt)}`);
   lines.push(formatAgent("Claude", snapshot.claude, snapshot.updatedAt));
   lines.push(formatAgent("Codex", snapshot.codex, snapshot.updatedAt));
 
