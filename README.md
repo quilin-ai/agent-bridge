@@ -327,7 +327,7 @@ The daemon's budget coordinator polls **both** agents' account-level 5h/weekly q
   - **Claude** — a channel push carrying a stable `resume_id`; Claude echoes it back via the `ack_resume` MCP tool. Unacked pushes retry with a fresh delivery id (stable `resume_id`); after retries are exhausted a `SessionStart` degrade-sentinel surfaces a recovery hint the next session reads.
   - **Idempotency** — per-pending claim/consumed tombstones (a sha256 of agent + session + cwd + content hash) ensure a given resume is injected at most once, even across daemon restarts; stale tombstones are TTL-pruned.
 
-Coordination directives the bridge may emit while a task runs: **balance** (route more work to the lighter side), **parallel** (split more subtasks when quota is plentiful near a reset), and **pause / handoff / resume**.
+Coordination directives the bridge may emit while a task runs: **balance** (route more work to the side with more runway / remaining work-time), **underutilized** (the account will not use its weekly quota before reset — split more parallel subtasks / raise delegation density), and **pause / handoff / resume**.
 
 > Slowdown-line + auto-resume are an opt-in, companion-guard feature. The Claude-side resume is best-effort (ack + retry + a SessionStart fallback): channel pushes to a fully idle session have known upstream variability, so the bridge only marks a side resumed once it sees a real `ack_resume`.
 

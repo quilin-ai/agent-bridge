@@ -87,7 +87,10 @@ export interface AgentUsage {
 
 export type AgentName = "claude" | "codex";
 
-export type BudgetPhase = "normal" | "balance" | "parallel" | "paused";
+// v3 P4: `parallel` is retired as a PRODUCED phase (the underutilization advice
+// replaces it), but the literal is kept in the union so legacy daemon snapshots
+// still deserialize. `underutilized` is the new advise phase.
+export type BudgetPhase = "normal" | "balance" | "parallel" | "underutilized" | "paused";
 
 export type CodexTier = "full" | "balanced" | "eco";
 
@@ -179,6 +182,22 @@ export interface BudgetConfig {
    * is silently ignored — normalizeBudgetConfig only reads known keys).
    */
   maximize: MaximizeConfig;
+  /**
+   * v3 P4 (§3.4): thresholds for the runway-difference balance criterion. A
+   * balance directive fires only when BOTH sides have a confident runway AND the
+   * shorter/longer ratio is below `minRunwayRatio` AND the absolute gap is at
+   * least `minRunwayGapHours` — the double gate prevents over-sensitive
+   * rebalancing (Codex acceptance). Advisory-only; never touches the gate.
+   */
+  allocation: AllocationConfig;
+}
+
+/** Runway-difference balance thresholds (v3 P4 §3.4; defaults in config-service.ts). */
+export interface AllocationConfig {
+  /** Min shorter/longer runway ratio (integer percent) below which sides are "unbalanced"; default 50, range [10, 100]. */
+  minRunwayRatio: number;
+  /** Min absolute runway gap (hours) to treat as unbalanced; default 2, range [1, 168]. */
+  minRunwayGapHours: number;
 }
 
 /** Pure-function output of computeBudgetState(). */
@@ -203,7 +222,20 @@ export interface BudgetState {
     resumeAfterEpoch: number | null;
     resetEpochs: { claude: number; codex: number };
   };
+  /**
+   * v3 P4: retired as a produced signal — always `{ recommended: false }`. Kept
+   * on the shape so `BudgetSnapshot.parallelRecommended` (a back-compat field
+   * external consumers still read) has a source. The underutilization advice
+   * below supersedes it.
+   */
   parallel: { recommended: boolean; reason: string | null };
+  /**
+   * v3 P4 (§3.4): "the account will not use its weekly quota before reset" →
+   * advise more parallelism / higher delegation density. Driven by the weekly
+   * window's `will-not-fill` verdict; advisory-only (never gates). The
+   * coordinator additionally gates EMISSION behind a cross-pair disk cooldown.
+   */
+  underutilization: { recommended: boolean; reason: string | null };
   effort: { claudeAdvice: string | null; codexTier: CodexTier };
   /** Rendered Chinese directive for Claude, or null when nothing to say (dedup is the coordinator's job). */
   directiveToClaude: string | null;

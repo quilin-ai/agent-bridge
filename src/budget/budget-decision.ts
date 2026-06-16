@@ -61,6 +61,17 @@ function clamp(value: number, min: number, max: number): number {
 }
 
 /**
+ * Clamped hours-to-reset for a window. Single source for the `tH` used by both
+ * `dynamicPauseAt` and `dynamicWindowVerdict`, so the projected-at-reset figure
+ * the underutilization advice shows can never diverge from the gating decision.
+ * Callers that need the "past reset" guard must check `resetEpoch <= now`
+ * themselves first (this only clamps the upper bound, never the lower).
+ */
+function clampedTimeToResetHours(window: BudgetWindow, now: number): number {
+  return Math.min((window.resetEpoch - now) / 3600, MAX_TIME_TO_RESET_HOURS);
+}
+
+/**
  * Decision-grade data check (moved here from budget-state.ts so the decision
  * module is self-contained; budget-state re-exports it for existing importers).
  * A record whose every window has already reset, or that was fetched long ago
@@ -102,7 +113,7 @@ export function dynamicPauseAt(
   const rawTimeToResetHours = (window.resetEpoch - now) / 3600;
   // Past reset point: do not pause on a stale window — wait for fresh data.
   if (rawTimeToResetHours <= 0) return 100;
-  const tH = Math.min(rawTimeToResetHours, MAX_TIME_TO_RESET_HOURS);
+  const tH = clampedTimeToResetHours(window, now);
 
   const finishingMarginPct = clamp(
     burnRatePctPerHour * (m.finishingHorizonMinutes / 60),
@@ -135,6 +146,59 @@ export function dynamicPauseAt(
   // conserve (I1 violation). Raising the ceiling to max(pauseAt, 99) keeps the
   // line ≥ pauseAt, so maximize degrades to conserve at such configs.
   return clamp(line, cfg.pauseAt, Math.max(cfg.pauseAt, DYNAMIC_LINE_CEILING_PCT));
+}
+
+/**
+ * Structured classification of one window's dynamic-line outcome (v3 P4 §3.4).
+ *
+ * The underutilization advice needs to distinguish "the window WILL NOT fill
+ * before reset" (dynamicPauseAt's `return 100` path) from "the window never
+ * yields a numeric line for other reasons" (admission-closed / degraded).
+ * `effectiveDynamicLine` cannot be the signal source because it deliberately
+ * drops `line >= 100` — and will-not-fill IS exactly line 100. This verdict
+ * reuses `dynamicPauseAt` for the gating decision (single source of truth) and
+ * only exposes the structured outcome plus the projected-at-reset figure the
+ * advice text shows.
+ */
+export type DynamicWindowVerdict =
+  | { kind: "will-fill"; line: number }
+  | { kind: "will-not-fill"; projectedAtReset: number }
+  | { kind: "admission-closed" }
+  | { kind: "degraded" };
+
+/**
+ * Classify a single window's dynamic-line outcome without re-deriving the gating
+ * logic. Returns `degraded` when there is no confident burn rate or the window
+ * has already reset (a past window is not a live underutilization signal).
+ *
+ * `projectedAtReset` reuses dynamicPauseAt's own projection formula
+ * (`util + guardRate × clampedTimeToResetHours`) — this is selection/formatting
+ * over the guard's verbatim rate, NOT a burn-rate recomputation (§3.3 #2): the
+ * decision layer already computes this exact value internally. Classifying
+ * will-not-fill by `projectedAtReset <= targetUtil` (rather than `line === 100`)
+ * stays correct even at the degenerate `pauseAt = 100` config, where a will-fill
+ * line could otherwise clamp to exactly 100.
+ */
+export function dynamicWindowVerdict(
+  window: BudgetWindow,
+  cfg: BudgetConfig,
+  now: number,
+): DynamicWindowVerdict {
+  const rate = confidentRate(window);
+  if (rate === null) return { kind: "degraded" };
+  if (window.resetEpoch <= now) return { kind: "degraded" };
+
+  const line = dynamicPauseAt(window, rate, cfg, now);
+  if (line === "admission-closed") return { kind: "admission-closed" };
+
+  const projectedAtReset = window.util + rate * clampedTimeToResetHours(window, now);
+  if (projectedAtReset <= cfg.maximize.targetUtil) {
+    // dynamicPauseAt returned 100 here (will-not-fill); no hard cap fired since
+    // admission-closed was already handled above.
+    return { kind: "will-not-fill", projectedAtReset };
+  }
+  // projected > target → dynamicPauseAt returned a numeric will-fill line.
+  return { kind: "will-fill", line };
 }
 
 /** A maximize window's contribution to the entry decision. */

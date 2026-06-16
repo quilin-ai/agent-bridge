@@ -261,7 +261,7 @@ function activeSideProbeUncertain(side: PauseSide, state: BudgetState): boolean 
 
 /**
  * Stable dedup fingerprint for a directive. When `activeSide` is set we are
- * paused; otherwise the phase (balance/parallel) drives the side selection.
+ * paused; otherwise the phase (balance/underutilized) drives the side selection.
  *
  * v3 P2 / R6 note: the maximize dynamic line is deliberately NOT folded into the
  * fingerprint. Design R6 suggested quantizing the line (1 pct) and tH (0.5h) to
@@ -288,16 +288,17 @@ export function directiveFingerprint(state: BudgetState, activeSide?: ActivePaus
   // NB: the old code had `side === "claude"/"codex"/"both"` branches here as
   // well. They were dead: when activeSide is set the chain already matched
   // above; when activeSide is undefined the phase is balance (handled above) or
-  // parallel (side is always "none"). Proven unreachable — instrumenting them
-  // with throws kept all 53 budget tests green — so they are removed.
+  // underutilized (side is always "none"; parallel is retired). Proven
+  // unreachable — instrumenting them with throws kept all budget tests green —
+  // so they are removed.
 
   // `drift.heavier` is which side carries more usage by drift — relevant only
-  // to a balance/parallel advisory. A pause is keyed on the paused side
+  // to a balance/underutilized advisory. A pause is keyed on the paused side
   // (activeSide), so folding `heavier` into a PAUSED fingerprint lets the
   // NON-paused side's warnUtil re-emit a duplicate pause banner whenever its
   // drift flips `heavier`, even though the pause itself never changed. Drop
   // `heavier` from the fingerprint while paused; keep it when not paused so the
-  // balance/parallel dedup behavior is unchanged.
+  // balance/underutilized dedup behavior is unchanged.
   const heavier = activeSide ? "" : (state.drift.heavier ?? "none");
 
   return [

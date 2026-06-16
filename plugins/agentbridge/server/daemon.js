@@ -4,8 +4,8 @@ var __require = import.meta.require;
 
 // src/daemon.ts
 import { existsSync as existsSync8, realpathSync as realpathSync2, rmSync as rmSync2 } from "fs";
-import { homedir as homedir4 } from "os";
-import { join as join10 } from "path";
+import { homedir as homedir5 } from "os";
+import { join as join11 } from "path";
 import { randomUUID as randomUUID4 } from "crypto";
 
 // src/contract-version.ts
@@ -30,10 +30,10 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.16", "0.0.0-source"),
-  commit: defineString("9861512", "source"),
+  commit: defineString("ad365c0", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION),
-  codeHash: defineString("0c4f360df15e", "source")
+  codeHash: defineString("050e098bfb0c", "source")
 });
 function daemonStatusBuildInfo() {
   return { ...BUILD_INFO };
@@ -3411,6 +3411,10 @@ var DEFAULT_BUDGET_CONFIG = {
     reserveMaxPct: 7,
     finishingHorizonMinutes: 30,
     resumeHysteresisPct: 5
+  },
+  allocation: {
+    minRunwayRatio: 50,
+    minRunwayGapHours: 2
   }
 };
 var DEFAULT_CONFIG = {
@@ -3481,6 +3485,17 @@ function findShapeViolation(raw) {
         }
       }
     }
+    if ("allocation" in budget) {
+      const allocation = budget.allocation;
+      if (!isRecord(allocation)) {
+        return "budget.allocation is present but not an object";
+      }
+      for (const key of ["minRunwayRatio", "minRunwayGapHours"]) {
+        if (key in allocation && !isCoercibleNumber(allocation[key])) {
+          return `budget.allocation.${key} is present but not a number`;
+        }
+      }
+    }
   }
   return null;
 }
@@ -3488,7 +3503,7 @@ function hasCustomDecisionValues(config) {
   const d = DEFAULT_CONFIG;
   const b = config.budget;
   const db = d.budget;
-  return config.idleShutdownSeconds !== d.idleShutdownSeconds || config.turnCoordination.attentionWindowSeconds !== d.turnCoordination.attentionWindowSeconds || config.codex.appPort !== d.codex.appPort || config.codex.proxyPort !== d.codex.proxyPort || b.enabled !== db.enabled || b.pollSeconds !== db.pollSeconds || b.pauseAt !== db.pauseAt || b.resumeBelow !== db.resumeBelow || b.syncDriftPct !== db.syncDriftPct || b.parallel.minRemainingPct !== db.parallel.minRemainingPct || b.parallel.timeWindowSec !== db.parallel.timeWindowSec || b.codexTierControl !== db.codexTierControl || b.maximize.targetUtil !== db.maximize.targetUtil || b.maximize.reserveSlopePctPerHour !== db.maximize.reserveSlopePctPerHour || b.maximize.reserveMaxPct !== db.maximize.reserveMaxPct || b.maximize.finishingHorizonMinutes !== db.maximize.finishingHorizonMinutes || b.maximize.resumeHysteresisPct !== db.maximize.resumeHysteresisPct;
+  return config.idleShutdownSeconds !== d.idleShutdownSeconds || config.turnCoordination.attentionWindowSeconds !== d.turnCoordination.attentionWindowSeconds || config.codex.appPort !== d.codex.appPort || config.codex.proxyPort !== d.codex.proxyPort || b.enabled !== db.enabled || b.pollSeconds !== db.pollSeconds || b.pauseAt !== db.pauseAt || b.resumeBelow !== db.resumeBelow || b.syncDriftPct !== db.syncDriftPct || b.parallel.minRemainingPct !== db.parallel.minRemainingPct || b.parallel.timeWindowSec !== db.parallel.timeWindowSec || b.codexTierControl !== db.codexTierControl || b.maximize.targetUtil !== db.maximize.targetUtil || b.maximize.reserveSlopePctPerHour !== db.maximize.reserveSlopePctPerHour || b.maximize.reserveMaxPct !== db.maximize.reserveMaxPct || b.maximize.finishingHorizonMinutes !== db.maximize.finishingHorizonMinutes || b.maximize.resumeHysteresisPct !== db.maximize.resumeHysteresisPct || b.allocation.minRunwayRatio !== db.allocation.minRunwayRatio || b.allocation.minRunwayGapHours !== db.allocation.minRunwayGapHours;
 }
 function normalizeInteger(value, fallback) {
   if (typeof value === "number" && Number.isFinite(value))
@@ -3534,6 +3549,13 @@ function normalizeMaximizeConfig(raw, pauseAt, fallback = DEFAULT_BUDGET_CONFIG.
     return { ...DEFAULT_BUDGET_CONFIG.maximize };
   }
   return normalized;
+}
+function normalizeAllocationConfig(raw, fallback = DEFAULT_BUDGET_CONFIG.allocation) {
+  const a = isRecord(raw) ? raw : {};
+  return {
+    minRunwayRatio: normalizeBoundedInteger(a.minRunwayRatio, fallback.minRunwayRatio, 10, 100),
+    minRunwayGapHours: normalizeBoundedInteger(a.minRunwayGapHours, fallback.minRunwayGapHours, 1, 168)
+  };
 }
 function normalizeBoolean(value, fallback) {
   if (typeof value === "boolean")
@@ -3584,7 +3606,8 @@ function normalizeBudgetConfig(raw, fallback = DEFAULT_BUDGET_CONFIG) {
     },
     codexTierControl: normalizeBoolean(budget.codexTierControl, fallback.codexTierControl) && codexTiers.full !== null,
     codexTiers,
-    maximize: normalizeMaximizeConfig(budget.maximize, pauseAt, fallback.maximize)
+    maximize: normalizeMaximizeConfig(budget.maximize, pauseAt, fallback.maximize),
+    allocation: normalizeAllocationConfig(budget.allocation, fallback.allocation)
   };
 }
 function applyBudgetEnvOverrides(budget, env = process.env) {
@@ -3606,6 +3629,10 @@ function applyBudgetEnvOverrides(budget, env = process.env) {
       reserveMaxPct: env.AGENTBRIDGE_BUDGET_RESERVE_MAX_PCT ?? budget.maximize.reserveMaxPct,
       finishingHorizonMinutes: env.AGENTBRIDGE_BUDGET_FINISHING_HORIZON_MINUTES ?? budget.maximize.finishingHorizonMinutes,
       resumeHysteresisPct: env.AGENTBRIDGE_BUDGET_RESUME_HYSTERESIS_PCT ?? budget.maximize.resumeHysteresisPct
+    },
+    allocation: {
+      minRunwayRatio: env.AGENTBRIDGE_BUDGET_MIN_RUNWAY_RATIO ?? budget.allocation.minRunwayRatio,
+      minRunwayGapHours: env.AGENTBRIDGE_BUDGET_MIN_RUNWAY_GAP_HOURS ?? budget.allocation.minRunwayGapHours
     }
   };
   return normalizeBudgetConfig(overlay, budget);
@@ -3719,6 +3746,9 @@ class ConfigService {
   }
 }
 
+// src/budget/budget-coordinator.ts
+import { homedir as homedir2 } from "os";
+
 // src/budget/budget-gate.ts
 function matchingGateReset(usage) {
   if (!usage)
@@ -3760,6 +3790,9 @@ function pct(value) {
 function clamp(value, min, max) {
   return Math.min(Math.max(value, min), max);
 }
+function clampedTimeToResetHours(window, now) {
+  return Math.min((window.resetEpoch - now) / 3600, MAX_TIME_TO_RESET_HOURS);
+}
 function isDecisionGrade(usage, now) {
   if (!usage)
     return false;
@@ -3775,7 +3808,7 @@ function dynamicPauseAt(window, burnRatePctPerHour, cfg, now) {
   const rawTimeToResetHours = (window.resetEpoch - now) / 3600;
   if (rawTimeToResetHours <= 0)
     return 100;
-  const tH = Math.min(rawTimeToResetHours, MAX_TIME_TO_RESET_HOURS);
+  const tH = clampedTimeToResetHours(window, now);
   const finishingMarginPct = clamp(burnRatePctPerHour * (m.finishingHorizonMinutes / 60), FINISHING_MARGIN_MIN_PCT, FINISHING_MARGIN_MAX_PCT);
   const projectedAtReset = window.util + burnRatePctPerHour * tH;
   if (projectedAtReset <= m.targetUtil) {
@@ -3789,6 +3822,21 @@ function dynamicPauseAt(window, burnRatePctPerHour, cfg, now) {
   const reservePct = Math.min(m.reserveMaxPct, m.reserveSlopePctPerHour * tH);
   const line = m.targetUtil - finishingMarginPct - reservePct;
   return clamp(line, cfg.pauseAt, Math.max(cfg.pauseAt, DYNAMIC_LINE_CEILING_PCT));
+}
+function dynamicWindowVerdict(window, cfg, now) {
+  const rate = confidentRate(window);
+  if (rate === null)
+    return { kind: "degraded" };
+  if (window.resetEpoch <= now)
+    return { kind: "degraded" };
+  const line = dynamicPauseAt(window, rate, cfg, now);
+  if (line === "admission-closed")
+    return { kind: "admission-closed" };
+  const projectedAtReset = window.util + rate * clampedTimeToResetHours(window, now);
+  if (projectedAtReset <= cfg.maximize.targetUtil) {
+    return { kind: "will-not-fill", projectedAtReset };
+  }
+  return { kind: "will-fill", line };
 }
 function confidentRate(window) {
   if (window.burnConfident !== true)
@@ -3921,6 +3969,8 @@ function resumeBlockingEpochFor(usage, cfg, now) {
 }
 
 // src/budget/budget-state.ts
+var NO_RUNWAY = { claude: null, codex: null };
+var UNDERUTILIZATION_MIN_WASTE_PCT = 10;
 var AGENT_LABEL2 = {
   claude: "Claude",
   codex: "Codex"
@@ -3969,24 +4019,64 @@ function driftFor(claude, codex, cfg) {
     lighter: drift > 0 ? "codex" : "claude"
   };
 }
-function parallelState(claude, codex, cfg, now) {
-  if (!claude || !codex)
-    return { recommended: false, reason: null };
-  if (claude.remaining <= cfg.parallel.minRemainingPct || codex.remaining <= cfg.parallel.minRemainingPct) {
-    return { recommended: false, reason: null };
+function runwayBalance(claudeRunway, codexRunway, cfg) {
+  const ch = claudeRunway.seconds / 3600;
+  const xh = codexRunway.seconds / 3600;
+  const lo = Math.min(ch, xh);
+  const hi = Math.max(ch, xh);
+  const ratioPct = hi <= 0 ? 100 : Math.round(100 * lo / hi);
+  const gapHours = Math.abs(ch - xh);
+  if (ratioPct < cfg.allocation.minRunwayRatio && gapHours >= cfg.allocation.minRunwayGapHours) {
+    const shorter = ch < xh ? "claude" : "codex";
+    return { heavier: shorter, lighter: shorter === "claude" ? "codex" : "claude" };
   }
-  const claudeReset = claude.fiveHour?.resetEpoch ?? 0;
-  const codexReset = codex.fiveHour?.resetEpoch ?? 0;
-  if (claudeReset <= now || codexReset <= now)
-    return { recommended: false, reason: null };
-  const nearestResetSec = Math.min(claudeReset - now, codexReset - now);
-  if (nearestResetSec >= cfg.parallel.timeWindowSec)
-    return { recommended: false, reason: null };
-  const minutes = Math.ceil(nearestResetSec / 60);
+  return null;
+}
+function allocationDrift(claude, codex, runway, cfg) {
+  const warnDrift = driftFor(claude, codex, cfg);
+  if (!claude || !codex || !runway.claude || !runway.codex) {
+    return { drift: warnDrift, basis: "warn" };
+  }
+  const balance = runwayBalance(runway.claude, runway.codex, cfg);
   return {
-    recommended: true,
-    reason: `\u53CC\u65B9\u5269\u4F59\u989D\u5EA6\u5747\u9AD8\u4E8E ${pct2(cfg.parallel.minRemainingPct)}\uFF0C\u6700\u8FD1 5h \u6876\u7EA6 ${minutes} \u5206\u949F\u540E\u91CD\u7F6E`
+    drift: {
+      pct: warnDrift.pct,
+      heavier: balance?.heavier ?? null,
+      lighter: balance?.lighter ?? null
+    },
+    basis: "runway"
   };
+}
+function runwayHoursText(runway) {
+  if (!runway)
+    return "\u672A\u77E5";
+  return `~${(runway.seconds / 3600).toFixed(1)}h`;
+}
+function underutilizationState(claude, codex, cfg, now) {
+  let top = null;
+  for (const [agent, usage] of [["claude", claude], ["codex", codex]]) {
+    const weekly = usage?.weekly;
+    if (!weekly)
+      continue;
+    const verdict = dynamicWindowVerdict(weekly, cfg, now);
+    if (verdict.kind !== "will-not-fill")
+      continue;
+    const waste = Math.round((cfg.maximize.targetUtil - verdict.projectedAtReset) * 10) / 10;
+    if (waste < UNDERUTILIZATION_MIN_WASTE_PCT)
+      continue;
+    if (top === null || waste > top.waste) {
+      top = { agent, projected: verdict.projectedAtReset, waste, resetEpoch: weekly.resetEpoch };
+    }
+  }
+  if (top === null)
+    return { recommended: false, reason: null };
+  const hoursToReset = Math.max(0, (top.resetEpoch - now) / 3600);
+  const reason = [
+    "\u3010\u9884\u7B97\u534F\u8C03 \xB7 \u8D26\u53F7\u7EA7\u3011\u989D\u5EA6\u5C06\u6B20\u8F7D\uFF0C\u5EFA\u8BAE\u63D0\u9AD8\u5E76\u884C/\u59D4\u6D3E\u5BC6\u5EA6\u3002",
+    `${AGENT_LABEL2[top.agent]} \u6309\u5F53\u524D\u71C3\u5C3D\u7387\u5468\u7A97\u53E3\u5237\u65B0\u65F6\u53EA\u4F1A\u7528\u5230 ~${pct2(top.projected)}\uFF0C` + `\u8DDD\u5237\u65B0\u8FD8\u6709 ~${hoursToReset.toFixed(1)}h \u2014\u2014 \u5EFA\u8BAE\u62C6\u66F4\u591A\u5E76\u884C\u5B50\u4EFB\u52A1/\u63D0\u9AD8\u59D4\u6D3E\u5BC6\u5EA6\uFF0C` + `\u5426\u5219\u7EA6 ${pct2(top.waste)} \u5468\u989D\u5EA6\u5C06\u4F5C\u5E9F\u3002`
+  ].join(`
+`);
+  return { recommended: true, reason };
 }
 function renderBudgetInterventionDirective(claude, codex, side, reason, resumeEpoch, cfg) {
   const resumeText = `\u9884\u8BA1\u6062\u590D\u65F6\u95F4\uFF08\u4EE5\u5B9E\u6D4B\u4E3A\u51C6\uFF1B\u63D0\u524D\u5237\u65B0\u4F1A\u66F4\u65E9\u89E3\u9664\uFF09\uFF1A${formatEpoch(resumeEpoch)}\u3002`;
@@ -4022,25 +4112,21 @@ function renderBudgetInterventionDirective(claude, codex, side, reason, resumeEp
   ].join(`
 `);
 }
-function balanceDirective(claude, codex, drift, parallel) {
+function balanceDirective(claude, codex, drift, basis, runway) {
   const heavier = drift.heavier ? AGENT_LABEL2[drift.heavier] : "\u672A\u77E5";
   const lighter = drift.lighter ? AGENT_LABEL2[drift.lighter] : "\u672A\u77E5";
-  const lines = [
+  if (basis === "runway") {
+    return [
+      "\u3010\u9884\u7B97\u534F\u8C03 \xB7 \u8D26\u53F7\u7EA7\u3011\u6309\u5269\u4F59\u53EF\u5DE5\u4F5C\u65F6\u95F4\u9700\u8981\u5747\u8861\u3002",
+      `${usageSummary("claude", claude)}\uFF1B${usageSummary("codex", codex)}\u3002`,
+      `Claude \u6309\u5F53\u524D\u71C3\u5C3D\u7387\u7EA6\u53EF\u518D\u5DE5\u4F5C ${runwayHoursText(runway.claude)}\u3001` + `Codex ${runwayHoursText(runway.codex)}\uFF08\u7A97\u53E3\u4E3A\u7EA6\u675F\uFF09\uFF1B` + `runway \u8F83\u77ED\u7684\u4E00\u4FA7\u662F ${heavier}\uFF0C\u8BF7\u628A\u540E\u7EED\u53EF\u62C6\u5206\u4EFB\u52A1\u4F18\u5148\u6D3E\u7ED9 ${lighter}\u3002`
+    ].join(`
+`);
+  }
+  return [
     "\u3010\u9884\u7B97\u534F\u8C03 \xB7 \u8D26\u53F7\u7EA7\u3011\u68C0\u6D4B\u5230\u53CC\u65B9\u7528\u91CF\u6BD4\u4F8B\u6F02\u79FB\u3002",
     `${usageSummary("claude", claude)}\uFF1B${usageSummary("codex", codex)}\u3002`,
     `${heavier} \u6BD4 ${lighter} \u9AD8 ${pct2(Math.abs(drift.pct))}\uFF0C\u8BF7\u4F18\u5148\u628A\u540E\u7EED\u53EF\u62C6\u5206\u4EFB\u52A1\u5206\u7ED9 ${lighter}\uFF0C\u76F4\u5230 warnUtil \u63A5\u8FD1\u3002`
-  ];
-  if (parallel.recommended && parallel.reason) {
-    lines.push(`${parallel.reason}\uFF1B\u53EF\u8BA9 ${lighter} \u627F\u62C5\u66F4\u591A\u5E76\u884C\u5B50\u4EFB\u52A1\uFF0C\u517C\u987E\u5747\u8861\u4E0E\u63D0\u901F\u3002`);
-  }
-  return lines.join(`
-`);
-}
-function parallelDirective(claude, codex, parallel) {
-  return [
-    "\u3010\u9884\u7B97\u534F\u8C03 \xB7 \u8D26\u53F7\u7EA7\u3011\u5F53\u524D\u989D\u5EA6\u5BCC\u4F59\u4E14\u4E34\u8FD1 5h \u7ED3\u7B97\uFF0C\u5EFA\u8BAE\u52A8\u6001\u5E76\u884C\u3002",
-    `${usageSummary("claude", claude)}\uFF1B${usageSummary("codex", codex)}\u3002`,
-    `${parallel.reason}\uFF1B\u53EF\u4EE5\u62C6\u66F4\u591A\u72EC\u7ACB\u5B50\u4EFB\u52A1\u5E76\u884C\u63A8\u8FDB\u3002`
   ].join(`
 `);
 }
@@ -4060,14 +4146,17 @@ function claudeAdviceFor(claude, now) {
     return null;
   return `Claude warnUtil ${pct2(claude.warnUtil)} \u5DF2\u504F\u9AD8\uFF1B\u540E\u7EED\u53EF\u62C6\u5206 subagent \u5EFA\u8BAE\u964D\u6863\u5230 haiku/sonnet\uFF0C\u5E76\u4FDD\u7559\u9AD8\u96BE\u5EA6\u4E3B\u7EBF\u7ED9\u5F53\u524D\u4F1A\u8BDD\u3002`;
 }
-function computeBudgetState(claude, codex, cfg, now) {
+function computeBudgetState(claude, codex, cfg, now, runway = NO_RUNWAY) {
   const triggers = [
     pauseTrigger("claude", claude, cfg, now),
     pauseTrigger("codex", codex, cfg, now)
   ].filter((trigger) => trigger !== null);
   const paused = triggers.length > 0;
-  const drift = driftFor(claude, codex, cfg);
-  const parallel = paused ? { recommended: false, reason: null } : parallelState(claude, codex, cfg, now);
+  const { drift, basis } = allocationDrift(claude, codex, runway, cfg);
+  const parallel = { recommended: false, reason: null };
+  const adviceEligible = !paused && claude !== null && codex !== null && claude.rateLimitedUntil <= now && codex.rateLimitedUntil <= now && isDecisionGrade(claude, now) && isDecisionGrade(codex, now);
+  const balanceActive = adviceEligible && drift.heavier !== null && drift.lighter !== null;
+  const underutilization = adviceEligible && !balanceActive ? underutilizationState(claude, codex, cfg, now) : { recommended: false, reason: null };
   const resetEpochs = {
     claude: matchingGateReset(claude),
     codex: matchingGateReset(codex)
@@ -4076,18 +4165,18 @@ function computeBudgetState(claude, codex, cfg, now) {
   let phase = "normal";
   if (paused)
     phase = "paused";
-  else if (drift.heavier && drift.lighter)
+  else if (balanceActive)
     phase = "balance";
-  else if (parallel.recommended)
-    phase = "parallel";
+  else if (underutilization.recommended)
+    phase = "underutilized";
   const pauseSide = !paused ? null : triggers.length > 1 ? "both" : triggers[0].agent;
   let directiveToClaude = null;
   if (phase === "paused") {
     directiveToClaude = renderBudgetInterventionDirective(claude, codex, pauseSide ?? "both", triggers.map((trigger) => trigger.reason).join("\uFF1B"), filteredResumeAfterEpoch, cfg);
   } else if (phase === "balance" && claude && codex) {
-    directiveToClaude = balanceDirective(claude, codex, drift, parallel);
-  } else if (phase === "parallel" && claude && codex) {
-    directiveToClaude = parallelDirective(claude, codex, parallel);
+    directiveToClaude = balanceDirective(claude, codex, drift, basis, runway);
+  } else if (phase === "underutilized") {
+    directiveToClaude = underutilization.reason;
   }
   return {
     phase,
@@ -4103,9 +4192,75 @@ function computeBudgetState(claude, codex, cfg, now) {
       resetEpochs
     },
     parallel,
+    underutilization,
     effort: { claudeAdvice: claudeAdviceFor(claude, now), codexTier: codexTierFor(codex, now) },
     directiveToClaude
   };
+}
+
+// src/budget/advice-cooldown.ts
+import { readFileSync as readFileSync5 } from "fs";
+import { join as join5 } from "path";
+var DEFAULT_ADVICE_COOLDOWN_SEC = 1800;
+var COOLDOWN_FILENAME = "advice-cooldown.json";
+function resolveAdviceCooldownSec(env = process.env) {
+  const raw = env.AGENTBRIDGE_BUDGET_ADVICE_COOLDOWN_SEC;
+  if (raw === undefined || raw.trim() === "")
+    return DEFAULT_ADVICE_COOLDOWN_SEC;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0 || parsed > 86400)
+    return DEFAULT_ADVICE_COOLDOWN_SEC;
+  return parsed;
+}
+function resolveStateDir(homeDir) {
+  const override = process.env.BUDGET_STATE_DIR;
+  if (override && override.trim() !== "")
+    return override.trim();
+  return join5(homeDir, ".budget-guard");
+}
+
+class AdviceCooldown {
+  path;
+  cooldownSec;
+  log;
+  constructor(options) {
+    this.path = join5(resolveStateDir(options.homeDir), COOLDOWN_FILENAME);
+    this.cooldownSec = options.cooldownSec ?? DEFAULT_ADVICE_COOLDOWN_SEC;
+    this.log = options.log ?? (() => {});
+  }
+  tryAcquire(direction, now) {
+    const file = this.read();
+    const last = file[direction]?.lastEmittedEpoch;
+    if (this.cooldownSec > 0 && typeof last === "number" && Number.isFinite(last) && now - last < this.cooldownSec && last <= now) {
+      return false;
+    }
+    this.write({ ...file, [direction]: { lastEmittedEpoch: now } });
+    return true;
+  }
+  read() {
+    let raw;
+    try {
+      raw = readFileSync5(this.path, "utf-8");
+    } catch {
+      return {};
+    }
+    try {
+      const parsed = JSON.parse(raw);
+      if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed))
+        return {};
+      return parsed;
+    } catch {
+      this.log(`advice-cooldown: ignoring malformed ${this.path}`);
+      return {};
+    }
+  }
+  write(file) {
+    try {
+      atomicWriteJson(this.path, file);
+    } catch (error) {
+      this.log(`advice-cooldown: write failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
 }
 
 // src/budget/budget-fingerprint.ts
@@ -4430,6 +4585,7 @@ class BudgetCoordinator {
   log;
   onResume;
   resumeSignals;
+  adviceCooldown;
   timer = null;
   running = false;
   fpState = INITIAL_FINGERPRINT_STATE;
@@ -4451,6 +4607,11 @@ class BudgetCoordinator {
     this.log = options.log ?? (() => {});
     this.onResume = options.onResume ?? (() => {});
     this.resumeSignals = options.resumeSignals ?? null;
+    this.adviceCooldown = options.adviceCooldown ?? new AdviceCooldown({
+      homeDir: homedir2(),
+      cooldownSec: resolveAdviceCooldownSec(),
+      log: this.log
+    });
   }
   async start() {
     if (this.running || !this.config.enabled)
@@ -4544,10 +4705,15 @@ class BudgetCoordinator {
     if (!this.running) {
       return;
     }
-    const state = computeBudgetState(usage.claude, usage.codex, this.config, this.now());
+    const now = this.now();
+    const runway = {
+      claude: agentRunway(usage.claude, now),
+      codex: agentRunway(usage.codex, now)
+    };
+    const state = computeBudgetState(usage.claude, usage.codex, this.config, now, runway);
     this.updatePendingOverrides(state.effort.codexTier);
     this.applyState(state);
-    this.setSnapshot(this.toSnapshot(state));
+    this.setSnapshot(this.toSnapshot(state, runway));
   }
   setSnapshot(snapshot) {
     this.latestSnapshot = snapshot;
@@ -4576,8 +4742,13 @@ class BudgetCoordinator {
         return;
       }
       case "advise": {
-        const prefix = effect.phase === "balance" ? "system_budget_balance" : "system_budget_parallel";
-        this.emitDirective(prefix, state.directiveToClaude);
+        if (effect.phase === "underutilized") {
+          if (!this.adviceCooldown.tryAcquire("underutilization", state.now))
+            return;
+          this.emitDirective("system_budget_underutilized", state.directiveToClaude);
+          return;
+        }
+        this.emitDirective("system_budget_balance", state.directiveToClaude);
         return;
       }
       case "none":
@@ -4655,7 +4826,7 @@ class BudgetCoordinator {
     ].join(`
 `);
   }
-  toSnapshot(state) {
+  toSnapshot(state, runway) {
     const paused = this.isPaused();
     return {
       phase: paused ? "paused" : state.phase,
@@ -4671,7 +4842,7 @@ class BudgetCoordinator {
       parallelRecommended: paused ? false : state.parallel.recommended,
       codexTier: state.effort.codexTier,
       claudeAdvice: state.effort.claudeAdvice,
-      ...this.burnRateSnapshotFields(state),
+      ...this.burnRateSnapshotFields(state, runway),
       ...this.dynamicLineSnapshotFields(state)
     };
   }
@@ -4683,14 +4854,10 @@ class BudgetCoordinator {
       }
     };
   }
-  burnRateSnapshotFields(state) {
+  burnRateSnapshotFields(state, runway) {
     const rates = {
       claude: agentBurnRates(state.perAgent.claude),
       codex: agentBurnRates(state.perAgent.codex)
-    };
-    const runway = {
-      claude: agentRunway(state.perAgent.claude, state.now),
-      codex: agentRunway(state.perAgent.codex, state.now)
     };
     if (!hasAnyBurnSignal(rates, runway))
       return {};
@@ -4701,8 +4868,8 @@ class BudgetCoordinator {
 // src/budget/quota-source.ts
 import { execFile } from "child_process";
 import { existsSync as existsSync5 } from "fs";
-import { homedir as homedir2 } from "os";
-import { basename, join as join5 } from "path";
+import { homedir as homedir3 } from "os";
+import { basename, join as join6 } from "path";
 function parseBurnFields(record) {
   const group = {};
   let any = false;
@@ -4989,7 +5156,7 @@ class QuotaSource {
   unknownSchemaVersionsLogged = new Set;
   constructor(options = {}) {
     this.env = options.env ?? process.env;
-    this.homeDir = options.homeDir ?? homedir2();
+    this.homeDir = options.homeDir ?? homedir3();
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     this.runner = options.runner ?? defaultRunner;
     this.log = options.log ?? (() => {});
@@ -5021,11 +5188,11 @@ class QuotaSource {
       add(command, commandKind(command));
       return candidates;
     }
-    const binDir = join5(this.homeDir, ".budget-guard/bin");
-    const installedProbeMjs = join5(binDir, "probe.mjs");
+    const binDir = join6(this.homeDir, ".budget-guard/bin");
+    const installedProbeMjs = join6(binDir, "probe.mjs");
     if (existsSync5(installedProbeMjs))
       add(installedProbeMjs, "probe-mjs");
-    const installedBudgetProbe = join5(binDir, "budget-probe");
+    const installedBudgetProbe = join6(binDir, "budget-probe");
     if (existsSync5(installedBudgetProbe))
       add(installedBudgetProbe, "budget-probe");
     return candidates;
@@ -5090,7 +5257,7 @@ function createQuotaSource(options) {
 
 // src/budget/pending-reader.ts
 import { createHash } from "crypto";
-import { join as join6 } from "path";
+import { join as join7 } from "path";
 function nodeFs() {
   return __require("fs");
 }
@@ -5127,11 +5294,11 @@ function parsePendingPayload(value) {
 function sha256(value) {
   return createHash("sha256").update(value).digest("hex");
 }
-function resolveStateDir(homeDir) {
+function resolveStateDir2(homeDir) {
   const override = process.env.BUDGET_STATE_DIR;
   if (override && override.trim() !== "")
     return override.trim();
-  return join6(homeDir, ".budget-guard");
+  return join7(homeDir, ".budget-guard");
 }
 function readPendingFile(path, log) {
   let raw;
@@ -5157,7 +5324,7 @@ function readPendingFile(path, log) {
   return { ...entry, sourcePath: path, contentHash: sha256(text) };
 }
 function listScopeFiles(stateDir, agent, log) {
-  const pendingDir = join6(stateDir, "pending");
+  const pendingDir = join7(stateDir, "pending");
   let names;
   try {
     names = nodeFs().readdirSync(pendingDir);
@@ -5165,14 +5332,14 @@ function listScopeFiles(stateDir, agent, log) {
     return [];
   }
   const prefix = `${agent}_`;
-  return names.filter((name) => name.startsWith(prefix) && name.endsWith(".json")).map((name) => join6(pendingDir, name));
+  return names.filter((name) => name.startsWith(prefix) && name.endsWith(".json")).map((name) => join7(pendingDir, name));
 }
 function readGuardPending(opts) {
   const log = opts.log ?? (() => {});
-  const stateDir = resolveStateDir(opts.homeDir);
+  const stateDir = resolveStateDir2(opts.homeDir);
   const paths = [
     ...listScopeFiles(stateDir, opts.agent, log),
-    join6(stateDir, `pending_${opts.agent}.json`)
+    join7(stateDir, `pending_${opts.agent}.json`)
   ];
   const bySession = new Map;
   for (const path of paths) {
@@ -5194,8 +5361,8 @@ function readGuardPending(opts) {
 
 // src/budget/resume-injection-queue.ts
 import { createHash as createHash2 } from "crypto";
-import { closeSync as closeSync3, existsSync as existsSync6, mkdirSync as mkdirSync5, openSync as openSync3, readdirSync, readFileSync as readFileSync5, realpathSync, unlinkSync as unlinkSync4, writeFileSync as writeFileSync3 } from "fs";
-import { join as join7 } from "path";
+import { closeSync as closeSync3, existsSync as existsSync6, mkdirSync as mkdirSync5, openSync as openSync3, readdirSync, readFileSync as readFileSync6, realpathSync, unlinkSync as unlinkSync4, writeFileSync as writeFileSync3 } from "fs";
+import { join as join8 } from "path";
 
 // src/budget/resume-prompt.ts
 var RESUME_PROMPT = "\u989D\u5EA6\u7A97\u53E3\u5DF2\u5237\u65B0\uFF0C\u7EE7\u7EED\u4E0A\u6B21\u672A\u5B8C\u6210\u7684\u4EFB\u52A1\uFF1A\u4ECE .agent/checkpoint.md \u7684\u300C\u4E0B\u4E00\u6B65\u300D\u63A5\u7740\u505A\uFF1B\u5B8C\u6210\u540E\u505C\u4E0B\u5E76\u6807 DONE\u3002";
@@ -5461,7 +5628,7 @@ function unlinkIfExists(path) {
 }
 function readClaimedAt(path) {
   try {
-    const parsed = JSON.parse(readFileSync5(path, "utf-8"));
+    const parsed = JSON.parse(readFileSync6(path, "utf-8"));
     const claimedAt = parsed?.claimed_at;
     return typeof claimedAt === "number" && Number.isFinite(claimedAt) ? claimedAt : null;
   } catch {
@@ -5478,9 +5645,9 @@ function pruneStaleResumeArtifacts(dir, tsField, ttlSec, nowSec, log) {
   for (const name of names) {
     if (!name.endsWith(".json"))
       continue;
-    const p = join7(dir, name);
+    const p = join8(dir, name);
     try {
-      const parsed = JSON.parse(readFileSync5(p, "utf-8"));
+      const parsed = JSON.parse(readFileSync6(p, "utf-8"));
       const ts = parsed?.[tsField];
       if (typeof ts === "number" && Number.isFinite(ts) && nowSec - ts > ttlSec) {
         unlinkIfExists(p);
@@ -5503,10 +5670,10 @@ function tryClaimPendingResume(opts) {
     cwd,
     contentHash
   ].join("\x00"));
-  const claimsDir = join7(opts.stateDir, "claims");
-  const consumedDir = join7(opts.stateDir, "consumed");
-  const claimPath = join7(claimsDir, `${identity}.json`);
-  const consumedPath = join7(consumedDir, `${identity}.json`);
+  const claimsDir = join8(opts.stateDir, "claims");
+  const consumedDir = join8(opts.stateDir, "consumed");
+  const claimPath = join8(claimsDir, `${identity}.json`);
+  const consumedPath = join8(consumedDir, `${identity}.json`);
   mkdirSync5(claimsDir, { recursive: true });
   mkdirSync5(consumedDir, { recursive: true });
   const nowSec = now();
@@ -5660,10 +5827,10 @@ function routeResume(side, resumeId, deps) {
 
 // src/budget/resume-ack-sentinel.ts
 import { renameSync as renameSync3, writeFileSync as writeFileSync4 } from "fs";
-import { join as join8 } from "path";
+import { join as join9 } from "path";
 var RESUME_ACK_DEGRADED_SENTINEL = "resume-ack-degraded.json";
 function resumeAckSentinelPath(stateDir) {
-  return join8(stateDir, RESUME_ACK_DEGRADED_SENTINEL);
+  return join9(stateDir, RESUME_ACK_DEGRADED_SENTINEL);
 }
 function writeResumeAckDegradedSentinel(opts) {
   const now = opts.now ?? (() => Date.now());
@@ -5683,8 +5850,8 @@ function writeResumeAckDegradedSentinel(opts) {
 }
 
 // src/daemon-identity-ownership.ts
-import { readFileSync as readFileSync6 } from "fs";
-var defaultRead2 = (path) => readFileSync6(path, "utf-8");
+import { readFileSync as readFileSync7 } from "fs";
+var defaultRead2 = (path) => readFileSync7(path, "utf-8");
 function pidFileOwnedByUs(pidFilePath, ourPid, read = defaultRead2) {
   let raw;
   try {
@@ -5854,10 +6021,10 @@ class ReplyRequiredTracker {
 import {
   existsSync as existsSync7,
   readdirSync as readdirSync2,
-  readFileSync as readFileSync7
+  readFileSync as readFileSync8
 } from "fs";
-import { homedir as homedir3 } from "os";
-import { basename as basename2, join as join9 } from "path";
+import { homedir as homedir4 } from "os";
+import { basename as basename2, join as join10 } from "path";
 function nowIso() {
   return new Date().toISOString();
 }
@@ -5866,11 +6033,11 @@ function threadTag(identity) {
   return `abg:${name}:${identity.cwd}`;
 }
 function codexHome(env = process.env) {
-  return env.CODEX_HOME && env.CODEX_HOME.length > 0 ? env.CODEX_HOME : join9(homedir3(), ".codex");
+  return env.CODEX_HOME && env.CODEX_HOME.length > 0 ? env.CODEX_HOME : join10(homedir4(), ".codex");
 }
 function readRawCurrentThread(stateDir) {
   try {
-    const parsed = JSON.parse(readFileSync7(stateDir.currentThreadFile, "utf-8"));
+    const parsed = JSON.parse(readFileSync8(stateDir.currentThreadFile, "utf-8"));
     if (parsed?.version === 1 && typeof parsed.threadId === "string" && parsed.threadId.length > 0 && (parsed.status === "pending" || parsed.status === "current") && typeof parsed.cwd === "string") {
       return parsed;
     }
@@ -5878,7 +6045,7 @@ function readRawCurrentThread(stateDir) {
   return null;
 }
 function findCodexRolloutFile(threadId, env = process.env, maxEntries = 20000) {
-  const sessionsDir = join9(codexHome(env), "sessions");
+  const sessionsDir = join10(codexHome(env), "sessions");
   if (!threadId || !existsSync7(sessionsDir))
     return null;
   const exactName = `rollout-${threadId}.jsonl`;
@@ -5894,7 +6061,7 @@ function findCodexRolloutFile(threadId, env = process.env, maxEntries = 20000) {
     }
     for (const entry of entries) {
       visited++;
-      const path = join9(dir, entry.name);
+      const path = join10(dir, entry.name);
       if (entry.isDirectory()) {
         stack.push(path);
         continue;
@@ -6188,7 +6355,7 @@ function budgetGuardStateDir() {
   const override = process.env.BUDGET_STATE_DIR;
   if (override && override.trim() !== "")
     return override.trim();
-  return join10(homedir4(), ".budget-guard");
+  return join11(homedir5(), ".budget-guard");
 }
 function resumeClaimTtlSec() {
   const totalMs = RESUME_CONFIRM_TIMEOUT_MS * RESUME_INJECT_MAX_ATTEMPTS + RESUME_INJECT_RETRY_MS * Math.max(0, RESUME_INJECT_MAX_ATTEMPTS - 1);
@@ -6212,7 +6379,7 @@ function readResumeSignals() {
   let pendingCodexEntry;
   let pendingClaudeEntry;
   try {
-    const home = homedir4();
+    const home = homedir5();
     const cwd = pairCwd();
     pendingCodexEntry = readGuardPending({ homeDir: home, agent: "codex", cwd, log })[0];
     pendingClaudeEntry = readGuardPending({ homeDir: home, agent: "claude", cwd, log })[0];
@@ -6224,7 +6391,7 @@ function readResumeSignals() {
   let checkpointExists = false;
   let checkpointPath;
   try {
-    checkpointPath = join10(pairCwd(), ".agent", "checkpoint.md");
+    checkpointPath = join11(pairCwd(), ".agent", "checkpoint.md");
     checkpointExists = existsSync8(checkpointPath);
   } catch (error) {
     log(`resume signal: checkpoint stat failed: ${error instanceof Error ? error.message : String(error)}`);

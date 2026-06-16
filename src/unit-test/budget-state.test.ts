@@ -21,6 +21,7 @@ const CONFIG: BudgetConfig = {
     eco: { effort: "low" },
   },
   maximize: { targetUtil: 97, reserveSlopePctPerHour: 0.4, reserveMaxPct: 7, finishingHorizonMinutes: 30, resumeHysteresisPct: 5 },
+  allocation: { minRunwayRatio: 50, minRunwayGapHours: 2 },
 };
 
 function usage(overrides: Partial<AgentUsage> = {}): AgentUsage {
@@ -198,7 +199,11 @@ describe("computeBudgetState", () => {
     expect(state.directiveToClaude).toContain("分给 Claude");
   });
 
-  test("recommends parallel when both sides have high remaining and a nearby five-hour reset", () => {
+  test("v3 P4: parallel phase is retired — high remaining + near reset stays normal", () => {
+    // Former "parallel" trigger (both sides flush, a nearby 5h reset) no longer
+    // produces a parallel directive; the underutilization advice replaces it and
+    // is driven by the weekly will-not-fill verdict, not 5h remaining. Without
+    // burn data, no advice fires → normal.
     const state = computeBudgetState(
       usage({ gateUtil: 20, warnUtil: 20, remaining: 80, fiveHour: { util: 20, resetEpoch: NOW + 3500 } }),
       usage({ gateUtil: 25, warnUtil: 25, remaining: 75, fiveHour: { util: 25, resetEpoch: NOW + 5000 } }),
@@ -206,63 +211,12 @@ describe("computeBudgetState", () => {
       NOW,
     );
 
-    expect(state.phase).toBe("parallel");
-    expect(state.parallel.recommended).toBe(true);
-    expect(state.directiveToClaude).toContain("并行");
+    expect(state.phase).toBe("normal");
+    expect(state.parallel.recommended).toBe(false);
+    expect(state.directiveToClaude).toBeNull();
   });
 
-  test("does not recommend parallel outside remaining and reset boundaries", () => {
-    const lowRemaining = computeBudgetState(
-      usage({ gateUtil: 41, warnUtil: 41, remaining: 59, fiveHour: { util: 41, resetEpoch: NOW + 3500 } }),
-      usage({ gateUtil: 20, warnUtil: 20, remaining: 80, fiveHour: { util: 20, resetEpoch: NOW + 3500 } }),
-      { ...CONFIG, syncDriftPct: 100 },
-      NOW,
-    );
-    expect(lowRemaining.phase).toBe("normal");
-
-    const lateReset = computeBudgetState(
-      usage({ gateUtil: 39, warnUtil: 39, remaining: 61, fiveHour: { util: 39, resetEpoch: NOW + 3600 } }),
-      usage({ gateUtil: 20, warnUtil: 20, remaining: 80, fiveHour: { util: 20, resetEpoch: NOW + 7200 } }),
-      { ...CONFIG, syncDriftPct: 100 },
-      NOW,
-    );
-    expect(lateReset.phase).toBe("normal");
-  });
-
-  test("parallel boundary matrix only triggers with 61% remaining and 59 minutes to reset", () => {
-    const cfg = { ...CONFIG, syncDriftPct: 100 };
-    const cases = [
-      { remaining: 59, resetSec: 59 * 60, expected: "normal" },
-      { remaining: 59, resetSec: 61 * 60, expected: "normal" },
-      { remaining: 61, resetSec: 59 * 60, expected: "parallel" },
-      { remaining: 61, resetSec: 61 * 60, expected: "normal" },
-    ] as const;
-
-    for (const item of cases) {
-      const gateUtil = 100 - item.remaining;
-      const state = computeBudgetState(
-        usage({
-          gateUtil,
-          warnUtil: gateUtil,
-          remaining: item.remaining,
-          fiveHour: { util: gateUtil, resetEpoch: NOW + item.resetSec },
-        }),
-        usage({
-          gateUtil,
-          warnUtil: gateUtil,
-          remaining: item.remaining,
-          fiveHour: { util: gateUtil, resetEpoch: NOW + item.resetSec },
-        }),
-        cfg,
-        NOW,
-      );
-
-      expect(state.phase).toBe(item.expected);
-      expect(state.parallel.recommended).toBe(item.expected === "parallel");
-    }
-  });
-
-  test("combines balance and parallel into one balance directive", () => {
+  test("balance directive (warnUtil basis) names the lighter side without a parallel addendum", () => {
     const state = computeBudgetState(
       usage({ gateUtil: 20, warnUtil: 40, remaining: 80, fiveHour: { util: 20, resetEpoch: NOW + 1200 } }),
       usage({ gateUtil: 10, warnUtil: 20, remaining: 90, fiveHour: { util: 10, resetEpoch: NOW + 1800 } }),
@@ -271,9 +225,11 @@ describe("computeBudgetState", () => {
     );
 
     expect(state.phase).toBe("balance");
-    expect(state.parallel.recommended).toBe(true);
+    expect(state.parallel.recommended).toBe(false);
     expect(state.directiveToClaude).toContain("Codex");
-    expect(state.directiveToClaude).toContain("并行");
+    // No runway passed → warnUtil basis text, never the retired parallel addendum.
+    expect(state.directiveToClaude).toContain("用量比例漂移");
+    expect(state.directiveToClaude).not.toContain("并行");
   });
 
   test("keeps phase normal when one side is unknown and known side is healthy", () => {

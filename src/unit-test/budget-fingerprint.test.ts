@@ -25,6 +25,7 @@ const CONFIG: BudgetConfig = {
     eco: { effort: "low" },
   },
   maximize: { targetUtil: 97, reserveSlopePctPerHour: 0.4, reserveMaxPct: 7, finishingHorizonMinutes: 30, resumeHysteresisPct: 5 },
+  allocation: { minRunwayRatio: 50, minRunwayGapHours: 2 },
 };
 
 function usage(overrides: Partial<AgentUsage> = {}): AgentUsage {
@@ -158,14 +159,19 @@ describe("classifyPoll reducer — event coverage", () => {
     expect(effects[1]).toEqual({ kind: "none", recoveredSides: [] });
   });
 
-  test("advise: parallel phase emits with phase=parallel", () => {
-    const parallel = state(
-      usage({ gateUtil: 20, warnUtil: 20, remaining: 80, fiveHour: { util: 20, resetEpoch: NOW + 3500 } }),
-      usage({ gateUtil: 25, warnUtil: 25, remaining: 75, fiveHour: { util: 25, resetEpoch: NOW + 5000 } }),
+  test("advise: underutilized phase emits with phase=underutilized", () => {
+    // v3 P4: parallel is retired; the underutilization advice is the new advise
+    // phase. A weekly window with a confident low burn rate projects far below
+    // target → will-not-fill → underutilized. (The cooldown gate lives in the
+    // coordinator, not this pure reducer.)
+    const wkly = { util: 20, resetEpoch: NOW + 500_000, burnRate: 0.1, burnConfident: true };
+    const underutilized = state(
+      usage({ gateUtil: 20, warnUtil: 20, weekly: wkly }),
+      usage({ gateUtil: 20, warnUtil: 20, weekly: wkly }),
     );
-    expect(parallel.phase).toBe("parallel");
-    const { effects } = runPolls([parallel]);
-    expect(effects[0]).toEqual({ kind: "advise", phase: "parallel", recoveredSides: [] });
+    expect(underutilized.phase).toBe("underutilized");
+    const { effects } = runPolls([underutilized]);
+    expect(effects[0]).toEqual({ kind: "advise", phase: "underutilized", recoveredSides: [] });
   });
 
   test("reset: advising → directive disappears (decision-grade) clears fingerprint", () => {
@@ -430,6 +436,7 @@ describe("directiveFingerprint — pure fingerprint", () => {
         resetEpochs: { claude: 0, codex: 0 },
       },
       parallel: { recommended: false, reason: null },
+      underutilization: { recommended: false, reason: null },
       effort: { claudeAdvice: null, codexTier: "full" },
       directiveToClaude: "balance",
     };
