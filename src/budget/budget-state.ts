@@ -1,4 +1,5 @@
 import { matchingGateReset } from "./budget-gate";
+import { formatBeijing } from "./format-time";
 import {
   agentShouldAdmitClose,
   agentShouldPause,
@@ -62,13 +63,12 @@ function pct(value: number): string {
 }
 
 function formatEpoch(epoch: number | null): string {
-  if (!epoch || epoch <= 0) return "未知";
-  return new Date(epoch * 1000).toISOString().replace("T", " ").replace(/\.\d+Z$/, "Z");
+  return formatBeijing(epoch);
 }
 
 function usageSummary(name: AgentName, usage: AgentUsage | null): string {
   if (!usage) return `${AGENT_LABEL[name]} 未知`;
-  return `${AGENT_LABEL[name]} gate=${pct(usage.gateUtil)} warn=${pct(usage.warnUtil)} 5h重置=${formatEpoch(usage.fiveHour?.resetEpoch ?? 0)}`;
+  return `${AGENT_LABEL[name]} gate=${pct(usage.gateUtil)} warn=${pct(usage.warnUtil)} 5h重置=${formatEpoch(usage.fiveHour?.resetEpoch ?? 0)}（北京时间）`;
 }
 
 function resumeAfterEpoch(

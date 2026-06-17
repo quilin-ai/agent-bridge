@@ -34,6 +34,7 @@ import {
   resumeBlockingEpochFor,
 } from "./budget-decision";
 import type { PendingEntry } from "./pending-reader";
+import { formatBeijing } from "./format-time";
 import type { AgentName, AgentUsage, BudgetConfig, BudgetState } from "./types";
 
 /** Active side, identical to the old pauseSide() bijection over activeSides. */
@@ -54,7 +55,7 @@ function pct(value: number): string {
 }
 
 function formatEpoch(epoch: number): string {
-  return new Date(epoch * 1000).toISOString().replace("T", " ").replace(/\.\d+Z$/, "Z");
+  return formatBeijing(epoch);
 }
 
 /**
@@ -224,7 +225,7 @@ function removedAgents(prevSide: PauseSide, currentSide: PauseSide): AgentName[]
 function activeSideReason(agent: AgentName, usage: AgentUsage | null, cfg: BudgetConfig, now: number): string {
   if (!usage) return `${AGENT_LABEL[agent]} 探测暂时不可用，保持上一轮预算干预`;
   if (usage.rateLimitedUntil > now) {
-    return `${AGENT_LABEL[agent]} 探针被限流至 ${formatEpoch(usage.rateLimitedUntil)}`;
+    return `${AGENT_LABEL[agent]} 探针被限流至 ${formatEpoch(usage.rateLimitedUntil)}（北京时间）`;
   }
   // Delegate the "why paused" text to the decision layer (dynamic-line string,
   // or the gateUtil fallback string when burn data is absent).
@@ -548,7 +549,7 @@ function admissionReason(side: PauseSide, state: BudgetState, cfg: BudgetConfig)
       // rateLimitedUntil > now) even though agentShouldAdmitClose no longer trips
       // — without this branch that hold would mislabel as the hysteresis band.
       if (usage.rateLimitedUntil > state.now) {
-        return `${AGENT_LABEL[agent]} 探针被限流至 ${formatEpoch(usage.rateLimitedUntil)}，保持收尾保护`;
+        return `${AGENT_LABEL[agent]} 探针被限流至 ${formatEpoch(usage.rateLimitedUntil)}（北京时间），保持收尾保护`;
       }
       const decision = agentShouldAdmitClose(agent, usage, cfg, state.now);
       if (decision.admitClose) return decision.reason;

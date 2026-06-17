@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { computeBudgetState } from "../budget/budget-state";
+import { formatBeijing } from "../budget/format-time";
 import type { AgentUsage, BudgetConfig } from "../budget/types";
 
 const NOW = 1_700_000_000;
@@ -158,8 +159,8 @@ describe("computeBudgetState", () => {
     expect(state.phase).toBe("paused");
     expect(state.pause.side).toBe("codex");
     expect(state.pause.resumeAfterEpoch).toBe(NOW + 600);
-    const codexResume = new Date((NOW + 600) * 1000).toISOString().replace("T", " ").replace(/\.\d+Z$/, "Z");
-    const claudeReset = new Date((NOW + 7200) * 1000).toISOString().replace("T", " ").replace(/\.\d+Z$/, "Z");
+    const codexResume = formatBeijing(NOW + 600);
+    const claudeReset = formatBeijing(NOW + 7200);
     expect(state.directiveToClaude).toContain(`预计恢复时间（以实测为准；提前刷新会更早解除）：${codexResume}`);
     expect(state.directiveToClaude).not.toContain(`预计恢复时间（以实测为准；提前刷新会更早解除）：${claudeReset}`);
   });

@@ -7,6 +7,7 @@
  */
 
 import { agentWeeklyFiveHourWindowsLeft } from "./burn-view";
+import { formatBeijing, formatBeijingClock } from "./format-time";
 import type {
   AgentBurnRates,
   AgentUsage,
@@ -40,8 +41,7 @@ export function resolveGuardHardHint(
 }
 
 function formatEpoch(epochSeconds: number | null | undefined): string {
-  if (!epochSeconds || epochSeconds <= 0) return "未知";
-  return new Date(epochSeconds * 1000).toISOString().replace("T", " ").replace(/\.\d+Z$/, "Z");
+  return formatBeijing(epochSeconds);
 }
 
 function formatWindow(window: { util: number; resetEpoch: number } | null, label: string): string {
@@ -97,12 +97,9 @@ export function formatDuration(seconds: number): string {
   return `${hours}小时${minutes}分钟`;
 }
 
-/** Format an epoch as a LOCAL-timezone wall-clock 「HH:MM」. */
+/** Format an epoch as a Beijing-time wall-clock 「HH:MM」. */
 export function formatClockTime(epochSeconds: number): string {
-  const date = new Date(epochSeconds * 1000);
-  const hh = String(date.getHours()).padStart(2, "0");
-  const mm = String(date.getMinutes()).padStart(2, "0");
-  return `${hh}:${mm}`;
+  return formatBeijingClock(epochSeconds);
 }
 
 function formatWindowRate(label: string, rate: BurnRate | null): string | null {
@@ -115,7 +112,7 @@ function formatWindowRate(label: string, rate: BurnRate | null): string | null {
  * The runway display segment. All numbers are the guard's verbatim fields
  * (constraint #2: the bridge never recomputes) — this function only formats:
  *  - duration from runway_seconds;
- *  - 「至 HH:MM」 from depleted_at_epoch (local clock; omitted when absent);
+ *  - 「至 HH:MM」 from depleted_at_epoch (Beijing clock; omitted when absent);
  *  - the reset-truncation note when runway_seconds ends at the basis
  *    window's reset (refresh un-blocks before depletion would).
  */
@@ -268,7 +265,7 @@ export function renderBudgetSnapshot(
   // `?? snapshot.phase` degrades an unknown phase (cross-version skew / a future
   // phase a stale bundle has not learned) to its raw string instead of rendering
   // "undefined".
-  lines.push(`【预算快照 · 账号级】阶段：${PHASE_LABELS[snapshot.phase] ?? snapshot.phase} · 更新于 ${formatEpoch(snapshot.updatedAt)}`);
+  lines.push(`【预算快照 · 账号级】阶段：${PHASE_LABELS[snapshot.phase] ?? snapshot.phase} · 更新于 ${formatEpoch(snapshot.updatedAt)}（时间均为北京时间 UTC+8）`);
   lines.push(formatAgent("Claude", snapshot.claude, snapshot.updatedAt));
   lines.push(formatAgent("Codex", snapshot.codex, snapshot.updatedAt));
 
