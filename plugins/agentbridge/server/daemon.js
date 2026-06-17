@@ -30,10 +30,10 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.17", "0.0.0-source"),
-  commit: defineString("02064f0", "source"),
+  commit: defineString("ca19f6a", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION),
-  codeHash: defineString("6cbaf424d274", "source")
+  codeHash: defineString("1b88232d447e", "source")
 });
 function daemonStatusBuildInfo() {
   return { ...BUILD_INFO };
@@ -1016,6 +1016,9 @@ class CodexAdapter extends EventEmitter {
   }
   get activeThreadId() {
     return this.threadId;
+  }
+  canInject() {
+    return !!this.threadId && this.appServerWs?.readyState === WebSocket.OPEN && !this.turnInProgress;
   }
   get capturedAppServerInfo() {
     return this.appServerInfo;
@@ -3460,6 +3463,14 @@ function consumeWrapUp(path, fiveHourResetEpoch, limit, log = () => {}) {
   }
   return { allowed: true, used: next.wrapUpUsed, remaining: Math.max(0, limit - next.wrapUpUsed) };
 }
+function consumeCheckpointBaton(path, fiveHourResetEpoch, log = () => {}) {
+  if (!Number.isFinite(fiveHourResetEpoch))
+    return false;
+  const state = currentWindowState(path, fiveHourResetEpoch, log);
+  if (state.checkpointBatonUsed)
+    return false;
+  return persist(path, { ...state, checkpointBatonUsed: true }, log);
+}
 
 // src/config-service.ts
 import { readFileSync as readFileSync4, mkdirSync as mkdirSync4, existsSync as existsSync4 } from "fs";
@@ -4268,6 +4279,18 @@ function renderBudgetInterventionDirective(claude, codex, side, reason, resumeEp
   ].join(`
 `);
 }
+function renderBudgetAdmissionDirective(claude, codex, side, reason, resetEpoch, cfg) {
+  const resetText = `\u5BF9\u5E94\u7A97\u53E3\u7EA6 ${formatEpoch(resetEpoch)} \u5237\u65B0\uFF08\u4EE5\u5B9E\u6D4B\u4E3A\u51C6\uFF1B\u63D0\u524D\u5237\u65B0\u4F1A\u66F4\u65E9\u89E3\u9664\uFF09`;
+  const head = side === "both" ? "\u3010\u9884\u7B97\u534F\u8C03 \xB7 \u8D26\u53F7\u7EA7\u3011\u53CC\u65B9\u8FDB\u5165\u6536\u5C3E\u4FDD\u62A4\uFF08admission-closed\uFF09\u3002" : "\u3010\u9884\u7B97\u534F\u8C03 \xB7 \u8D26\u53F7\u7EA7\u3011Codex \u4FA7\u8FDB\u5165\u6536\u5C3E\u4FDD\u62A4\uFF08admission-closed\uFF09\u3002";
+  return [
+    head,
+    `\u89E6\u53D1\u539F\u56E0\uFF1A${reason}\u3002`,
+    `${usageSummary("claude", claude)}\uFF1B${usageSummary("codex", codex)}\u3002`,
+    `\u95F8\u95E8\u5DF2\u6536\u7D27\uFF1A\u65B0\u7684 Codex \u4EFB\u52A1\u4F1A\u88AB\u62D2\uFF08budget_admission\uFF09\uFF0C\u4F46\u4ECD\u53EF\u7528 reply \u5E26 wrap_up=true \u628A\u5F53\u524D\u534F\u4F5C\u6536\u5C3E\u5230 checkpoint` + `\uFF08\u6BCF\u7A97\u53E3\u81F3\u591A ${cfg.maximize.wrapUpQuota} \u4E2A\uFF09\uFF0Csteer \u4FEE\u6B63\u4E0D\u53D7\u9650\uFF1B${resetText}\u3002`,
+    "\u5EFA\u8BAE\uFF1A\u4E0D\u8981\u518D\u5411 Codex \u6D3E\u65B0\u4EFB\u52A1\uFF1B\u628A\u5F53\u524D Codex \u534F\u4F5C\u6536\u5C3E\u3001\u5199 checkpoint\uFF0C\u53EF\u72EC\u7ACB\u63A8\u8FDB\u7684\u90E8\u5206 Claude \u53EF solo \u7EE7\u7EED\u3002"
+  ].join(`
+`);
+}
 function balanceDirective(claude, codex, drift, basis, runway) {
   const heavier = drift.heavier ? AGENT_LABEL2[drift.heavier] : "\u672A\u77E5";
   const lighter = drift.lighter ? AGENT_LABEL2[drift.lighter] : "\u672A\u77E5";
@@ -4310,7 +4333,7 @@ function computeBudgetState(claude, codex, cfg, now, runway = NO_RUNWAY) {
   const paused = triggers.length > 0;
   const { drift, basis } = allocationDrift(claude, codex, runway, cfg);
   const parallel = { recommended: false, reason: null };
-  const adviceEligible = !paused && claude !== null && codex !== null && claude.rateLimitedUntil <= now && codex.rateLimitedUntil <= now && isDecisionGrade(claude, now) && isDecisionGrade(codex, now);
+  const adviceEligible = !paused && claude !== null && codex !== null && claude.rateLimitedUntil <= now && codex.rateLimitedUntil <= now && isDecisionGrade(claude, now) && isDecisionGrade(codex, now) && !agentShouldAdmitClose("claude", claude, cfg, now).admitClose && !agentShouldAdmitClose("codex", codex, cfg, now).admitClose;
   const balanceActive = adviceEligible && drift.heavier !== null && drift.lighter !== null;
   const underutilization = adviceEligible && !balanceActive ? underutilizationState(claude, codex, cfg, now) : { recommended: false, reason: null };
   const resetEpochs = {
@@ -4794,10 +4817,13 @@ class BudgetCoordinator {
   onResume;
   resumeSignals;
   adviceCooldown;
+  isCodexTurnActive;
   timer = null;
   running = false;
   fpState = INITIAL_FINGERPRINT_STATE;
   admissionState = INITIAL_ADMISSION_STATE;
+  pendingAdmissionDirective = null;
+  lastEmittedAdmissionFingerprint = null;
   resumeCandidate = {};
   latestSnapshot = null;
   pendingOverrideTier = null;
@@ -4821,6 +4847,7 @@ class BudgetCoordinator {
       cooldownSec: resolveAdviceCooldownSec(),
       log: this.log
     });
+    this.isCodexTurnActive = options.isCodexTurnActive ?? (() => false);
   }
   async start() {
     if (this.running || !this.config.enabled)
@@ -4939,8 +4966,13 @@ class BudgetCoordinator {
     const { next, effect } = classifyPoll(this.fpState, state, this.config);
     this.fpState = next;
     this.admissionState = classifyAdmission(this.admissionState, state, this.config).next;
+    this.applyAdmissionDirective(state);
     this.resumeCandidate = this.resumeSignals ? computeResumeCandidate(resumeCandidateSides(effect), state, this.config, this.resumeSignals()) : {};
     for (const side of effect.recoveredSides) {
+      if (side === "codex" && (this.admissionState.side === "codex" || this.admissionState.side === "both")) {
+        this.log(`Budget recovery for Codex held: pause cleared but still admission-closed`);
+        continue;
+      }
       const { id, directive } = this.emitRecovery(side, state);
       this.onResume(side, directive, id);
     }
@@ -4959,6 +4991,10 @@ class BudgetCoordinator {
         return;
       }
       case "advise": {
+        if (this.gateState() !== "open") {
+          this.fpState = { ...this.fpState, fingerprint: null };
+          return;
+        }
         if (effect.phase === "underutilized") {
           if (!this.adviceCooldown.tryAcquire("underutilization", state.now))
             return;
@@ -4971,6 +5007,51 @@ class BudgetCoordinator {
       case "none":
         return;
     }
+  }
+  applyAdmissionDirective(state) {
+    const side = this.admissionState.side;
+    if (side !== "codex" && side !== "both") {
+      this.pendingAdmissionDirective = null;
+      this.lastEmittedAdmissionFingerprint = null;
+      return;
+    }
+    const fingerprint = this.admissionState.fingerprint;
+    if (fingerprint === null || fingerprint === this.lastEmittedAdmissionFingerprint) {
+      this.pendingAdmissionDirective = null;
+      return;
+    }
+    if (this.isPaused()) {
+      this.pendingAdmissionDirective = null;
+      return;
+    }
+    const content = renderBudgetAdmissionDirective(state.perAgent.claude, state.perAgent.codex, side, this.admissionState.reason ?? "\u989D\u5EA6\u7A97\u53E3\u6536\u5C3E\u4FDD\u62A4", this.admissionResetEpoch(state), this.config);
+    if (this.isCodexTurnActive()) {
+      this.pendingAdmissionDirective = { content, fingerprint };
+      return;
+    }
+    this.emitAdmission(content, fingerprint);
+  }
+  emitAdmission(content, fingerprint) {
+    this.emitDirective("system_budget_admission", content);
+    this.lastEmittedAdmissionFingerprint = fingerprint;
+    this.pendingAdmissionDirective = null;
+  }
+  admissionResetEpoch(state) {
+    const usage = state.perAgent.codex;
+    const now = state.now;
+    const fiveHour = usage?.fiveHour?.resetEpoch ?? 0;
+    const weekly = usage?.weekly?.resetEpoch ?? 0;
+    const fresh = fiveHour > now ? fiveHour : weekly > now ? weekly : 0;
+    return fresh > 0 ? fresh : null;
+  }
+  onCodexTurnIdle() {
+    const pending = this.pendingAdmissionDirective;
+    if (!pending)
+      return;
+    this.pendingAdmissionDirective = null;
+    if (this.isPaused() || this.gateState() !== "admission-closed")
+      return;
+    this.emitAdmission(pending.content, pending.fingerprint);
   }
   tierControlEnabled() {
     if (!this.config.codexTierControl)
@@ -6669,7 +6750,10 @@ function ensureBudgetCoordinatorStarted() {
       onPauseChange: (paused) => {
         log(`Budget intervention ${paused ? "ACTIVE" : "CLEARED"} ` + `(gate ${budgetCoordinator?.isGateClosed() ? "CLOSED" : "OPEN"})`);
       },
-      onSnapshot: () => broadcastStatus(),
+      onSnapshot: () => {
+        broadcastStatus();
+        maybeFireCheckpointBaton("snapshot");
+      },
       log,
       onResume: (side, _directive, resumeId) => {
         if (side === "claude") {
@@ -6680,7 +6764,8 @@ function ensureBudgetCoordinatorStarted() {
           enqueueCodex: enqueueCodexBudgetResume
         });
       },
-      resumeSignals: readResumeSignals
+      resumeSignals: readResumeSignals,
+      isCodexTurnActive: () => codex.turnInProgress
     });
   }
   budgetCoordinator.start();
@@ -6704,6 +6789,71 @@ function budgetAdmissionGateError(windowResetEpoch, wrapUpLeft, quotaExhausted) 
   }
   return `\u989D\u5EA6\u7A97\u53E3\u6536\u5C3E\u4FDD\u62A4\u4E2D\uFF08admission-closed\uFF09\uFF1A\u4EC5\u63A5\u6536\u6536\u5C3E\u7C7B\u6CE8\u5165\uFF0C\u5DF2\u62D2\u7EDD\u8BE5\u65B0\u4EFB\u52A1\u3002` + `\u5982\u9700\u628A\u5F53\u524D\u534F\u4F5C\u6536\u5C3E\u5230 checkpoint\uFF0C\u53EF\u7528 reply \u5E26 wrap_up=true \u91CD\u53D1\uFF08\u672C\u7A97\u53E3\u8FD8\u5269 ${wrapUpLeft} \u4E2A\u6536\u5C3E\u914D\u989D\uFF09\uFF1Bsteer \u4FEE\u6B63\u4E0D\u53D7\u9650\u3002` + `\u65B0\u4EFB\u52A1\u8BF7\u7B49\u989D\u5EA6\u7A97\u53E3\u5237\u65B0\uFF08\u7EA6 ${resetAt}\uFF09\u540E\u518D\u6D3E\u3002`;
 }
+function evaluateInjectionBudgetGate(message, willInject, isSteer) {
+  const gateState = budgetCoordinator?.gateState() ?? "open";
+  if (gateState === "closed") {
+    log(`Injection rejected by budget pause gate`);
+    const resumeAfterEpoch3 = budgetCoordinator?.getSnapshot()?.resumeAfterEpoch ?? null;
+    const retryAfterMs = retryAfterMsForResume(resumeAfterEpoch3, Date.now());
+    return {
+      allow: false,
+      code: "budget_paused",
+      error: budgetPauseGateError(),
+      ...retryAfterMs !== undefined ? { retryAfterMs } : {}
+    };
+  }
+  if (gateState === "admission-closed" && !isSteer) {
+    const nowSec = Math.floor(Date.now() / 1000);
+    const admSnap = budgetCoordinator?.getSnapshot()?.codex;
+    const admFiveHour = admSnap?.fiveHour?.resetEpoch ?? 0;
+    const admWeekly = admSnap?.weekly?.resetEpoch ?? 0;
+    const admissionWindowReset = admFiveHour > nowSec ? admFiveHour : admWeekly > nowSec ? admWeekly : 0;
+    if (admissionWindowReset <= 0) {
+      log(`Injection rejected by admission gate: no fresh quota window (probe stale / snapshot lost)`);
+      return { allow: false, code: "budget_admission", error: budgetAdmissionGateError(0, 0, true) };
+    }
+    if (message.wrapUp === true && willInject) {
+      const peek = currentWindowState(stateDir.admissionQuotaFile, admissionWindowReset, log);
+      if (peek.wrapUpUsed >= BUDGET_CONFIG.maximize.wrapUpQuota) {
+        log(`Injection rejected by admission gate: wrap-up quota exhausted`);
+        return { allow: false, code: "budget_admission", error: budgetAdmissionGateError(admissionWindowReset, 0, true) };
+      }
+      log(`Admission-closed: wrap-up permitted (${peek.wrapUpUsed}/${BUDGET_CONFIG.maximize.wrapUpQuota} used; slot committed on inject)`);
+      return { allow: true, pendingWrapUpReset: admissionWindowReset };
+    }
+    if (message.wrapUp === true && !willInject) {
+      return { allow: true, pendingWrapUpReset: null };
+    }
+    const left = Math.max(0, BUDGET_CONFIG.maximize.wrapUpQuota - currentWindowState(stateDir.admissionQuotaFile, admissionWindowReset, log).wrapUpUsed);
+    log(`Injection rejected by admission gate: new task (set wrap_up to finish the current work)`);
+    return { allow: false, code: "budget_admission", error: budgetAdmissionGateError(admissionWindowReset, left, false) };
+  }
+  return { allow: true, pendingWrapUpReset: null };
+}
+var CHECKPOINT_BATON_PROMPT = "\u3010\u9884\u7B97\u534F\u8C03 \xB7 \u7CFB\u7EDF\u53D1\u8D77\u3011\u8D26\u53F7\u7EA7\u989D\u5EA6\u5373\u5C06\u8017\u5C3D\uFF0C\u95F8\u95E8\u5DF2\u5173\u95ED\u3002\u8FD9\u662F\u672C\u989D\u5EA6\u7A97\u53E3\u552F\u4E00\u4E00\u6B21\u7CFB\u7EDF\u63D0\u9192\uFF1A" + "\u8BF7\u7ACB\u5373\u628A\u5F53\u524D\u8FDB\u5EA6\u5199\u5165 checkpoint\uFF08.agent/checkpoint.md\uFF1A\u4EFB\u52A1 / \u5DF2\u5B8C\u6210 / \u8FDB\u884C\u4E2D\u65AD\u70B9 / \u4E0B\u4E00\u6B65 / \u5173\u952E\u51B3\u7B56\u4E0E\u7EA6\u675F\uFF09\uFF0C" + "\u7136\u540E\u505C\u624B\u7B49\u5F85\u989D\u5EA6\u7A97\u53E3\u5237\u65B0\uFF1B\u5237\u65B0\u524D\u4E0D\u8981\u518D\u5F00\u65B0\u4EFB\u52A1\u3002\u6B64\u4E3A\u7CFB\u7EDF\u63D0\u9192\uFF0C\u65E0\u9700\u56DE\u590D Claude\u3002";
+function maybeFireCheckpointBaton(trigger) {
+  if (!budgetCoordinator)
+    return;
+  if (budgetCoordinator.gateState() !== "closed")
+    return;
+  if (!codex.canInject())
+    return;
+  const nowSec = Math.floor(Date.now() / 1000);
+  const snap = budgetCoordinator.getSnapshot()?.codex;
+  const fiveHour = snap?.fiveHour?.resetEpoch ?? 0;
+  const weekly = snap?.weekly?.resetEpoch ?? 0;
+  const windowReset = fiveHour > nowSec ? fiveHour : weekly > nowSec ? weekly : 0;
+  if (windowReset <= 0)
+    return;
+  if (!consumeCheckpointBaton(stateDir.admissionQuotaFile, windowReset, log))
+    return;
+  const injectionId = codex.injectMessage(CHECKPOINT_BATON_PROMPT);
+  if (injectionId === null) {
+    log(`Checkpoint baton (${trigger}): inject failed after consume \u2014 baton lost this window (reset ${windowReset})`);
+    return;
+  }
+  log(`Checkpoint baton fired (${trigger}, window reset ${windowReset})`);
+}
 var tuiConnectionState = new TuiConnectionState({
   disconnectGraceMs: TUI_DISCONNECT_GRACE_MS,
   log,
@@ -6725,6 +6875,10 @@ function tryWriteStatusFile(reason) {
 codex.on("turnPhaseChanged", ({ phase, previous }) => {
   log(`Codex turn phase: ${previous} \u2192 ${phase}`);
   tryWriteStatusFile(`turnPhase:${phase}`);
+  if (phase === "idle" || phase === "aborted") {
+    budgetCoordinator?.onCodexTurnIdle();
+    maybeFireCheckpointBaton("turnIdle");
+  }
   broadcastStatus();
 });
 codex.on("steerFailed", ({ requestId, reason }) => {
@@ -7130,62 +7284,20 @@ async function handleClaudeToCodex(ws, message) {
     return;
   }
   let pendingWrapUpReset = null;
-  const gateState = budgetCoordinator?.gateState() ?? "open";
-  if (gateState === "closed") {
-    const reason = budgetPauseGateError();
-    log(`Injection rejected by budget pause gate`);
-    const resumeAfterEpoch3 = budgetCoordinator?.getSnapshot()?.resumeAfterEpoch ?? null;
-    const retryAfterMs = retryAfterMsForResume(resumeAfterEpoch3, Date.now());
-    sendClaudeToCodexResult(ws, message.requestId, {
-      success: false,
-      code: "budget_paused",
-      error: reason,
-      ...retryAfterMs !== undefined ? { retryAfterMs } : {}
-    });
-    return;
-  }
-  if (gateState === "admission-closed") {
+  {
     const isSteer = codex.turnInProgress && message.onBusy === "steer";
-    if (!isSteer) {
-      const nowSec = Math.floor(Date.now() / 1000);
-      const admSnap = budgetCoordinator?.getSnapshot()?.codex;
-      const admFiveHour = admSnap?.fiveHour?.resetEpoch ?? 0;
-      const admWeekly = admSnap?.weekly?.resetEpoch ?? 0;
-      const admissionWindowReset = admFiveHour > nowSec ? admFiveHour : admWeekly > nowSec ? admWeekly : 0;
-      if (admissionWindowReset <= 0) {
-        log(`Injection rejected by admission gate: no fresh quota window (probe stale / snapshot lost)`);
-        sendClaudeToCodexResult(ws, message.requestId, {
-          success: false,
-          code: "budget_admission",
-          error: budgetAdmissionGateError(0, 0, true)
-        });
-        return;
-      }
-      const willInject = !codex.turnInProgress || message.onBusy === "interrupt";
-      if (message.wrapUp === true && willInject) {
-        const peek = currentWindowState(stateDir.admissionQuotaFile, admissionWindowReset, log);
-        if (peek.wrapUpUsed >= BUDGET_CONFIG.maximize.wrapUpQuota) {
-          log(`Injection rejected by admission gate: wrap-up quota exhausted`);
-          sendClaudeToCodexResult(ws, message.requestId, {
-            success: false,
-            code: "budget_admission",
-            error: budgetAdmissionGateError(admissionWindowReset, 0, true)
-          });
-          return;
-        }
-        pendingWrapUpReset = admissionWindowReset;
-        log(`Admission-closed: wrap-up permitted (${peek.wrapUpUsed}/${BUDGET_CONFIG.maximize.wrapUpQuota} used; slot committed on inject)`);
-      } else if (message.wrapUp === true && !willInject) {} else {
-        const left = Math.max(0, BUDGET_CONFIG.maximize.wrapUpQuota - currentWindowState(stateDir.admissionQuotaFile, admissionWindowReset, log).wrapUpUsed);
-        log(`Injection rejected by admission gate: new task (set wrap_up to finish the current work)`);
-        sendClaudeToCodexResult(ws, message.requestId, {
-          success: false,
-          code: "budget_admission",
-          error: budgetAdmissionGateError(admissionWindowReset, left, false)
-        });
-        return;
-      }
+    const willInject = !codex.turnInProgress || message.onBusy === "interrupt";
+    const gate = evaluateInjectionBudgetGate(message, willInject, isSteer);
+    if (!gate.allow) {
+      sendClaudeToCodexResult(ws, message.requestId, {
+        success: false,
+        code: gate.code,
+        error: gate.error,
+        ...gate.retryAfterMs !== undefined ? { retryAfterMs: gate.retryAfterMs } : {}
+      });
+      return;
     }
+    pendingWrapUpReset = gate.pendingWrapUpReset;
   }
   const requireReply = !!message.requireReply;
   let contentToSend = message.message.content;
@@ -7273,6 +7385,21 @@ async function handleClaudeToCodex(ws, message) {
     }
     if (interruptThreadId && codex.activeThreadId !== interruptThreadId) {
       releaseInterruptKey();
+    }
+    {
+      const gate = evaluateInjectionBudgetGate(message, true, false);
+      if (!gate.allow) {
+        releaseInterruptKey();
+        log(`Interrupt-path injection rejected by budget gate after await (${gate.code})`);
+        sendClaudeToCodexResult(ws, message.requestId, {
+          success: false,
+          code: gate.code,
+          error: gate.error,
+          ...gate.retryAfterMs !== undefined ? { retryAfterMs: gate.retryAfterMs } : {}
+        });
+        return;
+      }
+      pendingWrapUpReset = gate.pendingWrapUpReset;
     }
   }
   const injectThreadId = codex.activeThreadId;
