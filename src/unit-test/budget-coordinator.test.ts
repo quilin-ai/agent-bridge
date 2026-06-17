@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BudgetCoordinator, nextBudgetPollDelayMs } from "../budget/budget-coordinator";
+import { formatBeijing } from "../budget/format-time";
 import { AdviceCooldown } from "../budget/advice-cooldown";
 import type { ResumeSignals } from "../budget/budget-fingerprint";
 import type { AgentName, AgentUsage, BudgetConfig } from "../budget/types";
@@ -1652,8 +1653,7 @@ describe("admission directive emission — v3 P3 (M3b, turnPhase-aware)", () => 
     expect(coordinator.gateState()).toBe("admission-closed");
     const ad = emitted.find((e) => e.id.startsWith("system_budget_admission"));
     expect(ad).toBeDefined();
-    const fmt = (epoch: number) => new Date(epoch * 1000).toISOString().replace("T", " ").replace(/\.\d+Z$/, "Z");
-    expect(ad!.content).toContain(`对应窗口约 ${fmt(NOW + 3_600)} 刷新`); // codex window
-    expect(ad!.content).not.toContain(`对应窗口约 ${fmt(NOW + 20_000)} 刷新`); // not claude's later window
+    expect(ad!.content).toContain(`对应窗口约 ${formatBeijing(NOW + 3_600)} 刷新`); // codex window
+    expect(ad!.content).not.toContain(`对应窗口约 ${formatBeijing(NOW + 20_000)} 刷新`); // not claude's later window
   });
 });

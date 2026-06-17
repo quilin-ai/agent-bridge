@@ -30,10 +30,10 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.20", "0.0.0-source"),
-  commit: defineString("2c84947", "source"),
+  commit: defineString("d6034c6", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION),
-  codeHash: defineString("d2425ba159fe", "source")
+  codeHash: defineString("efb5b785c5f9", "source")
 });
 function daemonStatusBuildInfo() {
   return { ...BUILD_INFO };
@@ -3861,6 +3861,36 @@ function retryAfterMsForResume(resumeAfterEpoch, nowMs) {
   return remainingMs > 0 ? remainingMs : undefined;
 }
 
+// src/budget/format-time.ts
+var BEIJING_TZ = "Asia/Shanghai";
+function parts(epochSeconds, options) {
+  const fmt = new Intl.DateTimeFormat("en-CA", {
+    timeZone: BEIJING_TZ,
+    hour12: false,
+    ...options
+  });
+  const out = {};
+  for (const part of fmt.formatToParts(new Date(epochSeconds * 1000))) {
+    out[part.type] = part.value;
+  }
+  return out;
+}
+function formatBeijing(epochSeconds) {
+  if (!epochSeconds || epochSeconds <= 0)
+    return "\u672A\u77E5";
+  const d = new Date(epochSeconds * 1000);
+  if (Number.isNaN(d.getTime()))
+    return "\u672A\u77E5";
+  const p = parts(epochSeconds, {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit"
+  });
+  return `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute}`;
+}
+
 // src/budget/types.ts
 var STALE_MAX_AGE_SEC = 600;
 
@@ -4149,14 +4179,12 @@ function pct2(value) {
   return `${Math.round(value * 10) / 10}%`;
 }
 function formatEpoch(epoch) {
-  if (!epoch || epoch <= 0)
-    return "\u672A\u77E5";
-  return new Date(epoch * 1000).toISOString().replace("T", " ").replace(/\.\d+Z$/, "Z");
+  return formatBeijing(epoch);
 }
 function usageSummary(name, usage) {
   if (!usage)
     return `${AGENT_LABEL2[name]} \u672A\u77E5`;
-  return `${AGENT_LABEL2[name]} gate=${pct2(usage.gateUtil)} warn=${pct2(usage.warnUtil)} 5h\u91CD\u7F6E=${formatEpoch(usage.fiveHour?.resetEpoch ?? 0)}`;
+  return `${AGENT_LABEL2[name]} gate=${pct2(usage.gateUtil)} warn=${pct2(usage.warnUtil)} 5h\u91CD\u7F6E=${formatEpoch(usage.fiveHour?.resetEpoch ?? 0)}\uFF08\u5317\u4EAC\u65F6\u95F4\uFF09`;
 }
 function resumeAfterEpoch(claude, codex, cfg, now) {
   const epochs = [
@@ -4452,7 +4480,7 @@ function pct3(value) {
   return `${Math.round(value * 10) / 10}%`;
 }
 function formatEpoch2(epoch) {
-  return new Date(epoch * 1000).toISOString().replace("T", " ").replace(/\.\d+Z$/, "Z");
+  return formatBeijing(epoch);
 }
 var INITIAL_FINGERPRINT_STATE = {
   side: null,
@@ -4500,7 +4528,7 @@ function activeSideReason(agent, usage, cfg, now) {
   if (!usage)
     return `${AGENT_LABEL3[agent]} \u63A2\u6D4B\u6682\u65F6\u4E0D\u53EF\u7528\uFF0C\u4FDD\u6301\u4E0A\u4E00\u8F6E\u9884\u7B97\u5E72\u9884`;
   if (usage.rateLimitedUntil > now) {
-    return `${AGENT_LABEL3[agent]} \u63A2\u9488\u88AB\u9650\u6D41\u81F3 ${formatEpoch2(usage.rateLimitedUntil)}`;
+    return `${AGENT_LABEL3[agent]} \u63A2\u9488\u88AB\u9650\u6D41\u81F3 ${formatEpoch2(usage.rateLimitedUntil)}\uFF08\u5317\u4EAC\u65F6\u95F4\uFF09`;
   }
   const decision = agentShouldPause(agent, usage, cfg, now);
   if (decision.pause)
@@ -4643,7 +4671,7 @@ function admissionReason(side, state, cfg) {
     if (!usage)
       return `${AGENT_LABEL3[agent]} \u63A2\u6D4B\u6682\u65F6\u4E0D\u53EF\u7528\uFF0C\u4FDD\u6301\u4E0A\u4E00\u8F6E\u6536\u5C3E\u4FDD\u62A4`;
     if (usage.rateLimitedUntil > state.now) {
-      return `${AGENT_LABEL3[agent]} \u63A2\u9488\u88AB\u9650\u6D41\u81F3 ${formatEpoch2(usage.rateLimitedUntil)}\uFF0C\u4FDD\u6301\u6536\u5C3E\u4FDD\u62A4`;
+      return `${AGENT_LABEL3[agent]} \u63A2\u9488\u88AB\u9650\u6D41\u81F3 ${formatEpoch2(usage.rateLimitedUntil)}\uFF08\u5317\u4EAC\u65F6\u95F4\uFF09\uFF0C\u4FDD\u6301\u6536\u5C3E\u4FDD\u62A4`;
     }
     const decision = agentShouldAdmitClose(agent, usage, cfg, state.now);
     if (decision.admitClose)
@@ -6778,13 +6806,13 @@ function stopBudgetCoordinator() {
 function budgetPauseGateError() {
   const snapshot = budgetCoordinator?.getSnapshot() ?? null;
   const reason = snapshot?.pauseReason ?? "Codex \u4FA7\u989D\u5EA6\u63A5\u8FD1\u8017\u5C3D";
-  const resumeAt = snapshot?.resumeAfterEpoch ? new Date(snapshot.resumeAfterEpoch * 1000).toISOString().replace("T", " ").replace(/\.\d+Z$/, "Z") : null;
+  const resumeAt = snapshot?.resumeAfterEpoch ? `${formatBeijing(snapshot.resumeAfterEpoch)}\uFF08\u5317\u4EAC\u65F6\u95F4\uFF09` : null;
   const sideHint = snapshot?.pauseSide === "both" ? "\u53CC\u4FA7\u989D\u5EA6\u5747\u5DF2\u8017\u5C3D\uFF0C\u8BF7\u5199 checkpoint \u7B49\u5F85\u5237\u65B0" : "\u4F60\u53EF\u7EE7\u7EED solo \u63A8\u8FDB\u53EF\u72EC\u7ACB\u90E8\u5206\uFF0C\u5E76\u5199 checkpoint \u6807\u6CE8\u5206\u5DE5\u65AD\u70B9";
   const reopenText = `Codex \u4FA7\u5404\u7A97\u53E3 util \u56DE\u843D\u81F3\u52A8\u6001\u6682\u505C\u7EBF \u2212 ${BUDGET_CONFIG.maximize.resumeHysteresisPct}% \u4EE5\u4E0B\u6216\u5BF9\u5E94\u7A97\u53E3\u5237\u65B0\u540E\u95F8\u95E8\u81EA\u52A8\u653E\u5F00`;
   return `\u9884\u7B97\u6682\u505C\uFF08\u95F8\u95E8\u5173\u95ED\uFF09\uFF0C\u5DF2\u62D2\u7EDD\u8F6C\u53D1\uFF1A${reason}\u3002` + reopenText + (resumeAt ? `\uFF08\u9884\u8BA1\u6062\u590D ${resumeAt}\uFF0C\u4EE5\u5B9E\u6D4B\u4E3A\u51C6\uFF1B\u63D0\u524D\u5237\u65B0\u4F1A\u66F4\u65E9\u89E3\u9664\uFF09` : "") + `\u3002\u6536\u5230 RESUME \u901A\u77E5\u524D\u8BF7\u52FF\u91CD\u8BD5\u5411 Codex \u53D1\u9001 reply\uFF1B${sideHint}\u3002`;
 }
 function budgetAdmissionGateError(windowResetEpoch, wrapUpLeft, quotaExhausted) {
-  const resetAt = windowResetEpoch > 0 ? new Date(windowResetEpoch * 1000).toISOString().replace("T", " ").replace(/\.\d+Z$/, "Z") : "\u672A\u77E5";
+  const resetAt = windowResetEpoch > 0 ? `${formatBeijing(windowResetEpoch)}\uFF08\u5317\u4EAC\u65F6\u95F4\uFF09` : "\u672A\u77E5";
   const quota = BUDGET_CONFIG.maximize.wrapUpQuota;
   if (quotaExhausted) {
     return `\u989D\u5EA6\u7A97\u53E3\u6536\u5C3E\u4FDD\u62A4\u4E2D\uFF08admission-closed\uFF09\uFF1A\u672C\u7A97\u53E3 wrap-up \u914D\u989D\uFF08\u6BCF\u7A97\u53E3 ${quota} \u4E2A\uFF09\u5DF2\u7528\u5C3D\uFF0C\u5DF2\u62D2\u7EDD\u8F6C\u53D1\u3002` + `\u8BF7\u52FF\u518D\u6D3E\u65B0\u4EFB\u52A1\uFF1B\u5199 checkpoint\uFF0C\u7B49\u989D\u5EA6\u7A97\u53E3\u5237\u65B0\uFF08\u7EA6 ${resetAt}\uFF09\u540E\u518D\u7EE7\u7EED\u3002`;

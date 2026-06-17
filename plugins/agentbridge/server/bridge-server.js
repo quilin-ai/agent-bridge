@@ -13866,6 +13866,45 @@ class StateDirResolver {
   }
 }
 
+// src/budget/format-time.ts
+var BEIJING_TZ = "Asia/Shanghai";
+function parts(epochSeconds, options) {
+  const fmt = new Intl.DateTimeFormat("en-CA", {
+    timeZone: BEIJING_TZ,
+    hour12: false,
+    ...options
+  });
+  const out = {};
+  for (const part of fmt.formatToParts(new Date(epochSeconds * 1000))) {
+    out[part.type] = part.value;
+  }
+  return out;
+}
+function formatBeijing(epochSeconds) {
+  if (!epochSeconds || epochSeconds <= 0)
+    return "\u672A\u77E5";
+  const d = new Date(epochSeconds * 1000);
+  if (Number.isNaN(d.getTime()))
+    return "\u672A\u77E5";
+  const p = parts(epochSeconds, {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit"
+  });
+  return `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute}`;
+}
+function formatBeijingClock(epochSeconds) {
+  if (!epochSeconds || epochSeconds <= 0)
+    return "\u672A\u77E5";
+  const d = new Date(epochSeconds * 1000);
+  if (Number.isNaN(d.getTime()))
+    return "\u672A\u77E5";
+  const p = parts(epochSeconds, { hour: "2-digit", minute: "2-digit" });
+  return `${p.hour}:${p.minute}`;
+}
+
 // src/budget/types.ts
 var STALE_MAX_AGE_SEC = 600;
 
@@ -13909,9 +13948,7 @@ function resolveGuardHardHint(env = process.env) {
   return parsed;
 }
 function formatEpoch(epochSeconds) {
-  if (!epochSeconds || epochSeconds <= 0)
-    return "\u672A\u77E5";
-  return new Date(epochSeconds * 1000).toISOString().replace("T", " ").replace(/\.\d+Z$/, "Z");
+  return formatBeijing(epochSeconds);
 }
 function formatWindow(window, label) {
   if (!window)
@@ -13921,25 +13958,25 @@ function formatWindow(window, label) {
 function formatAgent(name, usage, snapshotAt) {
   if (!usage)
     return `${name}\uFF1A\u672A\u77E5\uFF08\u63A2\u6D4B\u4E0D\u53EF\u7528\uFF09`;
-  const parts = [
+  const parts2 = [
     formatWindow(usage.fiveHour, "5h"),
     formatWindow(usage.weekly, "\u5468"),
     `\u95E8\u63A7 ${usage.gateUtil}%`,
     `\u9884\u8B66 ${usage.warnUtil}%`
   ];
   if (usage.rateLimitedUntil > 0) {
-    parts.push(`\u9650\u6D41\u81F3 ${formatEpoch(usage.rateLimitedUntil)}`);
+    parts2.push(`\u9650\u6D41\u81F3 ${formatEpoch(usage.rateLimitedUntil)}`);
   }
   if (usage.parsedVia === "positional") {
-    parts.push("\u26A0\uFE0F \u7A97\u53E3\u8BC6\u522B\u4F7F\u7528\u4F4D\u7F6E\u515C\u5E95");
+    parts2.push("\u26A0\uFE0F \u7A97\u53E3\u8BC6\u522B\u4F7F\u7528\u4F4D\u7F6E\u515C\u5E95");
   }
   const ageSec = usage.fetchedAt > 0 ? snapshotAt - usage.fetchedAt : 0;
   if (ageSec > 300) {
-    parts.push(`\u26A0\uFE0F \u6570\u636E\u91C7\u96C6\u4E8E ${Math.round(ageSec / 60)} \u5206\u949F\u524D`);
+    parts2.push(`\u26A0\uFE0F \u6570\u636E\u91C7\u96C6\u4E8E ${Math.round(ageSec / 60)} \u5206\u949F\u524D`);
   } else if (usage.stale) {
-    parts.push("\uFF08\u7F13\u5B58\u6570\u636E\uFF09");
+    parts2.push("\uFF08\u7F13\u5B58\u6570\u636E\uFF09");
   }
-  return `${name}\uFF1A${parts.join(" \xB7 ")}`;
+  return `${name}\uFF1A${parts2.join(" \xB7 ")}`;
 }
 var WINDOW_LABELS = {
   fiveHour: "5h \u7A97\u53E3",
@@ -13955,10 +13992,7 @@ function formatDuration(seconds) {
   return `${hours}\u5C0F\u65F6${minutes}\u5206\u949F`;
 }
 function formatClockTime(epochSeconds) {
-  const date4 = new Date(epochSeconds * 1000);
-  const hh = String(date4.getHours()).padStart(2, "0");
-  const mm = String(date4.getMinutes()).padStart(2, "0");
-  return `${hh}:${mm}`;
+  return formatBeijingClock(epochSeconds);
 }
 function formatWindowRate(label, rate) {
   if (!rate)
@@ -13979,20 +14013,20 @@ function formatRunwaySegment(runway, basisWindow, snapshotAt) {
   return `\u7EA6\u53EF\u518D\u5DE5\u4F5C ${formatDuration(runway.seconds)}\uFF08${clockNote}${WINDOW_LABELS[runway.basis]}\u4E3A\u7EA6\u675F\uFF09`;
 }
 function formatBurnRateLine(name, usage, rates, runway, snapshotAt, guardHardPct) {
-  const parts = [
+  const parts2 = [
     formatWindowRate("5h", rates.fiveHour),
     formatWindowRate("\u5468", rates.weekly)
   ].filter((part) => part !== null);
-  if (parts.length === 0 && !runway)
+  if (parts2.length === 0 && !runway)
     return null;
   if (runway) {
     const basisWindow = usage ? usage[runway.basis] : null;
-    parts.push(formatRunwaySegment(runway, basisWindow, snapshotAt));
+    parts2.push(formatRunwaySegment(runway, basisWindow, snapshotAt));
   }
   if (guardHardPct !== null) {
-    parts.push(`\u5916\u5C42 guard \u786C\u7EBF ${guardHardPct}%\uFF08v3 \u4E0D\u53EF\u8D8A\u8FC7\uFF1Brunway \u4E3A\u4E2D\u6027\u53E3\u5F84\uFF0CClaude \u4F1A\u5148\u5728\u786C\u7EBF\u88AB\u5916\u5C42\u505C\u4F4F\uFF09`);
+    parts2.push(`\u5916\u5C42 guard \u786C\u7EBF ${guardHardPct}%\uFF08v3 \u4E0D\u53EF\u8D8A\u8FC7\uFF1Brunway \u4E3A\u4E2D\u6027\u53E3\u5F84\uFF0CClaude \u4F1A\u5148\u5728\u786C\u7EBF\u88AB\u5916\u5C42\u505C\u4F4F\uFF09`);
   }
-  return `${name} \u71C3\u5C3D\u7387\uFF1A${parts.join(" \xB7 ")}`;
+  return `${name} \u71C3\u5C3D\u7387\uFF1A${parts2.join(" \xB7 ")}`;
 }
 function formatFiveHourWindowsLeftLine(snapshot) {
   const values = [];
@@ -14037,7 +14071,7 @@ function formatDynamicLineLine(snapshot) {
   const lines = snapshot.dynamicPauseLine;
   if (!lines)
     return null;
-  const parts = [];
+  const parts2 = [];
   const entries = [
     ["Claude", lines.claude, snapshot.claude],
     ["Codex", lines.codex, snapshot.codex]
@@ -14046,11 +14080,11 @@ function formatDynamicLineLine(snapshot) {
     if (line === null)
       continue;
     const headroom = usage ? `\uFF08util ${usage.gateUtil}%\uFF0C\u4F59\u91CF ${(line - usage.gateUtil).toFixed(1)}\uFF09` : "";
-    parts.push(`${name} ${line.toFixed(1)}%${headroom}`);
+    parts2.push(`${name} ${line.toFixed(1)}%${headroom}`);
   }
-  if (parts.length === 0)
+  if (parts2.length === 0)
     return null;
-  return `\u52A8\u6001\u6682\u505C\u7EBF\uFF1A${parts.join(" \xB7 ")}`;
+  return `\u52A8\u6001\u6682\u505C\u7EBF\uFF1A${parts2.join(" \xB7 ")}`;
 }
 var PHASE_LABELS = {
   normal: "normal\uFF08\u6B63\u5E38\uFF09",
@@ -14062,7 +14096,7 @@ var PHASE_LABELS = {
 function renderBudgetSnapshot(snapshot, options = {}) {
   const guardHardPct = options.guardHardPct ?? resolveGuardHardHint();
   const lines = [];
-  lines.push(`\u3010\u9884\u7B97\u5FEB\u7167 \xB7 \u8D26\u53F7\u7EA7\u3011\u9636\u6BB5\uFF1A${PHASE_LABELS[snapshot.phase] ?? snapshot.phase} \xB7 \u66F4\u65B0\u4E8E ${formatEpoch(snapshot.updatedAt)}`);
+  lines.push(`\u3010\u9884\u7B97\u5FEB\u7167 \xB7 \u8D26\u53F7\u7EA7\u3011\u9636\u6BB5\uFF1A${PHASE_LABELS[snapshot.phase] ?? snapshot.phase} \xB7 \u66F4\u65B0\u4E8E ${formatEpoch(snapshot.updatedAt)}\uFF08\u65F6\u95F4\u5747\u4E3A\u5317\u4EAC\u65F6\u95F4 UTC+8\uFF09`);
   lines.push(formatAgent("Claude", snapshot.claude, snapshot.updatedAt));
   lines.push(formatAgent("Codex", snapshot.codex, snapshot.updatedAt));
   if (snapshot.burnRate) {
@@ -14356,21 +14390,21 @@ Codex: ${msg.content}`;
 `);
     const noticeText = notices.map((notice) => `WARNING: ${notice}`).join(`
 `);
-    const parts = [];
+    const parts2 = [];
     if (count > 0) {
-      parts.push(`[${count} new message${count > 1 ? "s" : ""} from Codex]
+      parts2.push(`[${count} new message${count > 1 ? "s" : ""} from Codex]
 chat_id: ${this.sessionId}`);
     }
     if (noticeText)
-      parts.push(noticeText);
+      parts2.push(noticeText);
     if (formatted)
-      parts.push(formatted);
+      parts2.push(formatted);
     this.log(`get_messages returning ${count} message(s) ` + `(instance=${this.instanceId}, dropped=${dropped}, oversized=${oversized}, oversizedBytes=${oversizedBytes})`);
     return {
       content: [
         {
           type: "text",
-          text: parts.join(`
+          text: parts2.join(`
 
 `)
         }
@@ -14634,10 +14668,10 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.20", "0.0.0-source"),
-  commit: defineString("2c84947", "source"),
+  commit: defineString("d6034c6", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION),
-  codeHash: defineString("d2425ba159fe", "source")
+  codeHash: defineString("efb5b785c5f9", "source")
 });
 function sameRuntimeContract(a, b) {
   if (!a || !b)

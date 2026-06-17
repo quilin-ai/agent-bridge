@@ -22,6 +22,7 @@ import { consumeCheckpointBaton, consumeWrapUp, currentWindowState } from "./bud
 import { ConfigService, applyBudgetEnvOverrides } from "./config-service";
 import { BudgetCoordinator } from "./budget/budget-coordinator";
 import { createQuotaSource } from "./budget/quota-source";
+import { formatBeijing } from "./budget/format-time";
 import { retryAfterMsForResume } from "./budget/budget-gate";
 import { readGuardPending } from "./budget/pending-reader";
 import type { ResumeSignals } from "./budget/budget-fingerprint";
@@ -509,7 +510,7 @@ function budgetPauseGateError(): string {
   const snapshot = budgetCoordinator?.getSnapshot() ?? null;
   const reason = snapshot?.pauseReason ?? "Codex 侧额度接近耗尽";
   const resumeAt = snapshot?.resumeAfterEpoch
-    ? new Date(snapshot.resumeAfterEpoch * 1000).toISOString().replace("T", " ").replace(/\.\d+Z$/, "Z")
+    ? `${formatBeijing(snapshot.resumeAfterEpoch)}（北京时间）`
     : null;
   const sideHint = snapshot?.pauseSide === "both"
     ? "双侧额度均已耗尽，请写 checkpoint 等待刷新"
@@ -540,7 +541,7 @@ function budgetAdmissionGateError(
   quotaExhausted: boolean,
 ): string {
   const resetAt = windowResetEpoch > 0
-    ? new Date(windowResetEpoch * 1000).toISOString().replace("T", " ").replace(/\.\d+Z$/, "Z")
+    ? `${formatBeijing(windowResetEpoch)}（北京时间）`
     : "未知";
   const quota = BUDGET_CONFIG.maximize.wrapUpQuota;
   if (quotaExhausted) {

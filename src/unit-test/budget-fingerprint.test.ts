@@ -7,6 +7,7 @@ import {
   resumeCandidateSides,
   type FingerprintState,
 } from "../budget/budget-fingerprint";
+import { formatBeijing } from "../budget/format-time";
 import type { AgentUsage, BudgetConfig, BudgetState } from "../budget/types";
 
 const NOW = 1_700_000_000;
@@ -366,6 +367,16 @@ describe("classifyPoll reducer — hysteresis side transitions", () => {
     const r2 = classifyPoll(r1.next, s2, CONFIG);
     expect(r2.next.side).toBe("codex");
     expect(r2.next.resumeEpoch).toBe(NOW + 3600);
+  });
+
+  test("rate-limit pause reason renders the limit time in Beijing time, not UTC", () => {
+    const s = state(usage(), usage({ gateUtil: 92, warnUtil: 92, remaining: 8, rateLimitedUntil: NOW + 900 }));
+    const { effect } = classifyPoll(INITIAL_FINGERPRINT_STATE, s, CONFIG);
+    const reason = "reason" in effect ? (effect.reason ?? "") : "";
+    expect(reason).toContain("探针被限流至");
+    expect(reason).toContain(formatBeijing(NOW + 900));
+    expect(reason).toContain("（北京时间）");
+    expect(reason).not.toContain("Z");
   });
 });
 

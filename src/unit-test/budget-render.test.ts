@@ -215,15 +215,17 @@ describe("formatDuration（分钟取整，<1 小时只显分钟）", () => {
   });
 });
 
-describe("formatClockTime（本地时区 HH:MM）", () => {
-  test("formats a local wall-clock time with zero padding", () => {
-    // Construct the epoch FROM local components so the test is TZ-agnostic.
-    const epoch = Math.floor(new Date(2026, 5, 11, 8, 5).getTime() / 1000);
+describe("formatClockTime（北京时区 HH:MM）", () => {
+  test("formats a Beijing wall-clock time with zero padding", () => {
+    // Construct the epoch from UTC so the test is TZ-agnostic; +8h = Beijing.
+    // 2026-06-11 00:05 UTC = 2026-06-11 08:05 北京时间.
+    const epoch = Math.floor(Date.UTC(2026, 5, 11, 0, 5) / 1000);
     expect(formatClockTime(epoch)).toBe("08:05");
   });
 
-  test("crosses midnight into the next local day", () => {
-    const epoch = Math.floor(new Date(2026, 5, 12, 0, 7).getTime() / 1000);
+  test("crosses midnight into the next Beijing day", () => {
+    // 2026-06-11 16:07 UTC = 2026-06-12 00:07 北京时间.
+    const epoch = Math.floor(Date.UTC(2026, 5, 11, 16, 7) / 1000);
     expect(formatClockTime(epoch)).toBe("00:07");
   });
 });
