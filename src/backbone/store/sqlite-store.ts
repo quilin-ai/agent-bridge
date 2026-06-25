@@ -70,6 +70,10 @@ export class SqliteStore implements Store {
         envelope TEXT NOT NULL,
         UNIQUE (target_agent_id, idempotency_key)
       );
+      CREATE TABLE IF NOT EXISTS auth_tokens (
+        token TEXT PRIMARY KEY,
+        identity_id TEXT NOT NULL
+      );
     `);
   }
 
@@ -248,6 +252,29 @@ export class SqliteStore implements Store {
       .query("DELETE FROM pending_deliveries WHERE target_agent_id=?")
       .run(targetAgentId);
     return rows.map((r) => JSON.parse(r.envelope) as Envelope);
+  }
+
+  // --- auth tokens ---
+  async issueToken(token: string, identityId: string): Promise<void> {
+    this.db
+      .query(
+        "INSERT INTO auth_tokens(token, identity_id) VALUES(?, ?) ON CONFLICT(token) DO UPDATE SET identity_id=excluded.identity_id",
+      )
+      .run(token, identityId);
+  }
+
+  async resolveToken(token: string): Promise<string | null> {
+    const row = this.db
+      .query("SELECT identity_id FROM auth_tokens WHERE token=?")
+      .get(token) as { identity_id: string } | null;
+    return row ? row.identity_id : null;
+  }
+
+  async listTokens(): Promise<Array<{ token: string; identityId: string }>> {
+    const rows = this.db
+      .query("SELECT token, identity_id FROM auth_tokens")
+      .all() as { token: string; identity_id: string }[];
+    return rows.map((r) => ({ token: r.token, identityId: r.identity_id }));
   }
 
   async close(): Promise<void> {

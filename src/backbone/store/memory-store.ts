@@ -23,6 +23,7 @@ export class InMemoryStore implements Store {
   private whiteboards = new Map<string, WhiteboardRecord>();
   // targetAgentId → (idempotencyKey → envelope); Map preserves insertion order
   private pending = new Map<string, Map<string, Envelope>>();
+  private tokens = new Map<string, string>(); // token → identityId
 
   async upsertIdentity(id: string, displayName: string): Promise<IdentityRecord> {
     const record = { id, displayName };
@@ -146,6 +147,18 @@ export class InMemoryStore implements Store {
     if (!byKey) return [];
     this.pending.delete(targetAgentId);
     return [...byKey.values()];
+  }
+
+  async issueToken(token: string, identityId: string): Promise<void> {
+    this.tokens.set(token, identityId); // re-issue re-points
+  }
+
+  async resolveToken(token: string): Promise<string | null> {
+    return this.tokens.get(token) ?? null;
+  }
+
+  async listTokens(): Promise<Array<{ token: string; identityId: string }>> {
+    return [...this.tokens.entries()].map(([token, identityId]) => ({ token, identityId }));
   }
 
   async close(): Promise<void> {
