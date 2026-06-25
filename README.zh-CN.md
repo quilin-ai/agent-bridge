@@ -215,10 +215,11 @@ agent_bridge/
 │   ├── pull_request_template.md
 │   └── workflows/ci.yml          # GitHub Actions CI
 ├── assets/                        # 图片资源
-├── docs/
-│   ├── phase3-spec.md            # Phase 3 设计文档（CLI + Plugin）
-│   ├── v1-roadmap.md             # v1 功能路线图
-│   └── v2-architecture.md        # v2 多 Agent 架构设计
+├── docs/                          # 文档（带序号，索引见 docs/README.md）
+│   ├── 01-协作系统规格-v3.md       # 协作系统实现规格 v3（主规格）
+│   ├── 02-v2架构设计.md            # v2 多 Agent 架构（基座，中英双语）
+│   ├── 03-08 …                     # 单机多对 / 额度 / 协作协议 / 发布
+│   └── archive/历史归档.md         # 已归档的历史设计 / 复盘 / 测试计划
 ├── plugins/agentbridge/           # Claude Code 插件包
 │   ├── .claude-plugin/plugin.json
 │   ├── commands/init.md
@@ -340,8 +341,8 @@ Codex 运行在沙箱环境中，**禁止对 `.git` 目录进行任何写操作*
 
 ## Roadmap
 
-- **v1.x（当前）**：在不改变架构的前提下优化单桥体验 -- 降噪、控回合、定角色。详见 [docs/v1-roadmap.md](docs/v1-roadmap.md)。
-- **v2（规划中）**：引入多 Agent 基础设施 -- Room 作用域协作、稳定身份、正式控制协议、更强的恢复语义。详见 [docs/v2-architecture.md](docs/v2-architecture.md)。
+- **v1.x（当前）**：在不改变架构的前提下优化单桥体验 -- 降噪、控回合、定角色。详见 [docs/archive/历史归档.md](docs/archive/历史归档.md)。
+- **v2（规划中）**：引入多 Agent 基础设施 -- Room 作用域协作、稳定身份、正式控制协议、更强的恢复语义。详见 [docs/02-v2架构设计.md](docs/02-v2架构设计.md)。
 - **v3+（远期）**：更智能的协作、更丰富的策略、跨 runtime 的高级编排。
 
 ## 这个项目是怎么建成的
