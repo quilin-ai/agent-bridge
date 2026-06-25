@@ -39,6 +39,17 @@ export function runTransportContract(label: string, makeTransport: () => Message
       expect(b).toEqual(["z"]);
     });
 
+    test("a throwing subscriber does not block delivery to its siblings", async () => {
+      const t = makeTransport();
+      const got: string[] = [];
+      t.subscribe("r", () => {
+        throw new Error("bad subscriber");
+      });
+      t.subscribe("r", (m) => got.push(m.messageId));
+      await t.publish("r", makeEnvelope({ messageId: "z" }));
+      expect(got).toEqual(["z"]); // sibling still received despite the thrower
+    });
+
     test("one subscriber's unsubscribe does not affect the other", async () => {
       const t = makeTransport();
       const a: string[] = [];
