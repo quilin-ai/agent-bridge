@@ -123,6 +123,10 @@ async function main(command: string | undefined, restArgs: string[]) {
       const { runAuth } = await import("./cli/auth");
       await runAuth(restArgs);
       break;
+    case "broker":
+      const { runBroker } = await import("./cli/broker");
+      await runBroker(restArgs);
+      break;
     case "--help":
     case "-h":
     case undefined:

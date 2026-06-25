@@ -27,7 +27,11 @@ export class InMemoryTransport implements MessageTransport {
     const set = this.topics.get(topic);
     if (set) {
       for (const handler of [...set]) {
-        handler(msg);
+        try {
+          handler(msg);
+        } catch {
+          // Isolate a throwing subscriber (parity with InProcTransport, §6.4).
+        }
       }
     }
     return Promise.resolve();

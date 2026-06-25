@@ -1,0 +1,68 @@
+# Multi-machine broker simulation (§13 cross-machine slice).
+#
+#   provision → issues a PSK token into the shared collab DB
+#   broker    → the always-on control-plane broker (one "server machine")
+#   subscriber/publisher → two "agent machines" exchanging an event over the broker
+#
+# Run:  docker compose -f docker/docker-compose.yml up --build --abort-on-container-exit
+# Pass: the `subscriber` container prints `SIM_OK` and exits 0.
+#
+# NOTE: the containers share a /data volume only to distribute the token + DB for
+# the sim; in a real deployment the token is distributed out of band and each
+# machine has its own working copy (code sync is git's job, §2.6).
+
+services:
+  provision:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    volumes: [collab:/data]
+    command: ["bun", "docker/provision.ts"]
+    environment:
+      COLLAB_DB: /data/collab.db
+      TOKEN_FILE: /data/token
+      SIM_ID: sim@example.com
+
+  broker:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    volumes: [collab:/data]
+    depends_on:
+      provision:
+        condition: service_completed_successfully
+    command: ["bun", "docker/broker-entry.ts"]
+    environment:
+      BROKER_HOST: 0.0.0.0
+      BROKER_PORT: "4700"
+      COLLAB_DB: /data/collab.db
+    ports: ["4700:4700"]
+
+  subscriber:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    volumes: [collab:/data]
+    depends_on: [broker]
+    command: ["bun", "docker/sim-client.ts"]
+    environment:
+      ROLE: subscriber
+      BROKER_URL: ws://broker:4700/ws
+      TOKEN_FILE: /data/token
+      TOPIC: demo-room
+
+  publisher:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    volumes: [collab:/data]
+    depends_on: [broker, subscriber]
+    command: ["bun", "docker/sim-client.ts"]
+    environment:
+      ROLE: publisher
+      BROKER_URL: ws://broker:4700/ws
+      TOKEN_FILE: /data/token
+      TOPIC: demo-room
+
+volumes:
+  collab: {}
