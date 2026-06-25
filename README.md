@@ -217,10 +217,11 @@ agent_bridge/
 │   ├── pull_request_template.md
 │   └── workflows/ci.yml          # GitHub Actions CI
 ├── assets/                        # Static assets (images, etc.)
-├── docs/
-│   ├── phase3-spec.md            # Phase 3 design spec (CLI + Plugin)
-│   ├── v1-roadmap.md             # v1 feature roadmap
-│   └── v2-architecture.md        # v2 multi-agent architecture design
+├── docs/                          # Numbered docs; index in docs/README.md
+│   ├── 01-协作系统规格-v3.md       # Collaboration system spec v3 (main)
+│   ├── 02-v2架构设计.md            # v2 multi-agent architecture (foundation)
+│   ├── 03-08 …                     # multi-pair / budget / protocol / release
+│   └── archive/历史归档.md         # Archived design / post-mortems / test plans
 ├── plugins/agentbridge/           # Claude Code plugin bundle
 │   ├── .claude-plugin/plugin.json
 │   ├── commands/init.md
@@ -346,8 +347,8 @@ Codex runs in a sandboxed environment that **blocks all writes to the `.git` dir
 
 ## Roadmap
 
-- **v1.x (current)**: Improve the single-bridge experience without architectural refactoring -- less noise, better turn discipline, and clearer collaboration modes. See [docs/v1-roadmap.md](docs/v1-roadmap.md).
-- **v2 (planned)**: Introduce the multi-agent foundation -- room-scoped collaboration, stable identity, a formal control protocol, and stronger recovery semantics. See [docs/v2-architecture.md](docs/v2-architecture.md).
+- **v1.x (current)**: Improve the single-bridge experience without architectural refactoring -- less noise, better turn discipline, and clearer collaboration modes. See [docs/archive/历史归档.md](docs/archive/历史归档.md).
+- **v2 (planned)**: Introduce the multi-agent foundation -- room-scoped collaboration, stable identity, a formal control protocol, and stronger recovery semantics. See [docs/02-v2架构设计.md](docs/02-v2架构设计.md).
 - **v3+ (longer term)**: Explore smarter collaboration, richer policies, and more advanced orchestration across runtimes.
 
 ## How This Project Was Built
