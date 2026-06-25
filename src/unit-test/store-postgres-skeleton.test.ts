@@ -52,4 +52,10 @@ describe("PostgresStore skeleton — every method rejects (not implemented)", ()
     await expect(s.drainPending("ag")).rejects.toThrow(/not implemented/);
     await expect(s.close()).rejects.toThrow(/not implemented/);
   });
+
+  test("auth-token methods reject", async () => {
+    await expect(s.issueToken("tok", "id")).rejects.toThrow(/not implemented/);
+    await expect(s.resolveToken("tok")).rejects.toThrow(/not implemented/);
+    await expect(s.listTokens()).rejects.toThrow(/not implemented/);
+  });
 });

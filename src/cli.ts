@@ -119,6 +119,10 @@ async function main(command: string | undefined, restArgs: string[]) {
       const { runLogs } = await import("./cli/logs");
       await runLogs(restArgs);
       break;
+    case "auth":
+      const { runAuth } = await import("./cli/auth");
+      await runAuth(restArgs);
+      break;
     case "--help":
     case "-h":
     case undefined:
@@ -163,6 +167,8 @@ Commands:
   doctor [--json]    Diagnose env, daemon, build drift, logs, and current thread
   doctor resume-pollution [--apply]  Find/fix old AgentBridge kickoff metadata
   budget [--json]    Show both agents' subscription quota snapshot (5h/weekly, drift, pause state)
+  auth login --id <email|github> --name <displayName>
+                     Issue a collaboration PSK token and write it to <state>/auth-token (0600)
   logs [--codex] [-f] [-n N]
                      Tail this pair's daemon log (or the codex wrapper log with
                      --codex). -n N: last N lines (default 100). -f: follow/stream.

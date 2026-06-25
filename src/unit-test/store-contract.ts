@@ -123,5 +123,18 @@ export function runStoreContract(label: string, makeStore: () => Store) {
       expect(await store.drainPending("ag-2")).toEqual([]); // cleared
       expect((await store.drainPending("ag-3")).length).toBe(1); // other target intact
     });
+
+    test("auth tokens issue / resolve / list, re-issue re-points", async () => {
+      expect(await store.resolveToken("tok-1")).toBeNull();
+      await store.issueToken("tok-1", "alice@x.com");
+      await store.issueToken("tok-2", "bob@x.com");
+      expect(await store.resolveToken("tok-1")).toBe("alice@x.com");
+      expect(await store.resolveToken("tok-2")).toBe("bob@x.com");
+      // re-issuing the same token re-points it to a new identity
+      await store.issueToken("tok-1", "carol@x.com");
+      expect(await store.resolveToken("tok-1")).toBe("carol@x.com");
+      const all = (await store.listTokens()).map((t) => `${t.token}:${t.identityId}`).sort();
+      expect(all).toEqual(["tok-1:carol@x.com", "tok-2:bob@x.com"]);
+    });
   });
 }

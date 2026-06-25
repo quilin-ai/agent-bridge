@@ -108,6 +108,18 @@ export class PostgresStore implements Store {
     throw new Error(NOT_IMPLEMENTED);
   }
 
+  async issueToken(_token: string, _identityId: string): Promise<void> {
+    throw new Error(NOT_IMPLEMENTED);
+  }
+
+  async resolveToken(_token: string): Promise<string | null> {
+    throw new Error(NOT_IMPLEMENTED);
+  }
+
+  async listTokens(): Promise<Array<{ token: string; identityId: string }>> {
+    throw new Error(NOT_IMPLEMENTED);
+  }
+
   async close(): Promise<void> {
     throw new Error(NOT_IMPLEMENTED);
   }

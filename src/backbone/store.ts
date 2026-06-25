@@ -87,6 +87,14 @@ export interface Store {
   /** Remove and return the target's pending envelopes (deduped by idempotencyKey). */
   drainPending(targetAgentId: string): Promise<Envelope[]>;
 
+  // --- auth tokens (§6.2): `abg auth login` binds a PSK token to an identity ---
+  /** Persist a token → identity binding. Re-issuing the same token re-points it. */
+  issueToken(token: string, identityId: string): Promise<void>;
+  /** Resolve a presented token to its identity id, or null if unknown. */
+  resolveToken(token: string): Promise<string | null>;
+  /** All issued (token, identityId) bindings — e.g. to seed an in-memory PSK provider. */
+  listTokens(): Promise<Array<{ token: string; identityId: string }>>;
+
   /** Release resources (close the DB handle). Idempotent. */
   close(): Promise<void>;
 }
