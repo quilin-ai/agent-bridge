@@ -30,10 +30,10 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.24", "0.0.0-source"),
-  commit: defineString("b202e8f", "source"),
+  commit: defineString("d824fd2", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION),
-  codeHash: defineString("7c98560c206e", "source")
+  codeHash: defineString("2784fec70261", "source")
 });
 function daemonStatusBuildInfo() {
   return { ...BUILD_INFO };
@@ -6823,6 +6823,7 @@ class BrokerClient {
   subscriptions = new Set;
   outbox = [];
   eventHandlers = [];
+  whiteboardHandlers = [];
   closed = false;
   authFailed = false;
   reconnectAttempt = 0;
@@ -6890,6 +6891,9 @@ class BrokerClient {
   onEvent(handler) {
     this.eventHandlers.push(handler);
   }
+  onWhiteboard(handler) {
+    this.whiteboardHandlers.push(handler);
+  }
   close() {
     this.closed = true;
     this.clearReconnectTimer();
@@ -6945,6 +6949,14 @@ class BrokerClient {
             h(msg.topic, msg.envelope);
           } catch (e) {
             this.log(`event handler threw: ${String(e)}`);
+          }
+        }
+      } else if (msg.type === "whiteboard") {
+        for (const h of this.whiteboardHandlers) {
+          try {
+            h(msg.roomId, msg.whiteboard);
+          } catch (e) {
+            this.log(`whiteboard handler threw: ${String(e)}`);
           }
         }
       }
@@ -7282,6 +7294,29 @@ function label(env) {
   const dn = env.payload?.displayName;
   return env.from?.name || (typeof dn === "string" ? dn : "") || env.from?.agentId || "\u67D0\u6210\u5458";
 }
+function renderWhiteboard(wb) {
+  if (!wb || typeof wb !== "object")
+    return null;
+  const w = wb;
+  const arr = (x) => Array.isArray(x) ? x : [];
+  const contracts = arr(w.contractsReady);
+  const inProgress = arr(w.inProgress);
+  const blockers = arr(w.blockers);
+  const milestones = arr(w.recentMilestones);
+  if (contracts.length + inProgress.length + blockers.length + milestones.length === 0)
+    return null;
+  const names = (items, key) => items.slice(-3).map((it) => typeof it[key] === "string" ? it[key] : "?").join(key === "summary" ? " / " : ", ");
+  const parts2 = ["\uD83D\uDCCB \u623F\u95F4\u767D\u677F"];
+  if (contracts.length)
+    parts2.push(`\u5DF2\u5C31\u7EEA\u5951\u7EA6 ${contracts.length}\uFF08${names(contracts, "contract")}\uFF09`);
+  if (inProgress.length)
+    parts2.push(`\u8FDB\u884C\u4E2D ${inProgress.length}`);
+  if (blockers.length)
+    parts2.push(`\u963B\u585E ${blockers.length}`);
+  if (milestones.length)
+    parts2.push(`\u6700\u8FD1\uFF1A${names(milestones, "summary")}`);
+  return parts2.join(" \xB7 ");
+}
 function renderRoomEvent(env) {
   const who = label(env);
   switch (env.kind) {
@@ -7341,6 +7376,11 @@ async function startRoomBridge(deps) {
         seen.delete(seen.values().next().value);
     }
     const text = renderRoomEvent(env);
+    if (text)
+      deps.emit(text);
+  });
+  client.onWhiteboard((_roomId, wb) => {
+    const text = renderWhiteboard(wb);
     if (text)
       deps.emit(text);
   });

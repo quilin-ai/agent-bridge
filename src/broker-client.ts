@@ -33,6 +33,8 @@ export function reconnectDelay(baseMs: number, maxMs: number, attempt: number, r
   return ceiling / 2 + rand * (ceiling / 2);
 }
 
+type WhiteboardHandler = (roomId: string, whiteboard: unknown) => void;
+
 /**
  * Edge-side client to the control-plane broker (§5 adapter transport + §8.2
  * resilience foundation).
@@ -55,6 +57,7 @@ export class BrokerClient {
   private readonly subscriptions = new Set<string>();
   private readonly outbox: Array<{ topic: string; envelope: Envelope }> = [];
   private readonly eventHandlers: EventHandler[] = [];
+  private readonly whiteboardHandlers: WhiteboardHandler[] = [];
   private closed = false;
   /** Set on auth_error: a bad token must NOT trigger an infinite reconnect loop. */
   private authFailed = false;
@@ -134,6 +137,11 @@ export class BrokerClient {
     this.eventHandlers.push(handler);
   }
 
+  /** Register a handler for the room whiteboard snapshot pushed on join (§4.4). */
+  onWhiteboard(handler: WhiteboardHandler): void {
+    this.whiteboardHandlers.push(handler);
+  }
+
   close(): void {
     this.closed = true;
     this.clearReconnectTimer();
@@ -192,6 +200,15 @@ export class BrokerClient {
             h(msg.topic, msg.envelope);
           } catch (e) {
             this.log(`event handler threw: ${String(e)}`);
+          }
+        }
+      } else if (msg.type === "whiteboard") {
+        // §4.4 new-member injection: a room whiteboard snapshot pushed on join.
+        for (const h of this.whiteboardHandlers) {
+          try {
+            h(msg.roomId, msg.whiteboard);
+          } catch (e) {
+            this.log(`whiteboard handler threw: ${String(e)}`);
           }
         }
       }

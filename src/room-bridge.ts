@@ -47,6 +47,39 @@ function label(env: Envelope): string {
 }
 
 /**
+ * Render the on-join whiteboard snapshot (§4.4) into a one-line Chinese summary
+ * for the joining agent — counts + the few most-recent items, never the full
+ * (capped-50) slots. Returns null for an empty/absent board (nothing to inject).
+ */
+export function renderWhiteboard(wb: unknown): string | null {
+  if (!wb || typeof wb !== "object") return null;
+  const w = wb as {
+    contractsReady?: unknown[];
+    inProgress?: unknown[];
+    blockers?: unknown[];
+    recentMilestones?: unknown[];
+  };
+  const arr = (x: unknown[] | undefined): Array<Record<string, unknown>> =>
+    Array.isArray(x) ? (x as Array<Record<string, unknown>>) : [];
+  const contracts = arr(w.contractsReady);
+  const inProgress = arr(w.inProgress);
+  const blockers = arr(w.blockers);
+  const milestones = arr(w.recentMilestones);
+  if (contracts.length + inProgress.length + blockers.length + milestones.length === 0) return null;
+  const names = (items: Array<Record<string, unknown>>, key: string): string =>
+    items
+      .slice(-3)
+      .map((it) => (typeof it[key] === "string" ? (it[key] as string) : "?"))
+      .join(key === "summary" ? " / " : ", ");
+  const parts = ["📋 房间白板"];
+  if (contracts.length) parts.push(`已就绪契约 ${contracts.length}（${names(contracts, "contract")}）`);
+  if (inProgress.length) parts.push(`进行中 ${inProgress.length}`);
+  if (blockers.length) parts.push(`阻塞 ${blockers.length}`);
+  if (milestones.length) parts.push(`最近：${names(milestones, "summary")}`);
+  return parts.join(" · ");
+}
+
+/**
  * Render a room Envelope into a one-line Chinese notice, or null for kinds the
  * MVP doesn't surface (those are simply not injected — never a raw payload dump).
  */
@@ -125,6 +158,11 @@ export async function startRoomBridge(deps: RoomBridgeDeps): Promise<RoomBridgeH
       if (seen.size > SEEN_CAP) seen.delete(seen.values().next().value as string); // bounded FIFO-ish
     }
     const text = renderRoomEvent(env);
+    if (text) deps.emit(text);
+  });
+  // New-member injection (§4.4): the broker pushes the room whiteboard on join.
+  client.onWhiteboard((_roomId, wb) => {
+    const text = renderWhiteboard(wb);
     if (text) deps.emit(text);
   });
   client.subscribe(room); // queued in the subscription set; sent on the first welcome

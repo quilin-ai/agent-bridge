@@ -1,5 +1,5 @@
 import { describe, test, expect } from "bun:test";
-import { renderRoomEvent } from "../room-bridge";
+import { renderRoomEvent, renderWhiteboard } from "../room-bridge";
 import { buildTaskCompletedEnvelope } from "../task-completed";
 import { buildPresenceEnvelope } from "../presence";
 import type { Envelope } from "../backbone/envelope";
@@ -63,6 +63,25 @@ describe("renderRoomEvent — broker Envelope → one-line Claude notice", () =>
       deliveryMode: "online_only",
     };
     expect(renderRoomEvent(env)).toBeNull();
+  });
+
+  test("renderWhiteboard summarizes counts + recent items; empty/absent ⇒ null", () => {
+    expect(renderWhiteboard(null)).toBeNull();
+    expect(renderWhiteboard("nope")).toBeNull();
+    expect(
+      renderWhiteboard({ contractsReady: [], inProgress: [], blockers: [], recentMilestones: [] }),
+    ).toBeNull();
+    const text = renderWhiteboard({
+      contractsReady: [{ contract: "auth/v1" }, { contract: "checkout/v1" }],
+      inProgress: [{ summary: "x" }],
+      blockers: [],
+      recentMilestones: [{ summary: "auth done" }, { summary: "checkout shipped" }],
+    })!;
+    expect(text).toContain("📋 房间白板");
+    expect(text).toContain("已就绪契约 2");
+    expect(text).toContain("auth/v1");
+    expect(text).toContain("进行中 1");
+    expect(text).toContain("checkout shipped");
   });
 
   test("label falls back from.name → payload.displayName → agentId → 某成员", () => {
