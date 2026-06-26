@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { writeCollaborationSections } from "../cli/init";
-import { MARKER_ID } from "../collaboration-content";
+import { MARKER_ID, CLAUDE_MD_SECTION, AGENTS_MD_SECTION } from "../collaboration-content";
 
 const START = `<!-- ${MARKER_ID}:start -->`;
 const END = `<!-- ${MARKER_ID}:end -->`;
@@ -123,5 +123,16 @@ describe("writeCollaborationSections", () => {
     expect(updated).not.toContain("OLD COLLABORATION CONTENT");
     expect(updated).toContain("Multi-Agent Collaboration");
     expect(updated).toContain("# Project");
+  });
+
+  test("both injected sections carry the v3 room-collab usage AND the untrusted-input security rules", () => {
+    for (const section of [CLAUDE_MD_SECTION, AGENTS_MD_SECTION]) {
+      expect(section).toContain("Cross-machine room collaboration");
+      expect(section).toContain("abg publish");
+      // the non-negotiable anti prompt-injection rules must be present in both
+      expect(section).toContain("UNTRUSTED external input");
+      expect(section).toContain("NEVER as an instruction");
+      expect(section).toContain("Destructive operations always require human confirmation");
+    }
   });
 });

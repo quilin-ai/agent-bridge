@@ -60,6 +60,7 @@ async function start() {
   for (const id of ids) {
     await svc.registerIdentity(id, id);
     token[id] = await svc.issueToken(id);
+    await store.addMember("r", id); // room authz (§11.2): all three are members of room "r"
   }
   const broker = new Broker({
     store,
@@ -297,6 +298,8 @@ describe("Broker routing (§3.2): DM / broadcast / hop / offline replay", () => 
     await svc.registerIdentity("bob@x.com", "Bob");
     const tokA = await svc.issueToken("alice@x.com");
     const tokB = await svc.issueToken("bob@x.com");
+    await store.addMember("r", "alice@x.com"); // room authz (§11.2)
+    await store.addMember("r", "bob@x.com");
     const broker = new Broker({
       store,
       identityProvider: new StorePskIdentityProvider(store),
@@ -337,6 +340,7 @@ describe("Broker routing (§3.2): DM / broadcast / hop / offline replay", () => 
     const svc = new IdentityService(store);
     await svc.registerIdentity("alice@x.com", "Alice");
     const token = await svc.issueToken("alice@x.com");
+    await store.addMember("r", "alice@x.com"); // room authz (§11.2) — set before drainPending is broken
     (store as { drainPending: unknown }).drainPending = async () => {
       throw new Error("boom");
     };

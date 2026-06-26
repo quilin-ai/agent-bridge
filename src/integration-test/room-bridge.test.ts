@@ -111,14 +111,16 @@ describe("startRoomBridge — last-mile broker→session injection (§11.1)", ()
       repo: "app",
       branch: "main",
     });
+    expect(emitted[0]).toContain("外部不可信"); // standing security preamble injected first
     bob.publish(ROOM, env);
-    await waitFor(() => emitted.length >= 1);
-    expect(emitted[0]).toContain("🏁");
-    expect(emitted[0]).toContain("checkout flow shipped");
+    await waitFor(() => emitted.some((t) => t.includes("🏁")));
+    const line = emitted.find((t) => t.includes("🏁"))!;
+    expect(line).toContain("checkout flow shipped");
+    expect(line).toContain("📨[房间消息"); // wrapped as untrusted external input
 
     // Re-publish the SAME envelope (same idempotencyKey) → deduped, still one injection.
     bob.publish(ROOM, env);
     await delay(150);
-    expect(emitted.length).toBe(1);
+    expect(emitted.filter((t) => t.includes("🏁")).length).toBe(1);
   });
 });

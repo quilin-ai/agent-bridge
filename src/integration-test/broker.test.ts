@@ -59,6 +59,11 @@ async function startBroker() {
   await svc.registerIdentity("bob@x.com", "Bob");
   const token = await svc.issueToken("alice@x.com");
   const tokenB = await svc.issueToken("bob@x.com");
+  // Room authz (§11.2): both identities are members of every topic these tests use.
+  for (const t of ["room-1", "x"]) {
+    await store.addMember(t, "alice@x.com");
+    await store.addMember(t, "bob@x.com");
+  }
   const broker = new Broker({
     store,
     identityProvider: new StorePskIdentityProvider(store),

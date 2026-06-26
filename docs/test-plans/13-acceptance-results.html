@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>§13 端到端验收记录 — AgentBridge v3</title>
+<style>
+  :root{
+    --bg:#0f1117; --card:#171a21; --card2:#1d2129; --line:#262b35;
+    --fg:#e6e8ee; --mut:#9aa3b2; --pass:#34d399; --passbg:#0e2c22;
+    --accent:#7aa2ff; --warn:#fbbf24; --code:#11141a;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);
+    font:15px/1.6 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft Yahei",Segoe UI,Roboto,sans-serif}
+  .wrap{max-width:1000px;margin:0 auto;padding:28px 18px 80px}
+  header{display:flex;flex-wrap:wrap;align-items:center;gap:14px;margin-bottom:8px}
+  h1{font-size:24px;margin:0;font-weight:700;letter-spacing:.2px}
+  h2{font-size:18px;margin:34px 0 12px;padding-bottom:8px;border-bottom:1px solid var(--line)}
+  .badge{display:inline-flex;align-items:center;gap:7px;background:var(--passbg);color:var(--pass);
+    border:1px solid #1c5a44;border-radius:999px;padding:6px 14px;font-weight:700;font-size:15px}
+  .badge::before{content:"";width:9px;height:9px;border-radius:50%;background:var(--pass);box-shadow:0 0 10px var(--pass)}
+  .meta{color:var(--mut);font-size:13px;margin:2px 0 0}
+  .meta code{color:var(--accent)}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px;margin:14px 0}
+  .stat{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px 14px}
+  .stat b{display:block;font-size:22px;color:var(--pass)}
+  .stat span{color:var(--mut);font-size:12px}
+  table{width:100%;border-collapse:collapse;background:var(--card);border:1px solid var(--line);border-radius:12px;overflow:hidden}
+  th,td{padding:10px 12px;text-align:left;border-bottom:1px solid var(--line);vertical-align:top}
+  th{background:var(--card2);color:var(--mut);font-weight:600;font-size:13px}
+  tr:last-child td{border-bottom:none}
+  td .who{color:var(--accent);font-weight:600}
+  .pill{display:inline-block;background:var(--passbg);color:var(--pass);border:1px solid #1c5a44;
+    border-radius:6px;padding:1px 8px;font-size:12px;font-weight:700;white-space:nowrap}
+  .pill.w{background:#2a230c;color:var(--warn);border-color:#5a4a1c}
+  .tag{display:inline-block;border-radius:6px;padding:1px 7px;font-size:12px;font-weight:600}
+  .tag.claude{background:#1a2740;color:#8fb4ff} .tag.codex{background:#12302a;color:#5fe3c0}
+  .tag.gemini{background:#2e1a36;color:#d49bff}
+  .asserts{list-style:none;padding:0;margin:0}
+  .asserts li{display:flex;gap:10px;align-items:flex-start;background:var(--card);border:1px solid var(--line);
+    border-left:3px solid var(--pass);border-radius:8px;padding:10px 12px;margin-bottom:8px}
+  .asserts .t{color:var(--mut);font-size:12px;font-variant-numeric:tabular-nums;white-space:nowrap}
+  .asserts .id{color:var(--pass);font-weight:700;font-family:ui-monospace,Menlo,monospace;font-size:13px}
+  .asserts .d{color:var(--fg)}
+  .asserts .src{color:var(--accent);font-size:12px}
+  pre{background:var(--code);border:1px solid var(--line);border-radius:10px;padding:14px;overflow:auto;
+    font:12.5px/1.55 ui-monospace,Menlo,Consolas,monospace;color:#c8d0de}
+  .note{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 16px;color:var(--mut);font-size:14px}
+  .note b{color:var(--fg)}
+  .timeline{position:relative;margin:6px 0 0;padding-left:18px}
+  .timeline::before{content:"";position:absolute;left:5px;top:4px;bottom:4px;width:2px;background:var(--line)}
+  .ev{position:relative;padding:6px 0 6px 14px}
+  .ev::before{content:"";position:absolute;left:-17px;top:11px;width:9px;height:9px;border-radius:50%;
+    background:var(--accent);border:2px solid var(--bg)}
+  .ev .t{color:var(--mut);font-size:12px;font-variant-numeric:tabular-nums;margin-right:8px}
+  .ev .k{font-weight:600}
+  .ev.tc .k{color:#5fe3c0} .ev.dm .k{color:var(--warn)} .ev.wb .k{color:#d49bff}
+  footer{margin-top:40px;color:var(--mut);font-size:12px;text-align:center}
+  a{color:var(--accent)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <h1>§13 端到端验收记录</h1>
+    <span class="badge">全部通过 PASS</span>
+  </header>
+  <p class="meta">AgentBridge v3 · Docker 多机 / 多人 / 多异构 agent 模拟 ·
+    运行 2026-06-26 14:11:42 +0800 · 分支 <code>feat/v3-tailscale-docs</code> · HEAD <code>80643a1</code> · 可复现（跑两次同结果）</p>
+
+  <div class="grid">
+    <div class="stat"><b>6/6</b><span>agent 容器 exit 0</span></div>
+    <div class="stat"><b>11</b><span>§13 断言全 PASS</span></div>
+    <div class="stat"><b>3</b><span>异构 agent 类型</span></div>
+    <div class="stat"><b>0</b><span>失败 / 文件传输</span></div>
+  </div>
+
+  <h2>一、§13 验收矩阵</h2>
+  <table>
+    <tr><th>#</th><th>验收条目</th><th>场景</th><th>结果</th></tr>
+    <tr><td>1</td><td>一端完成→同房间成员自动获知（摘要+仓+契约）</td><td><span class="who">alice</span> 发 task_completed(auth/v1)，<span class="who">bob</span> 收到</td><td><span class="pill">PASS</span></td></tr>
+    <tr><td>2</td><td>DM 定向，不打扰房间其他 session</td><td>alice↔bob DM 往返；他人收不到</td><td><span class="pill">PASS</span></td></tr>
+    <tr><td>3</td><td>新成员 join 从白板拿房间状态摘要</td><td><span class="who">carol</span> 晚 8s 加入，拿到白板</td><td><span class="pill">PASS</span></td></tr>
+    <tr><td>4</td><td>离线成员重连补收事件</td><td><span class="who">dave</span> 断开→重连 drain</td><td><span class="pill">PASS</span></td></tr>
+    <tr><td>5</td><td>同 workspace 重起同类 agent 接回 session</td><td>recordSessionStart：new→resumed</td><td><span class="pill">PASS</span></td></tr>
+    <tr><td>6</td><td>两同名 Bob / 多设备 / 多 agent 不混淆</td><td><span class="who">bob2</span>（同名"Bob"不同 id）正确不收 bob@ 的 DM</td><td><span class="pill">PASS</span></td></tr>
+    <tr><td>7</td><td>非授权设备连不上（应用层 PSK）</td><td><span class="who">intruder</span> 伪造 token 被 4401 拒</td><td><span class="pill">PASS</span></td></tr>
+    <tr><td>8</td><td>broker 全程不传任何代码文件</td><td>broker 容器不挂仓库；payload 仅 git 指针</td><td><span class="pill">PASS</span></td></tr>
+    <tr><td>9</td><td>原 Claude↔Codex 单机流不受影响</td><td>room-bridge fail-inert + daemon 集成测试</td><td><span class="pill w">由 bun 测试套覆盖</span></td></tr>
+  </table>
+
+  <h2>二、演员表（多机 / 多人 / 多异构 agent）</h2>
+  <table>
+    <tr><th>容器（机器）</th><th>agent 类型</th><th>身份</th><th>剧本</th></tr>
+    <tr><td>broker</td><td>—</td><td>—</td><td>常开控制面 broker（服务器机）</td></tr>
+    <tr><td>alice</td><td><span class="tag claude">claude</span></td><td>alice@team.dev</td><td>发完成事件 + DM + 触发离线补投</td></tr>
+    <tr><td>bob</td><td><span class="tag codex">codex</span></td><td>bob@team.dev</td><td>收完成事件（断言契约）+ DM 往返</td></tr>
+    <tr><td>bob2</td><td><span class="tag codex">codex</span></td><td>bob2@team.dev<br><span class="meta">显示名也叫 "Bob"，id 不同</span></td><td>收广播；不收发给 bob@ 的 DM（身份消歧）</td></tr>
+    <tr><td>carol</td><td><span class="tag gemini">gemini</span></td><td>carol@team.dev</td><td>晚 8s 加入 → 收白板快照</td></tr>
+    <tr><td>dave</td><td><span class="tag claude">claude</span></td><td>dave@team.dev</td><td>断开 → 重连 → drain 离线事件</td></tr>
+    <tr><td>intruder</td><td>—</td><td>—</td><td>伪造 token → 被 PSK 拒</td></tr>
+  </table>
+
+  <h2>三、断言明细（按时间）</h2>
+  <ul class="asserts">
+    <li><span class="t">27.254</span><span class="src">provision</span><span class="id">s13-5</span><span class="d">会话连续性：first=new, second=resumed, prev=sess-1</span></li>
+    <li><span class="t">28.005</span><span class="src">intruder</span><span class="id">s13-7</span><span class="d">伪造 token 被拒（broker auth failed）</span></li>
+    <li><span class="t">29.002</span><span class="src">bob</span><span class="id">s13-1</span><span class="d">收到 alice 完成事件（contract=auth/v1，summary=auth 契约就绪）</span></li>
+    <li><span class="t">29.025</span><span class="src">bob2</span><span class="id">s13-6</span><span class="d">收到广播完成事件（广播到达所有成员）</span></li>
+    <li><span class="t">30.431</span><span class="src">alice</span><span class="id">s13-1</span><span class="d">alice 不收到自己的事件（防环 from-skip）</span></li>
+    <li><span class="t">30.431</span><span class="src">alice</span><span class="id">s13-2</span><span class="d">收到 bob 的 ack DM</span></li>
+    <li><span class="t">30.434</span><span class="src">bob</span><span class="id">s13-2</span><span class="d">收到 alice 发给 bob@ 的 DM</span></li>
+    <li><span class="t">31.586</span><span class="src">alice</span><span class="id">s13-4</span><span class="d">第二条事件发布时 dave 确实离线</span></li>
+    <li><span class="t">38.032</span><span class="src">bob2</span><span class="id">s13-6</span><span class="d">bob2 正确没收到 bob@ 的 DM —— 按 id 路由，非显示名</span></li>
+    <li><span class="t">38.600</span><span class="src">dave</span><span class="id">s13-4</span><span class="d">重连 drain 到离线事件（summary=second-wave 离线补投）</span></li>
+    <li><span class="t">38.996</span><span class="src">carol</span><span class="id">s13-3</span><span class="d">晚加入者拿到白板快照（contractsReady=auth/v1, checkout/v1）</span></li>
+  </ul>
+
+  <h2>四、事件时间线（谁收到什么）</h2>
+  <div class="timeline">
+    <div class="ev"><span class="t">28.0</span>alice / bob / dave / bob2 鉴权入房，互相收到 <span class="k">member_joined</span></div>
+    <div class="ev tc"><span class="t">28.9</span>bob / bob2 / dave 收到 <span class="k">task_completed</span> ← alice「auth 契约就绪」</div>
+    <div class="ev dm"><span class="t">29.0</span>alice 收到 <span class="k">dm</span> ← bob「收到，开始基于 auth/v1」</div>
+    <div class="ev dm"><span class="t">30.4</span>bob 收到 <span class="k">dm</span> ← alice「请基于 auth/v1 继续 checkout」（to=[bob@]，bob2 收不到）</div>
+    <div class="ev"><span class="t">31.4</span>dave 主动断开 → 全房收到 <span class="k">member_left</span> ← dave</div>
+    <div class="ev tc"><span class="t">31.5</span>alice 发第二条 <span class="k">task_completed</span>「second-wave 离线补投」（dave 离线 → 入 pending）</div>
+    <div class="ev wb"><span class="t">36.0</span>carol（gemini）晚加入 → 收 <span class="k">whiteboard</span> 快照 contractsReady=[auth/v1, checkout/v1]</div>
+    <div class="ev tc"><span class="t">38.5</span>dave 重连 → <span class="k">drain</span> 到离线的 task_completed + 白板快照</div>
+  </div>
+
+  <h2>五、broker 日志（节选）</h2>
+  <pre>[broker] broker listening on 0.0.0.0:4700
+[broker] up on 0.0.0.0:4700 (db /data/collab.db)
+[broker] conn #1 authenticated as bob2@team.dev
+[broker] conn #2 closed              ← intruder 伪造 token，4401 关连接
+[broker] conn #3 authenticated as alice@team.dev
+[broker] conn #4 authenticated as dave@team.dev
+[broker] conn #5 authenticated as bob@team.dev
+[broker] conn #4 closed              ← dave 主动离线
+[broker] conn #6 authenticated as carol@team.dev   ← 晚加入
+[broker] conn #7 authenticated as dave@team.dev     ← dave 重连
+[broker] conn #7 closed
+[broker] conn #6 closed</pre>
+
+  <h2>六、覆盖边界（诚实标注）</h2>
+  <div class="note">
+    <p><b>本 harness 证明：</b>控制面协议跨「机」（容器 / 网络）正确——完成事件扇出、DM 定向、新成员白板、离线补投、身份消歧、PSK 拒绝、无文件传输。</p>
+    <p><b>不在 Docker 内跑（由别处覆盖）：</b></p>
+    <p>· 真实 Claude/Codex 交互式会话注入（需 API key + 交互 CLI）→ 由 bun <code>room-bridge.test.ts</code> 覆盖。<br>
+       · Tailscale 网络层 ACL（非授权设备连不上）→ 由 <code>docs/10 跨网部署运维 runbook</code> 真机验证。<br>
+       · 原 Claude↔Codex 单机流不受影响 → 由 daemon 集成测试套覆盖（room-bridge fail-inert）。</p>
+    <p style="margin-bottom:0"><b>重跑：</b><code>bash docker/run-acceptance.sh</code></p>
+  </div>
+
+  <footer>AgentBridge v3 §11.1 单团队 MVP · §13 端到端验收 · 由 Docker 多机模拟自动生成</footer>
+</div>
+</body>
+</html>

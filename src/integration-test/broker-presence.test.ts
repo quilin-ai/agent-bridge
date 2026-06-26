@@ -26,6 +26,8 @@ async function startBroker() {
   await svc.registerIdentity("bob@x.com", "Bob");
   const tokenA = await svc.issueToken("alice@x.com");
   const tokenB = await svc.issueToken("bob@x.com");
+  await store.addMember(ROOM, "alice@x.com"); // room authz (§11.2)
+  await store.addMember(ROOM, "bob@x.com");
   const broker = new Broker({
     store,
     identityProvider: new StorePskIdentityProvider(store),

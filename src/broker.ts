@@ -235,6 +235,12 @@ export class Broker {
           this.send(ws, { type: "subscribed", topic }); // re-ack so a re-subscribe never hangs
           return;
         }
+        // Room authz (§11.2): closed-by-default — only members may subscribe.
+        if (!(await this.isMember(topic, me))) {
+          this.send(ws, { type: "error", reason: "not a room member" });
+          this.log(`DENY subscribe ${me} → ${topic} (not a member)`);
+          return;
+        }
         const unsub = this.transport.subscribe(topic, (envelope) => {
           if (this.shouldDeliver(me, envelope)) this.send(ws, { type: "event", topic, envelope });
         });
@@ -307,6 +313,14 @@ export class Broker {
         }
         if (typeof env.roomId !== "string" || env.roomId === "") {
           this.send(ws, { type: "error", reason: "envelope.roomId must be a non-empty string" });
+          return;
+        }
+        // Room authz (§11.2): only a member may publish into the room — a
+        // non-member can't inject events (incl. prompt-injection text) into rooms
+        // it isn't in. Gate on the delivery channel (msg.topic).
+        if (!(await this.isMember(msg.topic, me))) {
+          this.send(ws, { type: "error", reason: "not a room member" });
+          this.log(`DENY publish ${me} → ${msg.topic} (not a member)`);
           return;
         }
         // Anti-spoof + reliable loop prevention: stamp the authenticated sender
@@ -398,6 +412,21 @@ export class Broker {
 
   private isReachable(topic: string, id: string): boolean {
     return (this.topicMembers.get(topic)?.get(id) ?? 0) > 0;
+  }
+
+  /**
+   * Room authorization (§11.2): only a PERSISTED room member may subscribe to or
+   * publish into a room. Closed-by-default — a non-member (incl. an authenticated
+   * identity that simply isn't in this room) is denied, so PSK auth alone can't
+   * reach arbitrary rooms. FAIL-CLOSED: a Store error denies access, never grants.
+   */
+  private async isMember(topic: string, id: string): Promise<boolean> {
+    try {
+      return (await this.opts.store.getMembers(topic)).includes(id);
+    } catch (e) {
+      this.log(`membership check failed for ${id}@${topic} (deny): ${String(e)}`);
+      return false;
+    }
   }
 
   /**

@@ -135,7 +135,47 @@ export async function joinRoom(opts: {
   }
 }
 
-const ROOM_USAGE = "用法：abg room create <name> | abg room list";
+/**
+ * Add `identityId` as a member of `roomId` (§11.2 room access control). The broker
+ * is closed-by-default: only members may subscribe/publish, so membership IS the
+ * access grant. Authorization: the caller (logged-in identity) must already be a
+ * member — only insiders can invite. Runs against the collab DB the BROKER reads
+ * (the broker machine in a real cross-network deployment).
+ */
+export async function addRoomMember(opts: { roomId: string; identityId: string; dbPath?: string }): Promise<void> {
+  const dbPath = resolveDbPath(opts.dbPath);
+  const store = openStore(dbPath);
+  try {
+    const caller = await currentIdentityId(store, dbPath);
+    const svc = new RoomService(store);
+    if ((await svc.getRoom(opts.roomId)) === null) throw new Error(`房间不存在：${opts.roomId}（先 abg room create）`);
+    if (!(await svc.isMember(opts.roomId, caller))) {
+      throw new Error(`只有房间成员能加人；你（${caller}）不是 ${opts.roomId} 的成员`);
+    }
+    await svc.join(opts.roomId, opts.identityId);
+  } finally {
+    await store.close();
+  }
+}
+
+/** Remove `identityId` from `roomId`. Caller must be a member (§11.2). */
+export async function removeRoomMember(opts: { roomId: string; identityId: string; dbPath?: string }): Promise<void> {
+  const dbPath = resolveDbPath(opts.dbPath);
+  const store = openStore(dbPath);
+  try {
+    const caller = await currentIdentityId(store, dbPath);
+    const svc = new RoomService(store);
+    if (!(await svc.isMember(opts.roomId, caller))) {
+      throw new Error(`只有房间成员能移除成员；你（${caller}）不是 ${opts.roomId} 的成员`);
+    }
+    await svc.leave(opts.roomId, opts.identityId);
+  } finally {
+    await store.close();
+  }
+}
+
+const ROOM_USAGE =
+  "用法：abg room create <name> | abg room list | abg room add <roomId> <identityId> | abg room remove <roomId> <identityId>";
 
 /** Dispatch `abg room <subcommand>`: `create <name>` / `list`. */
 export async function runRoom(args: string[]): Promise<void> {
@@ -165,6 +205,24 @@ export async function runRoom(args: string[]): Promise<void> {
       }
       for (const r of rooms) {
         console.log(`${r.roomId}\t${r.name}\t${r.createdBy}`);
+      }
+      break;
+    }
+    case "add":
+    case "remove": {
+      const roomId = args[1];
+      const identityId = args[2];
+      if (!roomId || !identityId) {
+        console.error(`用法：abg room ${sub} <roomId> <identityId>`);
+        process.exit(1);
+        return;
+      }
+      if (sub === "add") {
+        await addRoomMember({ roomId, identityId });
+        console.log(`已把 ${identityId} 加入房间 ${roomId}（现在它可订阅/发布该房）`);
+      } else {
+        await removeRoomMember({ roomId, identityId });
+        console.log(`已把 ${identityId} 移出房间 ${roomId}（它将无法再订阅/发布该房）`);
       }
       break;
     }
