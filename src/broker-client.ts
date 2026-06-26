@@ -16,9 +16,22 @@ export interface BrokerClientOptions {
   maxOutbox?: number;
   /** WebSocket factory — injectable so tests can drive reconnect without a real socket. */
   wsFactory?: (url: string) => WebSocket;
+  /** Randomness source for reconnect jitter [0,1) — injectable so tests are deterministic. */
+  random?: () => number;
 }
 
 type EventHandler = (topic: string, envelope: Envelope) => void;
+
+/**
+ * Reconnect backoff with EQUAL JITTER (§8.2). `ceiling = min(maxMs, baseMs·2^attempt)`;
+ * the delay is `ceiling/2 + rand·ceiling/2`, i.e. uniformly in `[ceiling/2, ceiling]`.
+ * Half-fixed keeps a sane minimum wait; half-random de-synchronises adapters that
+ * dropped together (no thundering herd). Result is always `≤ ceiling ≤ maxMs`.
+ */
+export function reconnectDelay(baseMs: number, maxMs: number, attempt: number, rand: number): number {
+  const ceiling = Math.min(maxMs, baseMs * 2 ** attempt);
+  return ceiling / 2 + rand * (ceiling / 2);
+}
 
 /**
  * Edge-side client to the control-plane broker (§5 adapter transport + §8.2
@@ -55,6 +68,7 @@ export class BrokerClient {
   private readonly baseMs: number;
   private readonly maxMs: number;
   private readonly maxOutbox: number;
+  private readonly rand: () => number;
 
   constructor(private readonly opts: BrokerClientOptions) {
     this.log = opts.log ?? (() => {});
@@ -62,6 +76,7 @@ export class BrokerClient {
     this.baseMs = opts.reconnectBaseMs ?? 250;
     this.maxMs = opts.reconnectMaxMs ?? 10_000;
     this.maxOutbox = opts.maxOutbox ?? 1000;
+    this.rand = opts.random ?? Math.random;
   }
 
   get connected(): boolean {
@@ -237,9 +252,9 @@ export class BrokerClient {
 
   private scheduleReconnect(): void {
     if (this.closed || this.reconnectTimer) return;
-    const delay = Math.min(this.maxMs, this.baseMs * 2 ** this.reconnectAttempt);
+    const delay = reconnectDelay(this.baseMs, this.maxMs, this.reconnectAttempt, this.rand());
     this.reconnectAttempt++;
-    this.log(`reconnecting in ${delay}ms (attempt ${this.reconnectAttempt})`);
+    this.log(`reconnecting in ${Math.round(delay)}ms (attempt ${this.reconnectAttempt})`);
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
       if (this.closed) return;

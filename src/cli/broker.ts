@@ -91,7 +91,22 @@ export async function runBrokerStart(argv: string[]): Promise<void> {
   console.log(`AgentBridge broker 已启动，监听 ${bound.host}:${bound.port}`);
   console.log(`协作数据库：${dbPath}`);
   console.log("用 abg auth login 签发的 token 连接；Ctrl-C 停止。");
-  // Bun.serve keeps the event loop alive — the process stays up until killed.
+
+  // Graceful shutdown (§8.2): on SIGTERM/SIGINT, stop the server then close the
+  // Store — db.close() checkpoints the WAL so pending_deliveries survive the
+  // restart and a reconnecting member can still drain them. `once` so a second
+  // signal during teardown doesn't re-enter; exit 0 even if close() rejects.
+  let stopping = false;
+  const shutdown = (sig: string) => {
+    if (stopping) return;
+    stopping = true;
+    console.error(`[broker] ${sig} 收到，正在优雅关闭…`);
+    broker.stop();
+    store.close().finally(() => process.exit(0));
+  };
+  process.once("SIGTERM", () => shutdown("SIGTERM"));
+  process.once("SIGINT", () => shutdown("SIGINT"));
+  // Bun.serve keeps the event loop alive — the process stays up until a signal.
 }
 
 export async function runBroker(args: string[]): Promise<void> {

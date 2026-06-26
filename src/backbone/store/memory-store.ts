@@ -1,4 +1,5 @@
 import type { Envelope } from "../envelope";
+import { MAX_PENDING_PER_TARGET } from "../store";
 import type {
   AgentRecord,
   IdentityRecord,
@@ -139,6 +140,11 @@ export class InMemoryStore implements Store {
     }
     if (!byKey.has(envelope.idempotencyKey)) {
       byKey.set(envelope.idempotencyKey, envelope); // dedup: first wins
+    }
+    // Bound the per-target backlog (§8.2): Map preserves insertion order, so drop
+    // from the front (oldest) until within MAX_PENDING_PER_TARGET. Matches SqliteStore.
+    while (byKey.size > MAX_PENDING_PER_TARGET) {
+      byKey.delete(byKey.keys().next().value as string);
     }
   }
 

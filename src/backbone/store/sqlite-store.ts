@@ -1,5 +1,6 @@
 import { Database } from "bun:sqlite";
 import type { Envelope } from "../envelope";
+import { MAX_PENDING_PER_TARGET } from "../store";
 import type {
   AgentRecord,
   IdentityRecord,
@@ -242,6 +243,15 @@ export class SqliteStore implements Store {
         "INSERT OR IGNORE INTO pending_deliveries(target_agent_id, idempotency_key, envelope) VALUES(?, ?, ?)",
       )
       .run(targetAgentId, envelope.idempotencyKey, JSON.stringify(envelope));
+    // Bound the per-target backlog (§8.2): keep the newest MAX_PENDING_PER_TARGET,
+    // drop the oldest beyond it, so a never-reconnecting member can't grow the table.
+    this.db
+      .query(
+        `DELETE FROM pending_deliveries WHERE target_agent_id=? AND seq NOT IN (
+           SELECT seq FROM pending_deliveries WHERE target_agent_id=? ORDER BY seq DESC LIMIT ?
+         )`,
+      )
+      .run(targetAgentId, targetAgentId, MAX_PENDING_PER_TARGET);
   }
 
   async drainPending(targetAgentId: string): Promise<Envelope[]> {
