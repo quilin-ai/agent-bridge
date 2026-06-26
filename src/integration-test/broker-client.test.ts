@@ -12,7 +12,9 @@ async function startBroker() {
   const store = new InMemoryStore();
   const svc = new IdentityService(store);
   await svc.registerIdentity("alice@x.com", "Alice");
+  await svc.registerIdentity("bob@x.com", "Bob");
   const token = await svc.issueToken("alice@x.com");
+  const tokenB = await svc.issueToken("bob@x.com");
   const broker = new Broker({
     store,
     identityProvider: new StorePskIdentityProvider(store),
@@ -21,11 +23,11 @@ async function startBroker() {
     log: () => {},
   });
   const { port } = broker.start();
-  return { broker, store, token, url: `ws://127.0.0.1:${port}/ws` };
+  return { broker, store, token, tokenB, url: `ws://127.0.0.1:${port}/ws` };
 }
 
 describe("BrokerClient ↔ real Broker", () => {
-  test("connects, authenticates, and round-trips an event", async () => {
+  test("connects + authenticates; does NOT echo a client's own broadcast (loop prevention)", async () => {
     const { broker, store, token, url } = await startBroker();
     const c = new BrokerClient({ url, token, log: () => {} });
     try {
@@ -36,7 +38,7 @@ describe("BrokerClient ↔ real Broker", () => {
       await sleep(60); // let subscribe + ack land
       c.publish("room-1", makeEnvelope({ messageId: "e1" }));
       await sleep(60);
-      expect(got).toEqual(["e1"]);
+      expect(got).toEqual([]); // the sender never receives its own broadcast
     } finally {
       c.close();
       broker.stop();
@@ -44,10 +46,10 @@ describe("BrokerClient ↔ real Broker", () => {
     }
   });
 
-  test("fans out across clients: A publishes, B receives", async () => {
-    const { broker, store, token, url } = await startBroker();
-    const a = new BrokerClient({ url, token, log: () => {} });
-    const b = new BrokerClient({ url, token, log: () => {} });
+  test("fans out across clients: A publishes, B (different identity) receives", async () => {
+    const { broker, store, token, tokenB, url } = await startBroker();
+    const a = new BrokerClient({ url, token, log: () => {} }); // alice
+    const b = new BrokerClient({ url, token: tokenB, log: () => {} }); // bob
     try {
       await a.connect();
       await b.connect();
