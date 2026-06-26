@@ -51,12 +51,16 @@ async function start() {
   const svc = new IdentityService(store);
   await svc.registerIdentity("alice@x.com", "Alice");
   await svc.registerIdentity("mallory@x.com", "Mallory");
+  await svc.registerIdentity("bob@x.com", "Bob");
   const alice = await svc.issueToken("alice@x.com");
   const mallory = await svc.issueToken("mallory@x.com");
-  await store.addMember(ROOM, "alice@x.com"); // only alice is a member
-  const broker = new Broker({ store, identityProvider: new StorePskIdentityProvider(store), host: "127.0.0.1", port: 0, log: () => {} });
+  const bob = await svc.issueToken("bob@x.com");
+  await store.addMember(ROOM, "alice@x.com"); // alice + bob are members; mallory is not
+  await store.addMember(ROOM, "bob@x.com");
+  // memberCacheTtlMs: 0 ⇒ revocation re-check is immediate (no test sleeps).
+  const broker = new Broker({ store, identityProvider: new StorePskIdentityProvider(store), host: "127.0.0.1", port: 0, memberCacheTtlMs: 0, log: () => {} });
   const { port } = broker.start();
-  return { broker, store, alice, mallory, url: `ws://127.0.0.1:${port}/ws` };
+  return { broker, store, alice, mallory, bob, url: `ws://127.0.0.1:${port}/ws` };
 }
 
 function envelope(roomId: string) {
@@ -133,6 +137,54 @@ describe("Broker room authorization (§11.2) — closed by default", () => {
     expect(await store.getRecentEvents("other-room", 10)).toEqual([]);
     expect(await store.getWhiteboard("other-room")).toBeNull();
     a.close();
+  });
+
+  test("a store_if_offline DM to a NON-member is not queued (offline path is member-gated too)", async () => {
+    const { broker, store, alice, url } = await start();
+    stop = () => broker.stop();
+    const a = await WsClient.connect(url);
+    a.send({ type: "hello", token: alice });
+    await a.next(); // welcome (alice is a member)
+    // alice DMs an identity that is NOT a member of ROOM, offline.
+    a.send({
+      type: "publish",
+      topic: ROOM,
+      envelope: { ...envelope(ROOM), to: ["outsider@x.com"], payload: { summary: "INJECT" } },
+    });
+    await sleep(40);
+    expect(await store.drainPending("outsider@x.com")).toEqual([]); // never queued for a non-member
+    a.close();
+  });
+
+  test("removing a member evicts their LIVE subscription — no eavesdropping after abg room remove", async () => {
+    const { broker, store, alice, bob, url } = await start();
+    stop = () => broker.stop();
+    const aliceWs = await WsClient.connect(url);
+    aliceWs.send({ type: "hello", token: alice });
+    await aliceWs.next();
+    aliceWs.send({ type: "subscribe", topic: ROOM });
+    await aliceWs.next(); // subscribed
+    const bobWs = await WsClient.connect(url);
+    bobWs.send({ type: "hello", token: bob });
+    await bobWs.next();
+    bobWs.send({ type: "subscribe", topic: ROOM });
+    await bobWs.next();
+    await sleep(40);
+
+    // alice receives bob's first event (she's a member).
+    bobWs.send({ type: "publish", topic: ROOM, envelope: { ...envelope(ROOM), messageId: "ev1", idempotencyKey: "i1" } });
+    await sleep(100);
+    expect(aliceWs.drainNow().some((m) => m.envelope?.messageId === "ev1")).toBe(true);
+
+    // admin removes alice; her socket is still open.
+    await store.removeMember(ROOM, "alice@x.com");
+
+    // bob publishes again → alice must NOT receive it (evicted on the delivery re-check).
+    bobWs.send({ type: "publish", topic: ROOM, envelope: { ...envelope(ROOM), messageId: "ev2", idempotencyKey: "i2" } });
+    await sleep(120);
+    expect(aliceWs.drainNow().some((m) => m.envelope?.messageId === "ev2")).toBe(false);
+    aliceWs.close();
+    bobWs.close();
   });
 
   test("a member subscribes + publishes normally", async () => {

@@ -90,8 +90,14 @@ export async function createRoom(opts: {
     const createdBy = await currentIdentityId(store, dbPath);
     const svc = new RoomService(store);
     const existed = (await svc.getRoom(roomId)) !== null;
-    await svc.createRoom(roomId, opts.name, createdBy); // INSERT OR IGNORE — reuse if existed
-    await svc.join(roomId, createdBy); // the creator is a member
+    if (!existed) {
+      await svc.createRoom(roomId, opts.name, createdBy);
+      await svc.join(roomId, createdBy); // the creator of a NEW room is its first member
+    } else if (!(await svc.isMember(roomId, createdBy))) {
+      // Closed-by-default (§11.2): `create` must NOT self-grant membership of an
+      // EXISTING room — that reopens the self-join hole `joinRoom` closed.
+      throw new Error(`房间 ${roomId} 已存在且你（${createdBy}）不是成员；请让成员 abg room add ${createdBy}`);
+    }
     await svc.mapCwd(opts.cwd ?? process.cwd(), roomId);
     return { roomId, created: !existed };
   } finally {

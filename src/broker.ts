@@ -15,10 +15,11 @@ export function sanitizePresence(raw: unknown): PresenceMeta | undefined {
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return undefined;
   const r = raw as Record<string, unknown>;
   const out: PresenceMeta = {};
-  // Strip CR/LF/TAB at the source: a member who is later rendered into another
-  // agent's context must not be able to inject a SEPARATE forged line via a
-  // newline in host/capabilities (the render boundary neutralises it too).
-  const oneLine = (s: string) => s.replace(/[\r\n\t]+/g, " ");
+  // Strip ALL line/paragraph separators + control chars at the source (not just
+  // \r\n\t — also U+2028/U+2029/U+000B/U+000C/U+0085): a member rendered into
+  // another agent's context must not be able to inject a SEPARATE forged line via
+  // host/capabilities (the render boundary neutralises it too).
+  const oneLine = (s: string) => s.replace(/[\p{Cc}\p{Zl}\p{Zp}]+/gu, " ");
   if (typeof r.agentType === "string") out.agentType = oneLine(r.agentType);
   if (typeof r.host === "string") out.host = oneLine(r.host);
   if (Array.isArray(r.capabilities)) {
@@ -52,6 +53,8 @@ export interface BrokerOptions {
   /** Bind port. Default {@link DEFAULT_BROKER_PORT}; 0 picks a random free port. */
   port?: number;
   transport?: MessageTransport;
+  /** TTL for the hot-path membership cache (§11.2 revocation latency). Default 3000ms; tests set it small. */
+  memberCacheTtlMs?: number;
   log?: (msg: string) => void;
 }
 
@@ -83,6 +86,8 @@ export class Broker {
   private startedAt = 0;
   /** topic → (identityId → live-subscription count) — who is reachable per topic. */
   private readonly topicMembers = new Map<string, Map<string, number>>();
+  /** Short-TTL membership cache (§11.2 revocation): bounds re-validation cost on the hot delivery path. */
+  private readonly memberCache = new Map<string, { ok: boolean; exp: number }>();
   private readonly transport: MessageTransport;
   private readonly log: (msg: string) => void;
 
@@ -246,7 +251,27 @@ export class Broker {
           return;
         }
         const unsub = this.transport.subscribe(topic, (envelope) => {
-          if (this.shouldDeliver(me, envelope)) this.send(ws, { type: "event", topic, envelope });
+          // Re-validate membership on delivery (§11.2 revocation): an `abg room
+          // remove` only updates the Store, so without this a removed member's
+          // still-open subscription would keep receiving events until its socket
+          // drops. On revocation, evict the subscription (stop the eavesdropping).
+          void (async () => {
+            try {
+              if (!(await this.isMemberCached(topic, me))) {
+                const u = ws.data.subs.get(topic);
+                if (u) {
+                  u();
+                  ws.data.subs.delete(topic);
+                  this.removeTopicMember(topic, me);
+                  this.log(`EVICT ${me} from ${topic} (membership revoked)`);
+                }
+                return;
+              }
+              if (this.shouldDeliver(me, envelope)) this.send(ws, { type: "event", topic, envelope });
+            } catch (e) {
+              this.log(`delivery check failed (#${ws.data.connId}): ${String(e)}`);
+            }
+          })();
         });
         ws.data.subs.set(topic, unsub);
         const becamePresent = this.addTopicMember(topic, me);
@@ -444,6 +469,23 @@ export class Broker {
   }
 
   /**
+   * Cached membership check for the hot delivery path (§11.2 revocation). Bounds
+   * how long a REMOVED member's still-open subscription keeps receiving events to
+   * the TTL, without a Store hit per delivered event. `subscribe` itself uses the
+   * uncached {@link isMember} so admission is always authoritative.
+   */
+  private async isMemberCached(topic: string, id: string): Promise<boolean> {
+    const ttlMs = this.opts.memberCacheTtlMs ?? 3000;
+    const key = `${topic} ${id}`;
+    const now = Date.now();
+    const c = this.memberCache.get(key);
+    if (c && c.exp > now) return c.ok;
+    const ok = await this.isMember(topic, id);
+    this.memberCache.set(key, { ok, exp: now + ttlMs });
+    return ok;
+  }
+
+  /**
    * Distil an event into the room whiteboard (§4.2), zero-LLM. mergeWhiteboard
    * returns the SAME reference when the kind doesn't touch the board, so an
    * unmergeable event (a DM, etc.) skips the Store write entirely.
@@ -456,7 +498,13 @@ export class Broker {
 
   /** Persist a store_if_offline envelope for intended recipients with no live subscription (§3.2). */
   private async storeForOfflineRecipients(topic: string, env: Envelope, from?: string): Promise<void> {
-    const intended = Array.isArray(env.to) ? env.to : await this.opts.store.getMembers(topic);
+    // Always confine to room members (§11.2): a DM's `env.to` is attacker-supplied,
+    // so a member must NOT be able to queue an offline DM for an identity that
+    // isn't in this room (cross-room injection on the recipient's reconnect). Live
+    // delivery is already member-gated (non-members can't subscribe); this closes
+    // the offline path symmetrically.
+    const members = await this.opts.store.getMembers(topic);
+    const intended = Array.isArray(env.to) ? env.to.filter((id) => members.includes(id)) : members;
     for (const id of intended) {
       if (id === from) continue; // never store for the sender
       if (!this.isReachable(topic, id)) {

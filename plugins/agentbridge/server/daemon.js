@@ -30,10 +30,10 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.24", "0.0.0-source"),
-  commit: defineString("6d87f57", "source"),
+  commit: defineString("b9fed90", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION),
-  codeHash: defineString("539151ffe6fb", "source")
+  codeHash: defineString("31bc3ea195a0", "source")
 });
 function daemonStatusBuildInfo() {
   return { ...BUILD_INFO };
@@ -7296,7 +7296,7 @@ function senderId(env) {
   return safeField(env.from?.agentId) || "\u672A\u77E5\u6210\u5458";
 }
 function safeField(s) {
-  return String(s ?? "").replace(/[\r\n\t]+/g, " ").replace(/[\uD83D\uDCE8\u300C\u300D]/g, "\xB7");
+  return String(s ?? "").replace(/[\p{Cc}\p{Zl}\p{Zp}]+/gu, " ").replace(/[\uD83D\uDCE8\u300C\u300D]/gu, "\xB7").replace(/\u623F\u95F4\u6D88\u606F\u00B7\u5916\u90E8\u6210\u5458/gu, "\xB7\xB7");
 }
 function renderWhiteboard(wb) {
   if (!wb || typeof wb !== "object")

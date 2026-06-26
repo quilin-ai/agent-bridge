@@ -61,14 +61,19 @@ function senderId(env: Envelope): string {
 
 /**
  * Neutralise attacker-controlled free text before embedding it in a one-line
- * notice. Strips newlines/tabs (so a member can't inject a SEPARATE fake line)
- * and the structural chars `📨「」` (so they can't forge the untrusted-marker
- * prefix or break out of the data delimiters and fake a notice from another id).
+ * notice. (1) Collapse ALL line/paragraph separators + control chars — not just
+ * \r\n\t but also U+2028/U+2029/U+000B/U+000C/U+0085 — so a member can't inject a
+ * SEPARATE visual line. (2) Neutralise the structural chars `📨「」` AND the
+ * distinctive marker phrase `房间消息·外部成员` (so an attacker can't forge the
+ * untrusted-marker prefix even with a look-alike glyph like ✉️). The channel
+ * boundary (one injected notice per event) is the structural defense; this keeps
+ * the attacker's text confined and clearly un-marker-able inside their one notice.
  */
 function safeField(s: unknown): string {
   return String(s ?? "")
-    .replace(/[\r\n\t]+/g, " ")
-    .replace(/[📨「」]/g, "·");
+    .replace(/[\p{Cc}\p{Zl}\p{Zp}]+/gu, " ") // all control + line/para separators → space
+    .replace(/[📨「」]/gu, "·")
+    .replace(/房间消息·外部成员/gu, "··"); // the marker's distinctive core — unforgeable
 }
 
 /**
