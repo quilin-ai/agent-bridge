@@ -1,5 +1,5 @@
 {
-  "description": "Hint-only health checks for AgentBridge startup. These hooks never orchestrate the daemon.",
+  "description": "Hint-only health checks for AgentBridge startup + a fail-open task_completed announcer. These hooks never orchestrate the daemon.",
   "hooks": {
     "SessionStart": [
       {
@@ -8,6 +8,17 @@
           {
             "type": "command",
             "command": "bash \"${CLAUDE_PLUGIN_ROOT}/scripts/health-check.sh\""
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/scripts/publish-completion.sh\""
           }
         ]
       }

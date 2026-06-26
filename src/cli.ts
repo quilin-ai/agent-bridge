@@ -135,6 +135,11 @@ async function main(command: string | undefined, restArgs: string[]) {
       const { runJoin } = await import("./cli/room");
       await runJoin(restArgs);
       break;
+    case "publish":
+    case "announce":
+      const { runPublish } = await import("./cli/publish");
+      await runPublish(restArgs);
+      break;
     case "--help":
     case "-h":
     case undefined:

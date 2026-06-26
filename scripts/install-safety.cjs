@@ -24,6 +24,7 @@ const REQUIRED_ARTIFACTS = Object.freeze([
   "plugins/agentbridge/hooks/hooks.json",
   "plugins/agentbridge/scripts/health-check.sh",
   "plugins/agentbridge/scripts/plugin-update-notice.mjs",
+  "plugins/agentbridge/scripts/publish-completion.sh",
   "plugins/agentbridge/server/bridge-server.js",
   "plugins/agentbridge/server/daemon.js",
   "package.json",
