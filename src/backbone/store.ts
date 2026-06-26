@@ -1,6 +1,13 @@
 import type { Envelope } from "./envelope";
 
 /**
+ * Max queued envelopes per offline target before the oldest is dropped (§8.2).
+ * Mirrors the BrokerClient outbox bound: logged, bounded loss beats unbounded
+ * growth for a member that never comes back.
+ */
+export const MAX_PENDING_PER_TARGET = 1000;
+
+/**
  * Store interface (spec §6.1, §12 data model).
  *
  * The persistence seam. Battery impl = SQLite (WAL); production impl = Postgres
@@ -83,6 +90,11 @@ export interface Store {
   saveWhiteboard(roomId: string, whiteboard: WhiteboardRecord): Promise<void>;
 
   // --- pending_deliveries: offline replay queue (§3.2), dedup by idempotencyKey ---
+  /**
+   * Queue an envelope for an offline target. Bounded per target at
+   * {@link MAX_PENDING_PER_TARGET} (drop-oldest) so a member that never reconnects
+   * can't grow the backlog without limit (§8.2 resilience).
+   */
   enqueuePending(targetAgentId: string, envelope: Envelope): Promise<void>;
   /** Remove and return the target's pending envelopes (deduped by idempotencyKey). */
   drainPending(targetAgentId: string): Promise<Envelope[]>;

@@ -1,4 +1,5 @@
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
+import { MAX_PENDING_PER_TARGET } from "../backbone/store";
 import type { Store } from "../backbone/store";
 import { makeEnvelope } from "./backbone-fixtures";
 
@@ -122,6 +123,20 @@ export function runStoreContract(label: string, makeStore: () => Store) {
       expect(drained.map((e) => e.idempotencyKey).sort()).toEqual(["k1", "k2"]);
       expect(await store.drainPending("ag-2")).toEqual([]); // cleared
       expect((await store.drainPending("ag-3")).length).toBe(1); // other target intact
+    });
+
+    test("pending deliveries are bounded per target (§8.2): oldest dropped beyond MAX_PENDING_PER_TARGET", async () => {
+      const total = MAX_PENDING_PER_TARGET + 5;
+      for (let i = 0; i < total; i++) {
+        await store.enqueuePending("ag-cap", makeEnvelope({ idempotencyKey: `k${i}`, messageId: `m${i}` }));
+      }
+      const drained = await store.drainPending("ag-cap");
+      expect(drained.length).toBe(MAX_PENDING_PER_TARGET); // capped
+      const keys = new Set(drained.map((e) => e.idempotencyKey));
+      expect(keys.has("k0")).toBe(false); // oldest 5 dropped
+      expect(keys.has("k4")).toBe(false);
+      expect(keys.has("k5")).toBe(true); // newest kept
+      expect(keys.has(`k${total - 1}`)).toBe(true);
     });
 
     test("auth tokens issue / resolve / list, re-issue re-points", async () => {

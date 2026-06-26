@@ -30,10 +30,10 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.24", "0.0.0-source"),
-  commit: defineString("8284e8a", "source"),
+  commit: defineString("b202e8f", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION),
-  codeHash: defineString("0a63b984bf2a", "source")
+  codeHash: defineString("7c98560c206e", "source")
 });
 function daemonStatusBuildInfo() {
   return { ...BUILD_INFO };
@@ -6811,6 +6811,11 @@ class RoomManager {
 }
 
 // src/broker-client.ts
+function reconnectDelay(baseMs, maxMs, attempt, rand) {
+  const ceiling = Math.min(maxMs, baseMs * 2 ** attempt);
+  return ceiling / 2 + rand * (ceiling / 2);
+}
+
 class BrokerClient {
   opts;
   ws = null;
@@ -6830,6 +6835,7 @@ class BrokerClient {
   baseMs;
   maxMs;
   maxOutbox;
+  rand;
   constructor(opts) {
     this.opts = opts;
     this.log = opts.log ?? (() => {});
@@ -6837,6 +6843,7 @@ class BrokerClient {
     this.baseMs = opts.reconnectBaseMs ?? 250;
     this.maxMs = opts.reconnectMaxMs ?? 1e4;
     this.maxOutbox = opts.maxOutbox ?? 1000;
+    this.rand = opts.random ?? Math.random;
   }
   get connected() {
     return this.ws !== null && this.ws.readyState === WebSocket.OPEN && this.identity !== null;
@@ -6990,9 +6997,9 @@ class BrokerClient {
   scheduleReconnect() {
     if (this.closed || this.reconnectTimer)
       return;
-    const delay = Math.min(this.maxMs, this.baseMs * 2 ** this.reconnectAttempt);
+    const delay = reconnectDelay(this.baseMs, this.maxMs, this.reconnectAttempt, this.rand());
     this.reconnectAttempt++;
-    this.log(`reconnecting in ${delay}ms (attempt ${this.reconnectAttempt})`);
+    this.log(`reconnecting in ${Math.round(delay)}ms (attempt ${this.reconnectAttempt})`);
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
       if (this.closed)
@@ -7065,6 +7072,10 @@ import { dirname as dirname3, join as join11 } from "path";
 // src/backbone/store/sqlite-store.ts
 import { Database } from "bun:sqlite";
 
+// src/backbone/store.ts
+var MAX_PENDING_PER_TARGET = 1000;
+
+// src/backbone/store/sqlite-store.ts
 class SqliteStore {
   db;
   closed = false;
@@ -7203,6 +7214,9 @@ class SqliteStore {
   }
   async enqueuePending(targetAgentId, envelope) {
     this.db.query("INSERT OR IGNORE INTO pending_deliveries(target_agent_id, idempotency_key, envelope) VALUES(?, ?, ?)").run(targetAgentId, envelope.idempotencyKey, JSON.stringify(envelope));
+    this.db.query(`DELETE FROM pending_deliveries WHERE target_agent_id=? AND seq NOT IN (
+           SELECT seq FROM pending_deliveries WHERE target_agent_id=? ORDER BY seq DESC LIMIT ?
+         )`).run(targetAgentId, targetAgentId, MAX_PENDING_PER_TARGET);
   }
   async drainPending(targetAgentId) {
     const rows = this.db.query("SELECT envelope FROM pending_deliveries WHERE target_agent_id=? ORDER BY seq").all(targetAgentId);

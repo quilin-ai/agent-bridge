@@ -72,6 +72,10 @@ export interface BrokerOptions {
 export class Broker {
   private server: ReturnType<typeof Bun.serve> | null = null;
   private nextConnId = 0;
+  /** Live WS connections (incremented on upgrade, decremented on close) — for /healthz. */
+  private liveConnections = 0;
+  /** Epoch ms the server started, for /healthz uptime. 0 until start(). */
+  private startedAt = 0;
   /** topic → (identityId → live-subscription count) — who is reachable per topic. */
   private readonly topicMembers = new Map<string, Map<string, number>>();
   private readonly transport: MessageTransport;
@@ -90,14 +94,23 @@ export class Broker {
     // loopback rather than become an all-interfaces bind (`Bun.serve({hostname:""})`).
     const host = this.opts.host || "127.0.0.1";
     const port = this.opts.port ?? DEFAULT_BROKER_PORT;
+    this.startedAt = Date.now();
     // eslint-disable-next-line @typescript-eslint/no-this-alias
     const self = this;
     const server = Bun.serve<BrokerSocketData>({
       hostname: host,
       port,
       fetch(req, server) {
-        if (new URL(req.url).pathname === "/ws") {
+        const pathname = new URL(req.url).pathname;
+        if (pathname === "/healthz") {
+          // Liveness probe for a watchdog/supervisor (§8.2). Minimal, NON-SENSITIVE
+          // body — the broker binds a Tailscale 100.x address reachable by any
+          // tailnet node, so this must never leak tokens/PII/identities.
+          return Response.json(self.healthBody());
+        }
+        if (pathname === "/ws") {
           if (server.upgrade(req, { data: { connId: ++self.nextConnId, subs: new Map() } })) {
+            self.liveConnections++;
             return undefined;
           }
         }
@@ -124,6 +137,7 @@ export class Broker {
           }
           for (const unsub of ws.data.subs.values()) unsub();
           ws.data.subs.clear();
+          if (self.liveConnections > 0) self.liveConnections--;
           self.log(`conn #${ws.data.connId} closed`);
         },
       },
@@ -131,6 +145,16 @@ export class Broker {
     this.server = server;
     this.log(`broker listening on ${host}:${server.port}`);
     return { host, port: server.port ?? port };
+  }
+
+  /** Non-sensitive liveness body for GET /healthz (§8.2 watchdog). No tokens/PII/identities. */
+  private healthBody(): { ok: true; pid: number; uptimeMs: number; connections: number } {
+    return {
+      ok: true,
+      pid: process.pid,
+      uptimeMs: this.startedAt === 0 ? 0 : Date.now() - this.startedAt,
+      connections: this.liveConnections,
+    };
   }
 
   stop(): void {
