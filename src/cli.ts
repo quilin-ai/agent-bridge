@@ -186,8 +186,9 @@ Commands:
   budget [--json]    Show both agents' subscription quota snapshot (5h/weekly, drift, pause state)
   auth login --id <email|github> --name <displayName>
                      Issue a collaboration PSK token and write it to <state>/auth-token (0600)
-  room create <name> | room list
-                     Create a collaboration room (id = slugified name) or list rooms
+  room create <name> | room list | room add <roomId> <identityId> | room remove <roomId> <identityId>
+                     Create a collaboration room (id = slugified name), list rooms,
+                     or add/remove a member (caller must be a member)
   join <roomId>      Join a room and auto-join this directory next time (§2.4)
   broker start [--host <ip>] [--port <n>] [--db <path>] [--web-port <n>] [--no-web] [--no-open]
                      Run the always-on control-plane broker (§11.1) + a loopback-only
