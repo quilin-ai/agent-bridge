@@ -18,9 +18,11 @@ class WsClient {
     c.ws = new WebSocket(url);
     c.ws.onmessage = (ev) => {
       const m = JSON.parse(ev.data as string);
-      // Ignore presence churn (§11.1 bullet 9): these tests assert on the routing
-      // of PUBLISHED envelopes, not member_joined/left (covered by broker-presence).
+      // Ignore presence churn (§11.1 bullet 9) + whiteboard injection (§4.4):
+      // these tests assert on the routing of PUBLISHED envelopes, not member_joined/
+      // left (broker-presence) or the on-join whiteboard snapshot (broker-room-memory).
       if (m?.type === "event" && (m.envelope?.kind === "member_joined" || m.envelope?.kind === "member_left")) return;
+      if (m?.type === "whiteboard") return;
       const w = c.waiters.shift();
       if (w) w(m);
       else c.q.push(m);

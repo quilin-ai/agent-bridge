@@ -5,6 +5,7 @@ import type { MessageTransport } from "./backbone/transport";
 import type { Envelope } from "./backbone/envelope";
 import { InProcTransport } from "./backbone/transport/inproc-transport";
 import { buildPresenceEnvelope, type PresenceMeta } from "./presence";
+import { mergeWhiteboard } from "./whiteboard";
 
 export const DEFAULT_BROKER_PORT = 4700; // outside the multi-pair 4500/4501/4502+stride range
 const CLOSE_AUTH_FAILED = 4401;
@@ -247,7 +248,19 @@ export class Broker {
         // drain await means a disconnect mid-drain can't reorder it after the
         // close()-emitted member_left (a "left-then-joined" ghost) under a future
         // truly-async Store. Drain is broadcast-irrelevant; ordering vs join is moot.
-        if (becamePresent) await this.emitPresence(topic, "member_joined", ws.data.identity, ws.data.presence);
+        if (becamePresent) {
+          await this.emitPresence(topic, "member_joined", ws.data.identity, ws.data.presence);
+          // New-member injection (§4.4): hand the joiner the room's distilled
+          // whiteboard so it has context immediately, WITHOUT replaying the raw
+          // ledger (that would double-deliver against drainPendingTo). Sent only to
+          // this socket, best-effort.
+          try {
+            const whiteboard = await this.opts.store.getWhiteboard(topic);
+            if (whiteboard) this.send(ws, { type: "whiteboard", roomId: topic, whiteboard });
+          } catch (e) {
+            this.log(`whiteboard inject failed for ${me}@${topic}: ${String(e)}`);
+          }
+        }
         // Drain anything queued during the connected-but-not-yet-subscribed gap
         // (between hello's drain and this subscribe). Safe: drainPending removes,
         // so an already-drained message is never re-delivered.
@@ -307,6 +320,16 @@ export class Broker {
         }
         // Live fan-out; each subscriber's handler applies shouldDeliver (DM / from-skip).
         await this.transport.publish(msg.topic, env);
+        // Room memory (§4): append to the ledger + distil into the whiteboard AFTER
+        // delivery, best-effort — a memory write must never roll back or block the
+        // live fan-out that already happened. Presence is broker-synthesized via
+        // emitPresence (not this path), so it's naturally excluded from the ledger.
+        try {
+          await this.opts.store.appendEvent(env.roomId, env);
+          await this.updateWhiteboard(env);
+        } catch (e) {
+          this.log(`room-memory update failed (${env.idempotencyKey}): ${String(e)}`);
+        }
         return;
       }
       default: {
@@ -375,6 +398,17 @@ export class Broker {
 
   private isReachable(topic: string, id: string): boolean {
     return (this.topicMembers.get(topic)?.get(id) ?? 0) > 0;
+  }
+
+  /**
+   * Distil an event into the room whiteboard (§4.2), zero-LLM. mergeWhiteboard
+   * returns the SAME reference when the kind doesn't touch the board, so an
+   * unmergeable event (a DM, etc.) skips the Store write entirely.
+   */
+  private async updateWhiteboard(env: Envelope): Promise<void> {
+    const prev = await this.opts.store.getWhiteboard(env.roomId);
+    const next = mergeWhiteboard(prev, env);
+    if (next !== prev && next !== null) await this.opts.store.saveWhiteboard(env.roomId, next);
   }
 
   /** Persist a store_if_offline envelope for intended recipients with no live subscription (§3.2). */

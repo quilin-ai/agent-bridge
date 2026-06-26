@@ -60,6 +60,29 @@ describe("startRoomBridge — last-mile broker→session injection (§11.1)", ()
     expect(emitted).toEqual([]);
   });
 
+  test("on join, the room whiteboard is rendered and injected (§4.4 new-member injection)", async () => {
+    const { dir, store, tokenB, broker, url, dbPath } = await setup();
+    cleanup.push(() => broker.stop(), () => rmSync(dir, { recursive: true, force: true }));
+
+    // bob publishes a task_completed first so the room has a whiteboard.
+    const bob = new BrokerClient({ url, token: tokenB });
+    await bob.connect();
+    cleanup.push(() => bob.close());
+    bob.publish(
+      ROOM,
+      buildTaskCompletedEnvelope({ roomId: ROOM, from: { agentId: "bob@x.com", agentType: "codex" }, summary: "auth done", contract: "auth/v1" }),
+    );
+    await delay(120); // let the broker append + distil the whiteboard
+
+    // alice's room bridge starts → subscribes → broker pushes the whiteboard snapshot.
+    const emitted: string[] = [];
+    const handle = await startRoomBridge({ cwd: dir, emit: (t) => emitted.push(t), store, dbPath, brokerUrl: url });
+    cleanup.push(() => handle.stop());
+    await waitFor(() => emitted.some((t) => t.includes("📋 房间白板")));
+    const wbLine = emitted.find((t) => t.includes("📋 房间白板"))!;
+    expect(wbLine).toContain("auth/v1");
+  });
+
   test("inert when cwd is not mapped to a room", async () => {
     const { dir, store, broker, url, dbPath } = await setup({ mapCwd: false });
     cleanup.push(() => broker.stop(), () => rmSync(dir, { recursive: true, force: true }));
