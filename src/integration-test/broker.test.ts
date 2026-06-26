@@ -56,7 +56,9 @@ async function startBroker() {
   const store = new InMemoryStore();
   const svc = new IdentityService(store);
   await svc.registerIdentity("alice@x.com", "Alice");
+  await svc.registerIdentity("bob@x.com", "Bob");
   const token = await svc.issueToken("alice@x.com");
+  const tokenB = await svc.issueToken("bob@x.com");
   const broker = new Broker({
     store,
     identityProvider: new StorePskIdentityProvider(store),
@@ -65,7 +67,7 @@ async function startBroker() {
     log: () => {},
   });
   const { port } = broker.start();
-  return { broker, store, token, url: `ws://127.0.0.1:${port}/ws` };
+  return { broker, store, token, tokenB, url: `ws://127.0.0.1:${port}/ws` };
 }
 
 describe("Broker — WSS + PSK auth + transport fan-out", () => {
@@ -91,15 +93,15 @@ describe("Broker — WSS + PSK auth + transport fan-out", () => {
     }
   });
 
-  test("publish fans out the envelope to a subscriber (control-plane only)", async () => {
-    const { broker, store, token, url } = await startBroker();
+  test("publish fans out the envelope to a (different-identity) subscriber", async () => {
+    const { broker, store, token, tokenB, url } = await startBroker();
     try {
       const pub = await WsClient.connect(url);
-      pub.send({ type: "hello", token });
+      pub.send({ type: "hello", token }); // alice publishes
       await pub.next(); // welcome
 
       const sub = await WsClient.connect(url);
-      sub.send({ type: "hello", token });
+      sub.send({ type: "hello", token: tokenB }); // bob subscribes
       await sub.next(); // welcome
       sub.send({ type: "subscribe", topic: "room-1" });
       expect(await sub.next()).toEqual({ type: "subscribed", topic: "room-1" });
