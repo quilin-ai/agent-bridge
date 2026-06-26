@@ -111,8 +111,12 @@ export async function listRooms(opts: { dbPath?: string }): Promise<RoomRecord[]
 }
 
 /**
- * Join the logged-in identity to a room and map the cwd to it (so the same
- * directory auto-joins next time, §2.4). Throws if the room does not exist.
+ * Map the current directory to a room you're ALREADY a member of (§2.4 cwd→room).
+ *
+ * Closed-by-default (§11.2): `abg join` does NOT self-grant membership — that would
+ * let any token-holder self-join any room and defeat the access control. Membership
+ * is granted only by an existing member via `abg room add` (run on the broker
+ * machine). A non-member who tries to join is told to ask an admin.
  */
 export async function joinRoom(opts: {
   roomId: string;
@@ -127,7 +131,9 @@ export async function joinRoom(opts: {
     if ((await svc.getRoom(opts.roomId)) === null) {
       throw new Error(`房间不存在：${opts.roomId}（先用 abg room create 创建）`);
     }
-    await svc.join(opts.roomId, agentId);
+    if (!(await svc.isMember(opts.roomId, agentId))) {
+      throw new Error(`你（${agentId}）不是 ${opts.roomId} 的成员；请让房间成员在 broker 机上 abg room add ${agentId}`);
+    }
     await svc.mapCwd(opts.cwd ?? process.cwd(), opts.roomId);
     return { roomId: opts.roomId, agentId };
   } finally {
@@ -242,5 +248,5 @@ export async function runJoin(args: string[]): Promise<void> {
     return;
   }
   const result = await joinRoom({ roomId });
-  console.log(`已加入房间 ${result.roomId}（agent ${result.agentId}）；该目录今后会自动加入`);
+  console.log(`已把当前目录关联到房间 ${result.roomId}（agent ${result.agentId}，你已是成员）；该目录今后会自动加入`);
 }

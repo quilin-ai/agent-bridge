@@ -60,7 +60,7 @@ async function start() {
   for (const id of ids) {
     await svc.registerIdentity(id, id);
     token[id] = await svc.issueToken(id);
-    await store.addMember("r", id); // room authz (§11.2): all three are members of room "r"
+    await store.addMember("room-1", id); // room authz (§11.2): all three are members of room "room-1"
   }
   const broker = new Broker({
     store,
@@ -85,13 +85,13 @@ async function join(url: string, token: string, topic: string): Promise<WsClient
 describe("Broker routing (§3.2): DM / broadcast / hop / offline replay", () => {
   test("DM (`to`) reaches only the named target, not other room members", async () => {
     const { broker, store, token, url } = await start();
-    const bob = await join(url, token["bob@x.com"]!, "r");
-    const carol = await join(url, token["carol@x.com"]!, "r");
-    const alice = await join(url, token["alice@x.com"]!, "r");
+    const bob = await join(url, token["bob@x.com"]!, "room-1");
+    const carol = await join(url, token["carol@x.com"]!, "room-1");
+    const alice = await join(url, token["alice@x.com"]!, "room-1");
     try {
       alice.send({
         type: "publish",
-        topic: "r",
+        topic: "room-1",
         envelope: makeEnvelope({ messageId: "dm1", to: ["bob@x.com"], deliveryMode: "online_only" }),
       });
       const got = await bob.next();
@@ -109,12 +109,12 @@ describe("Broker routing (§3.2): DM / broadcast / hop / offline replay", () => 
 
   test("broadcast reaches all room members EXCEPT the sender (loop prevention)", async () => {
     const { broker, store, token, url } = await start();
-    const bob = await join(url, token["bob@x.com"]!, "r");
-    const alice = await join(url, token["alice@x.com"]!, "r");
+    const bob = await join(url, token["bob@x.com"]!, "room-1");
+    const alice = await join(url, token["alice@x.com"]!, "room-1");
     try {
       alice.send({
         type: "publish",
-        topic: "r",
+        topic: "room-1",
         envelope: makeEnvelope({ messageId: "bc1", deliveryMode: "online_only" }),
       });
       expect(await bob.next()).toMatchObject({ type: "event", envelope: { messageId: "bc1" } });
@@ -130,12 +130,12 @@ describe("Broker routing (§3.2): DM / broadcast / hop / offline replay", () => 
 
   test("hop<=0 is dropped (multi-hop loop guard)", async () => {
     const { broker, store, token, url } = await start();
-    const bob = await join(url, token["bob@x.com"]!, "r");
-    const alice = await join(url, token["alice@x.com"]!, "r");
+    const bob = await join(url, token["bob@x.com"]!, "room-1");
+    const alice = await join(url, token["alice@x.com"]!, "room-1");
     try {
       alice.send({
         type: "publish",
-        topic: "r",
+        topic: "room-1",
         envelope: makeEnvelope({ messageId: "hop0", hop: 0, deliveryMode: "online_only" }),
       });
       await sleep(40);
@@ -150,14 +150,14 @@ describe("Broker routing (§3.2): DM / broadcast / hop / offline replay", () => 
 
   test("store_if_offline DM is queued for an offline target and drained on reconnect", async () => {
     const { broker, store, token, url } = await start();
-    const alice = await join(url, token["alice@x.com"]!, "r");
+    const alice = await join(url, token["alice@x.com"]!, "room-1");
     try {
       // bob is NOT connected — the DM must be persisted for him.
       alice.send({
         type: "publish",
-        topic: "r",
+        topic: "room-1",
         envelope: makeEnvelope({
-          roomId: "r",
+          roomId: "room-1",
           messageId: "queued1",
           to: ["bob@x.com"],
           deliveryMode: "store_if_offline",
@@ -179,11 +179,11 @@ describe("Broker routing (§3.2): DM / broadcast / hop / offline replay", () => 
 
   test("rejects an envelope with a missing/non-object from (anti-spoof guard)", async () => {
     const { broker, store, token, url } = await start();
-    const alice = await join(url, token["alice@x.com"]!, "r");
+    const alice = await join(url, token["alice@x.com"]!, "room-1");
     try {
       const env = makeEnvelope({ messageId: "noFrom", deliveryMode: "online_only" });
       delete (env as { from?: unknown }).from;
-      alice.send({ type: "publish", topic: "r", envelope: env });
+      alice.send({ type: "publish", topic: "room-1", envelope: env });
       expect(await alice.next()).toMatchObject({ type: "error" }); // rejected, never fanned out
     } finally {
       alice.close();
@@ -194,11 +194,11 @@ describe("Broker routing (§3.2): DM / broadcast / hop / offline replay", () => 
 
   test("rejects a string `to` (would degrade DM to a substring match → leak)", async () => {
     const { broker, store, token, url } = await start();
-    const alice = await join(url, token["alice@x.com"]!, "r");
+    const alice = await join(url, token["alice@x.com"]!, "room-1");
     try {
       const env = makeEnvelope({ messageId: "strTo", deliveryMode: "online_only" });
       (env as { to?: unknown }).to = "bob@x.com"; // a string, not an array
-      alice.send({ type: "publish", topic: "r", envelope: env });
+      alice.send({ type: "publish", topic: "room-1", envelope: env });
       expect(await alice.next()).toMatchObject({ type: "error" });
     } finally {
       alice.close();
@@ -224,23 +224,23 @@ describe("Broker routing (§3.2): DM / broadcast / hop / offline replay", () => 
 
   test("a DM sent while connected-but-not-subscribed is drained on subscribe (no gap loss)", async () => {
     const { broker, store, token, url } = await start();
-    const alice = await join(url, token["alice@x.com"]!, "r");
+    const alice = await join(url, token["alice@x.com"]!, "room-1");
     const bob = await WsClient.connect(url);
     bob.send({ type: "hello", token: token["bob@x.com"]! });
     await bob.next(); // welcome (drain empty — bob not subscribed yet)
     try {
       alice.send({
         type: "publish",
-        topic: "r",
+        topic: "room-1",
         envelope: makeEnvelope({
-          roomId: "r",
+          roomId: "room-1",
           messageId: "gap1",
           to: ["bob@x.com"],
           deliveryMode: "store_if_offline",
         }),
       });
       await sleep(40);
-      bob.send({ type: "subscribe", topic: "r" }); // now reachable → drains the gap-window DM
+      bob.send({ type: "subscribe", topic: "room-1" }); // now reachable → drains the gap-window DM
       expect(await bob.next()).toMatchObject({ type: "subscribed" });
       expect(await bob.next()).toMatchObject({ type: "event", envelope: { messageId: "gap1" } });
     } finally {
@@ -253,16 +253,16 @@ describe("Broker routing (§3.2): DM / broadcast / hop / offline replay", () => 
 
   test("rejects an envelope missing idempotencyKey (offline-replay load-bearing field)", async () => {
     const { broker, store, token, url } = await start();
-    const alice = await join(url, token["alice@x.com"]!, "r");
+    const alice = await join(url, token["alice@x.com"]!, "room-1");
     try {
       const env = makeEnvelope({
-        roomId: "r",
+        roomId: "room-1",
         messageId: "noKey",
         to: ["bob@x.com"],
         deliveryMode: "store_if_offline",
       });
       delete (env as { idempotencyKey?: unknown }).idempotencyKey;
-      alice.send({ type: "publish", topic: "r", envelope: env });
+      alice.send({ type: "publish", topic: "room-1", envelope: env });
       expect(await alice.next()).toMatchObject({ type: "error" });
     } finally {
       alice.close();
@@ -273,13 +273,13 @@ describe("Broker routing (§3.2): DM / broadcast / hop / offline replay", () => 
 
   test("an empty `to: []` delivers to nobody (never degrades to a broadcast)", async () => {
     const { broker, store, token, url } = await start();
-    const bob = await join(url, token["bob@x.com"]!, "r");
-    const alice = await join(url, token["alice@x.com"]!, "r");
+    const bob = await join(url, token["bob@x.com"]!, "room-1");
+    const alice = await join(url, token["alice@x.com"]!, "room-1");
     try {
       alice.send({
         type: "publish",
-        topic: "r",
-        envelope: makeEnvelope({ roomId: "r", messageId: "emptyTo", to: [], deliveryMode: "online_only" }),
+        topic: "room-1",
+        envelope: makeEnvelope({ roomId: "room-1", messageId: "emptyTo", to: [], deliveryMode: "online_only" }),
       });
       await sleep(40);
       expect(bob.drainNow()).toEqual([]); // an empty DM target list reaches nobody
@@ -298,8 +298,8 @@ describe("Broker routing (§3.2): DM / broadcast / hop / offline replay", () => 
     await svc.registerIdentity("bob@x.com", "Bob");
     const tokA = await svc.issueToken("alice@x.com");
     const tokB = await svc.issueToken("bob@x.com");
-    await store.addMember("r", "alice@x.com"); // room authz (§11.2)
-    await store.addMember("r", "bob@x.com");
+    await store.addMember("room-1", "alice@x.com"); // room authz (§11.2)
+    await store.addMember("room-1", "bob@x.com");
     const broker = new Broker({
       store,
       identityProvider: new StorePskIdentityProvider(store),
@@ -309,13 +309,13 @@ describe("Broker routing (§3.2): DM / broadcast / hop / offline replay", () => 
     });
     const { port } = broker.start();
     const url = `ws://127.0.0.1:${port}/ws`;
-    const alice = await join(url, tokA, "r");
+    const alice = await join(url, tokA, "room-1");
     try {
       alice.send({
         type: "publish",
-        topic: "r",
+        topic: "room-1",
         envelope: makeEnvelope({
-          roomId: "r",
+          roomId: "room-1",
           messageId: "sql1",
           idempotencyKey: "sk1",
           to: ["bob@x.com"],
@@ -340,7 +340,7 @@ describe("Broker routing (§3.2): DM / broadcast / hop / offline replay", () => 
     const svc = new IdentityService(store);
     await svc.registerIdentity("alice@x.com", "Alice");
     const token = await svc.issueToken("alice@x.com");
-    await store.addMember("r", "alice@x.com"); // room authz (§11.2) — set before drainPending is broken
+    await store.addMember("room-1", "alice@x.com"); // room authz (§11.2) — set before drainPending is broken
     (store as { drainPending: unknown }).drainPending = async () => {
       throw new Error("boom");
     };
@@ -356,7 +356,7 @@ describe("Broker routing (§3.2): DM / broadcast / hop / offline replay", () => 
     try {
       c.send({ type: "hello", token });
       expect(await c.next()).toMatchObject({ type: "welcome" }); // welcomed despite drain error
-      c.send({ type: "subscribe", topic: "r" });
+      c.send({ type: "subscribe", topic: "room-1" });
       expect(await c.next()).toMatchObject({ type: "subscribed" }); // still usable, not closed
     } finally {
       c.close();

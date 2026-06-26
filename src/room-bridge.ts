@@ -56,7 +56,19 @@ export const ROOM_SECURITY_PREAMBLE =
 
 /** Authoritative attribution = the broker-stamped from.agentId (NOT a spoofable displayName). */
 function senderId(env: Envelope): string {
-  return env.from?.agentId || "未知成员";
+  return safeField(env.from?.agentId) || "未知成员";
+}
+
+/**
+ * Neutralise attacker-controlled free text before embedding it in a one-line
+ * notice. Strips newlines/tabs (so a member can't inject a SEPARATE fake line)
+ * and the structural chars `📨「」` (so they can't forge the untrusted-marker
+ * prefix or break out of the data delimiters and fake a notice from another id).
+ */
+function safeField(s: unknown): string {
+  return String(s ?? "")
+    .replace(/[\r\n\t]+/g, " ")
+    .replace(/[📨「」]/g, "·");
 }
 
 /**
@@ -82,7 +94,7 @@ export function renderWhiteboard(wb: unknown): string | null {
   const names = (items: Array<Record<string, unknown>>, key: string): string =>
     items
       .slice(-3)
-      .map((it) => (typeof it[key] === "string" ? (it[key] as string) : "?"))
+      .map((it) => (typeof it[key] === "string" ? safeField(it[key]) : "?")) // attacker-influenced → neutralise
       .join(key === "summary" ? " / " : ", ");
   const parts = [`${UNTRUSTED} 📋 房间白板`];
   if (contracts.length) parts.push(`已就绪契约 ${contracts.length}（${names(contracts, "contract")}）`);
@@ -107,15 +119,17 @@ export function renderRoomEvent(env: Envelope): string | null {
         commit?: string;
         unblocks?: string[];
       };
-      const where = [p.repo, p.branch].filter(Boolean).join("@");
-      const loc = [where, p.commit].filter(Boolean).join(" ");
-      const unblocks = p.unblocks && p.unblocks.length > 0 ? ` · 解锁: ${p.unblocks.join(", ")}` : "";
-      // The summary is attacker-influenced free text → delimit it as data with 「」.
-      return `${UNTRUSTED} ${from} · 🏁 完成任务：「${p.summary ?? "(无摘要)"}」${loc ? ` (${loc})` : ""}${unblocks}`;
+      // Every field below is attacker-influenced free text → safeField() each
+      // (strips newlines + neutralises the marker/delimiter chars).
+      const where = [p.repo, p.branch].filter(Boolean).map(safeField).join("@");
+      const loc = [where, p.commit ? safeField(p.commit) : ""].filter(Boolean).join(" ");
+      const unblocks =
+        p.unblocks && p.unblocks.length > 0 ? ` · 解锁: ${p.unblocks.map(safeField).join(", ")}` : "";
+      return `${UNTRUSTED} ${from} · 🏁 完成任务：「${safeField(p.summary ?? "(无摘要)")}」${loc ? ` (${loc})` : ""}${unblocks}`;
     }
     case "member_joined": {
       const host = (env.payload as { host?: unknown } | undefined)?.host;
-      return `${UNTRUSTED} ${from} · 👋 加入房间${typeof host === "string" && host ? `（${host}）` : ""}`;
+      return `${UNTRUSTED} ${from} · 👋 加入房间${typeof host === "string" && host ? `（${safeField(host)}）` : ""}`;
     }
     case "member_left":
       return `${UNTRUSTED} ${from} · 👋 离开房间`;

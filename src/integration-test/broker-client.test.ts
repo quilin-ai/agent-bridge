@@ -62,7 +62,7 @@ describe("BrokerClient ↔ real Broker", () => {
       b.onEvent((_topic, env) => got.push(env.messageId));
       b.subscribe("room-x");
       await sleep(60);
-      a.publish("room-x", makeEnvelope({ messageId: "x1" }));
+      a.publish("room-x", makeEnvelope({ messageId: "x1", roomId: "room-x" }));
       await sleep(60);
       expect(got).toEqual(["x1"]);
     } finally {

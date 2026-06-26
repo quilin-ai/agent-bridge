@@ -15,13 +15,17 @@ export function sanitizePresence(raw: unknown): PresenceMeta | undefined {
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return undefined;
   const r = raw as Record<string, unknown>;
   const out: PresenceMeta = {};
-  if (typeof r.agentType === "string") out.agentType = r.agentType;
-  if (typeof r.host === "string") out.host = r.host;
+  // Strip CR/LF/TAB at the source: a member who is later rendered into another
+  // agent's context must not be able to inject a SEPARATE forged line via a
+  // newline in host/capabilities (the render boundary neutralises it too).
+  const oneLine = (s: string) => s.replace(/[\r\n\t]+/g, " ");
+  if (typeof r.agentType === "string") out.agentType = oneLine(r.agentType);
+  if (typeof r.host === "string") out.host = oneLine(r.host);
   if (Array.isArray(r.capabilities)) {
-    const caps = r.capabilities.filter((c): c is string => typeof c === "string");
+    const caps = r.capabilities.filter((c): c is string => typeof c === "string").map(oneLine);
     if (caps.length > 0) out.capabilities = caps;
   }
-  if (typeof r.budgetHint === "string") out.budgetHint = r.budgetHint;
+  if (typeof r.budgetHint === "string") out.budgetHint = oneLine(r.budgetHint);
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
@@ -313,6 +317,16 @@ export class Broker {
         }
         if (typeof env.roomId !== "string" || env.roomId === "") {
           this.send(ws, { type: "error", reason: "envelope.roomId must be a non-empty string" });
+          return;
+        }
+        // The delivery channel (msg.topic) and the envelope's room MUST be the same:
+        // authz + fan-out + offline-storage key on msg.topic, while the ledger +
+        // whiteboard key on env.roomId. A mismatch would let a member of `topic`
+        // write into ANOTHER room's memory (a member of room A poisoning room B's
+        // whiteboard/ledger). The legit publish path always sets them equal.
+        if (env.roomId !== msg.topic) {
+          this.send(ws, { type: "error", reason: "envelope.roomId must equal the publish topic" });
+          this.log(`DENY publish ${me} → topic=${msg.topic} roomId=${env.roomId} (topic/roomId mismatch)`);
           return;
         }
         // Room authz (§11.2): only a member may publish into the room — a
