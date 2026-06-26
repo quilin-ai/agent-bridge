@@ -1,0 +1,35 @@
+# 混沌测试编排：broker(常开、可被 kill/pause) + provision + pub/sub(按需 run)。
+# 由 docker/chaos/run-*.sh 驱动。
+services:
+  provision:
+    build: { context: ../.., dockerfile: docker/Dockerfile }
+    volumes: [chaos:/data]
+    command: ["bun", "docker/chaos/provision.ts"]
+    environment: { COLLAB_DB: /data/collab.db, TOKEN_DIR: /data, ROOM: chaos-room }
+
+  broker:
+    build: { context: ../.., dockerfile: docker/Dockerfile }
+    volumes: [chaos:/data]
+    depends_on:
+      provision: { condition: service_completed_successfully }
+    command: ["bun", "docker/broker-entry.ts"]
+    environment: { BROKER_HOST: 0.0.0.0, BROKER_PORT: "4700", COLLAB_DB: /data/collab.db }
+    ports: ["4700:4700"]
+
+  # 按需 run（profiles=tools ⇒ `up` 不自动起；由脚本 `compose run` 调起并传 env）
+  pub:
+    build: { context: ../.., dockerfile: docker/Dockerfile }
+    volumes: [chaos:/data]
+    command: ["bun", "docker/chaos/pub.ts"]
+    environment: { BROKER_URL: ws://broker:4700/ws, ROOM: chaos-room, TOKEN_FILE: /data/token-pub }
+    profiles: [tools]
+
+  sub:
+    build: { context: ../.., dockerfile: docker/Dockerfile }
+    volumes: [chaos:/data]
+    command: ["bun", "docker/chaos/sub.ts"]
+    environment: { BROKER_URL: ws://broker:4700/ws, ROOM: chaos-room, TOKEN_FILE: /data/token-sub }
+    profiles: [tools]
+
+volumes:
+  chaos:

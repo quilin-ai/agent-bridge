@@ -9,19 +9,42 @@ import { mergeWhiteboard } from "./whiteboard";
 
 export const DEFAULT_BROKER_PORT = 4700; // outside the multi-pair 4500/4501/4502+stride range
 const CLOSE_AUTH_FAILED = 4401;
+// Bound the hot-path membership cache (§11.2) so it can't grow unboundedly with
+// distinct topic/identity pairs over a long-lived process. FIFO-ish eviction of
+// the oldest key once full (same pattern as the room-bridge SEEN_CAP).
+const MEMBER_CACHE_CAP = 2000;
+// Bound attacker-controlled presence fields at the SOURCE: a member's hello blob is
+// broadcast to the whole room in member_joined, so cap each string field's length and
+// the capabilities count — one member must not be able to fan out a multi-MB field or
+// a huge list. (room-bridge's render-side FIELD_CAP only caps the final injection, not
+// the broker's fan-out bandwidth, so the cap is needed here too.)
+const PRESENCE_FIELD_CAP = 200;
+const PRESENCE_CAPS_CAP = 20;
 
 /** Validate the optional reserved presence blob from hello — best-effort, drop anything malformed. Exported for boundary tests. */
 export function sanitizePresence(raw: unknown): PresenceMeta | undefined {
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return undefined;
   const r = raw as Record<string, unknown>;
   const out: PresenceMeta = {};
-  if (typeof r.agentType === "string") out.agentType = r.agentType;
-  if (typeof r.host === "string") out.host = r.host;
+  // Strip ALL line/paragraph separators + control + format chars at the source
+  // (not just \r\n\t — also U+2028/U+2029/U+000B/U+000C/U+0085, AND \p{Cf}:
+  // zero-width U+200B/ZWJ/BOM + bidi U+202E/U+200F): a member rendered into
+  // another agent's context must not inject a SEPARATE forged line NOR smuggle
+  // invisible code points into a marker via host/capabilities (the render
+  // boundary neutralises it too).
+  const oneLine = (s: string) => {
+    const cleaned = s.replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]+/gu, " ");
+    // Hard length cap (DoS): a presence field is broadcast to every room member.
+    return cleaned.length <= PRESENCE_FIELD_CAP ? cleaned : Array.from(cleaned).slice(0, PRESENCE_FIELD_CAP).join("");
+  };
+  if (typeof r.agentType === "string") out.agentType = oneLine(r.agentType);
+  if (typeof r.host === "string") out.host = oneLine(r.host);
   if (Array.isArray(r.capabilities)) {
-    const caps = r.capabilities.filter((c): c is string => typeof c === "string");
+    // Cap the COUNT too — a 10k-entry list is the same fan-out DoS as one huge field.
+    const caps = r.capabilities.filter((c): c is string => typeof c === "string").slice(0, PRESENCE_CAPS_CAP).map(oneLine);
     if (caps.length > 0) out.capabilities = caps;
   }
-  if (typeof r.budgetHint === "string") out.budgetHint = r.budgetHint;
+  if (typeof r.budgetHint === "string") out.budgetHint = oneLine(r.budgetHint);
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
@@ -48,6 +71,8 @@ export interface BrokerOptions {
   /** Bind port. Default {@link DEFAULT_BROKER_PORT}; 0 picks a random free port. */
   port?: number;
   transport?: MessageTransport;
+  /** TTL for the hot-path membership cache (§11.2 revocation latency). Default 3000ms; tests set it small. */
+  memberCacheTtlMs?: number;
   log?: (msg: string) => void;
 }
 
@@ -79,6 +104,8 @@ export class Broker {
   private startedAt = 0;
   /** topic → (identityId → live-subscription count) — who is reachable per topic. */
   private readonly topicMembers = new Map<string, Map<string, number>>();
+  /** Short-TTL membership cache (§11.2 revocation): bounds re-validation cost on the hot delivery path. */
+  private readonly memberCache = new Map<string, { ok: boolean; exp: number }>();
   private readonly transport: MessageTransport;
   private readonly log: (msg: string) => void;
 
@@ -235,8 +262,40 @@ export class Broker {
           this.send(ws, { type: "subscribed", topic }); // re-ack so a re-subscribe never hangs
           return;
         }
+        // Room authz (§11.2): closed-by-default — only members may subscribe.
+        if (!(await this.isMember(topic, me))) {
+          this.send(ws, { type: "error", reason: "not a room member" });
+          this.log(`DENY subscribe ${me} → ${topic} (not a member)`);
+          return;
+        }
         const unsub = this.transport.subscribe(topic, (envelope) => {
-          if (this.shouldDeliver(me, envelope)) this.send(ws, { type: "event", topic, envelope });
+          // Re-validate membership on delivery (§11.2 revocation): an `abg room
+          // remove` only updates the Store, so without this a removed member's
+          // still-open subscription would keep receiving events until its socket
+          // drops. On revocation, evict the subscription (stop the eavesdropping).
+          void (async () => {
+            try {
+              // Three-state revocation check (§11.2): a CONFIRMED non-member
+              // (false) is evicted; a Store read error THROWS and is handled
+              // below — it must NOT be conflated with non-membership.
+              if (!(await this.isMemberCached(topic, me))) {
+                const u = ws.data.subs.get(topic);
+                if (u) {
+                  u();
+                  ws.data.subs.delete(topic);
+                  this.removeTopicMember(topic, me);
+                  this.log(`EVICT ${me} from ${topic} (membership revoked)`);
+                }
+                return;
+              }
+              if (this.shouldDeliver(me, envelope)) this.send(ws, { type: "event", topic, envelope });
+            } catch (e) {
+              // Membership UNREADABLE (Store error), not a confirmed revocation:
+              // skip THIS delivery but keep the subscription — never tear down a
+              // legitimate member's live subscription on a transient read error.
+              this.log(`delivery check skipped, subscription kept (#${ws.data.connId}): ${String(e)}`);
+            }
+          })();
         });
         ws.data.subs.set(topic, unsub);
         const becamePresent = this.addTopicMember(topic, me);
@@ -307,6 +366,24 @@ export class Broker {
         }
         if (typeof env.roomId !== "string" || env.roomId === "") {
           this.send(ws, { type: "error", reason: "envelope.roomId must be a non-empty string" });
+          return;
+        }
+        // The delivery channel (msg.topic) and the envelope's room MUST be the same:
+        // authz + fan-out + offline-storage key on msg.topic, while the ledger +
+        // whiteboard key on env.roomId. A mismatch would let a member of `topic`
+        // write into ANOTHER room's memory (a member of room A poisoning room B's
+        // whiteboard/ledger). The legit publish path always sets them equal.
+        if (env.roomId !== msg.topic) {
+          this.send(ws, { type: "error", reason: "envelope.roomId must equal the publish topic" });
+          this.log(`DENY publish ${me} → topic=${msg.topic} roomId=${env.roomId} (topic/roomId mismatch)`);
+          return;
+        }
+        // Room authz (§11.2): only a member may publish into the room — a
+        // non-member can't inject events (incl. prompt-injection text) into rooms
+        // it isn't in. Gate on the delivery channel (msg.topic).
+        if (!(await this.isMember(msg.topic, me))) {
+          this.send(ws, { type: "error", reason: "not a room member" });
+          this.log(`DENY publish ${me} → ${msg.topic} (not a member)`);
           return;
         }
         // Anti-spoof + reliable loop prevention: stamp the authenticated sender
@@ -401,6 +478,57 @@ export class Broker {
   }
 
   /**
+   * Room authorization (§11.2): only a PERSISTED room member may subscribe to or
+   * publish into a room. Closed-by-default — a non-member (incl. an authenticated
+   * identity that simply isn't in this room) is denied, so PSK auth alone can't
+   * reach arbitrary rooms. FAIL-CLOSED: a Store error denies access, never grants.
+   */
+  private async isMember(topic: string, id: string): Promise<boolean> {
+    try {
+      return (await this.opts.store.getMembers(topic)).includes(id);
+    } catch (e) {
+      this.log(`membership check failed for ${id}@${topic} (deny): ${String(e)}`);
+      return false;
+    }
+  }
+
+  /**
+   * Cached membership check for the hot delivery path (§11.2 revocation). Bounds
+   * how long a REMOVED member's still-open subscription keeps receiving events to
+   * the TTL, without a Store hit per delivered event. `subscribe` itself uses the
+   * uncached {@link isMember} so admission is always authoritative.
+   *
+   * UNLIKE {@link isMember}, a Store error here PROPAGATES (is NOT fail-closed to
+   * false): the delivery path must distinguish `false` (confirmed non-member →
+   * evict the subscription) from "couldn't read" (transient → skip THIS delivery,
+   * keep the subscription). Fail-closing to false would silently EVICT a
+   * legitimate member's live subscription on a one-off read error. Admission stays
+   * fail-closed via {@link isMember}; only delivery-time revocation is relaxed.
+   */
+  private async isMemberCached(topic: string, id: string): Promise<boolean> {
+    const ttlMs = this.opts.memberCacheTtlMs ?? 3000;
+    // `|` delimiter (NOT a literal NUL): slugified topics are `\p{L}\p{N}-` only, so
+    // they can't contain `|` → `${topic}|${id}` is collision-free, while keeping
+    // broker.ts greppable / tree-sitter-parseable (a NUL byte marks the file binary).
+    const key = `${topic}|${id}`;
+    const now = Date.now();
+    const c = this.memberCache.get(key);
+    if (c && c.exp > now) return c.ok;
+    // NOT this.isMember (which fail-closes): let a Store error throw so the caller
+    // can tell "non-member" from "unreadable" (see the doc-comment above).
+    const ok = (await this.opts.store.getMembers(topic)).includes(id);
+    // Bound the cache (§11.2): evict the oldest entry once at capacity. Only when
+    // inserting a NEW key — refreshing an existing key is an in-place update that
+    // doesn't grow the map, so it must not evict an unrelated valid entry.
+    if (!this.memberCache.has(key) && this.memberCache.size >= MEMBER_CACHE_CAP) {
+      const oldest = this.memberCache.keys().next().value;
+      if (oldest !== undefined) this.memberCache.delete(oldest);
+    }
+    this.memberCache.set(key, { ok, exp: now + ttlMs });
+    return ok;
+  }
+
+  /**
    * Distil an event into the room whiteboard (§4.2), zero-LLM. mergeWhiteboard
    * returns the SAME reference when the kind doesn't touch the board, so an
    * unmergeable event (a DM, etc.) skips the Store write entirely.
@@ -413,7 +541,13 @@ export class Broker {
 
   /** Persist a store_if_offline envelope for intended recipients with no live subscription (§3.2). */
   private async storeForOfflineRecipients(topic: string, env: Envelope, from?: string): Promise<void> {
-    const intended = Array.isArray(env.to) ? env.to : await this.opts.store.getMembers(topic);
+    // Always confine to room members (§11.2): a DM's `env.to` is attacker-supplied,
+    // so a member must NOT be able to queue an offline DM for an identity that
+    // isn't in this room (cross-room injection on the recipient's reconnect). Live
+    // delivery is already member-gated (non-members can't subscribe); this closes
+    // the offline path symmetrically.
+    const members = await this.opts.store.getMembers(topic);
+    const intended = Array.isArray(env.to) ? env.to.filter((id) => members.includes(id)) : members;
     for (const id of intended) {
       if (id === from) continue; // never store for the sender
       if (!this.isReachable(topic, id)) {
@@ -426,6 +560,14 @@ export class Broker {
   private async drainPendingTo(ws: ServerWebSocket<BrokerSocketData>, id: string): Promise<void> {
     const pending = await this.opts.store.drainPending(id);
     for (const env of pending) {
+      // §11.2 (revocation symmetry): the live-delivery path re-checks membership,
+      // so the offline-replay path must too — otherwise a member removed between
+      // enqueue and reconnect would still get the room's queued events drained to
+      // it. Authoritative (uncached) check; drain frequency is low. isMember
+      // fail-closes on a Store error → skip this one item (never leak a room
+      // event to a removed member; a re-drain on a later reconnect can't recover
+      // it, but under-delivering is the safe side of this trade).
+      if (!(await this.isMember(env.roomId, id))) continue;
       this.send(ws, { type: "event", topic: env.roomId, envelope: env });
     }
   }

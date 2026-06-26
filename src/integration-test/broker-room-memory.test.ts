@@ -43,6 +43,8 @@ async function startBroker(store: Store = new InMemoryStore()) {
   await svc.registerIdentity("bob@x.com", "Bob");
   const tokenA = await svc.issueToken("alice@x.com");
   const tokenB = await svc.issueToken("bob@x.com");
+  await store.addMember(ROOM, "alice@x.com"); // room authz (§11.2)
+  await store.addMember(ROOM, "bob@x.com");
   const broker = new Broker({ store, identityProvider: new StorePskIdentityProvider(store), host: "127.0.0.1", port: 0, log: () => {} });
   const { port } = broker.start();
   return { broker, store, tokenA, tokenB, url: `ws://127.0.0.1:${port}/ws` };

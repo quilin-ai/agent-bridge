@@ -15,6 +15,11 @@ async function startBroker() {
   await svc.registerIdentity("bob@x.com", "Bob");
   const token = await svc.issueToken("alice@x.com");
   const tokenB = await svc.issueToken("bob@x.com");
+  // Room authz (§11.2): both identities are members of every topic these tests use.
+  for (const t of ["room-1", "room-x"]) {
+    await store.addMember(t, "alice@x.com");
+    await store.addMember(t, "bob@x.com");
+  }
   const broker = new Broker({
     store,
     identityProvider: new StorePskIdentityProvider(store),
@@ -57,7 +62,7 @@ describe("BrokerClient ↔ real Broker", () => {
       b.onEvent((_topic, env) => got.push(env.messageId));
       b.subscribe("room-x");
       await sleep(60);
-      a.publish("room-x", makeEnvelope({ messageId: "x1" }));
+      a.publish("room-x", makeEnvelope({ messageId: "x1", roomId: "room-x" }));
       await sleep(60);
       expect(got).toEqual(["x1"]);
     } finally {
