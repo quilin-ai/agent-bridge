@@ -38,6 +38,20 @@ interface DaemonClientEvents {
   turnStarted: [{ requestId: string; idempotencyKey?: string; threadId: string; turnId: string }];
 }
 
+/** Result of a claude_to_room round trip (foreground view). */
+export interface RoomSayReply {
+  success: boolean;
+  error?: string;
+}
+
+/** Result of a request_room_members round trip (foreground view); null on a transport failure. */
+export interface RoomMembersReply {
+  members: string[] | null;
+  ownerId: string | null;
+  self: string | null;
+  error?: string;
+}
+
 let nextSocketId = 0;
 
 export interface DaemonClientOptions {
@@ -73,6 +87,16 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
   // none reject. Timers are ref'd (registry default), matching the prior raw
   // setTimeout in both waiters.
   private pendingEventWaiters = new PendingRequestRegistry<unknown>();
+  // Room round-trips (claude_to_room / request_room_members). Keyed by the UNIQUE
+  // requestId — NOT the message type — because room_say / room_members are the first
+  // MODEL-invokable round-trips and Claude can dispatch several in ONE turn (concurrent
+  // tools/call). The type-keyed pendingEventWaiters above is only safe for the
+  // single-flight attach/probe/budget callers; routing room calls through it would let a
+  // second call overwrite the first's waiter (orphaning it, cross-settling the reply). So
+  // these mirror pendingReplies: a per-requestId entry, settled by the matching result /
+  // a timeout / a disconnect.
+  private pendingRoomSays = new PendingRequestRegistry<RoomSayReply>();
+  private pendingRoomMembers = new PendingRequestRegistry<RoomMembersReply | null>();
 
   constructor(private readonly url: string, private readonly options: DaemonClientOptions = {}) {
     super();
@@ -215,6 +239,48 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
       timeoutMs,
       send: () => this.send({ type: "request_budget_refresh", requestId }),
     });
+  }
+
+  /**
+   * Agent → room (§5): forward a chat message (optionally @-mentioning members) to the daemon's
+   * room bridge. Fail-CLOSED on a transport problem: a closed socket / timeout resolves
+   * `{ success:false, error }` so the tool reports the failure instead of claiming it sent.
+   * `requestId` correlates the reply so a straggler can't settle a later waiter.
+   */
+  async sendRoomMessage(text: string, mentions?: string[], timeoutMs = 5000): Promise<RoomSayReply> {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      return { success: false, error: "AgentBridge daemon is not connected." };
+    }
+    const requestId = `room_${Date.now()}_${this.nextRequestId++}`;
+    const pending = this.pendingRoomSays.register(requestId, {
+      timeoutMs,
+      onTimeout: ({ resolve }) => resolve({ success: false, error: "Timed out waiting for AgentBridge daemon reply." }),
+    });
+    this.send({
+      type: "claude_to_room",
+      requestId,
+      text,
+      ...(mentions && mentions.length > 0 ? { mentions } : {}),
+    });
+    return pending;
+  }
+
+  /**
+   * Agent → room roster (§5): ask the daemon for the room's member list + owner. Fail-OPEN to
+   * null on a closed socket / timeout so the tool degrades to "unavailable" instead of hanging.
+   * `requestId` correlates the reply (straggler-safe on the long-lived socket).
+   */
+  async requestRoomMembers(timeoutMs = 5000): Promise<RoomMembersReply | null> {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      return null;
+    }
+    const requestId = `roomm_${Date.now()}_${this.nextRequestId++}`;
+    const pending = this.pendingRoomMembers.register(requestId, {
+      timeoutMs,
+      onTimeout: ({ resolve }) => resolve(null),
+    });
+    this.send({ type: "request_room_members", requestId });
+    return pending;
   }
 
   /**
@@ -403,6 +469,22 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
         case "budget_refresh":
           this.emit("budgetRefresh", { requestId: message.requestId, snapshot: message.snapshot });
           return;
+        case "claude_to_room_result":
+          // settle() is a no-op for an unknown / already-settled requestId (a straggler
+          // after timeout). Keyed by requestId ⇒ concurrent room_say calls never cross.
+          this.pendingRoomSays.settle(message.requestId, {
+            success: message.success,
+            ...(message.error !== undefined ? { error: message.error } : {}),
+          });
+          return;
+        case "room_members_result":
+          this.pendingRoomMembers.settle(message.requestId, {
+            members: message.members,
+            ownerId: message.ownerId,
+            self: message.self,
+            ...(message.error !== undefined ? { error: message.error } : {}),
+          });
+          return;
       }
     };
 
@@ -440,6 +522,10 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
     // factory form so each settled promise gets its OWN result object, exactly
     // as the old per-entry literal did (no shared reference across callers).
     this.pendingReplies.settleAll(() => ({ success: false, error }));
+    // Room round-trips resolve to their fail value on a drop (never reject): room_say
+    // reports the failure, room_members degrades to "unavailable" (null).
+    this.pendingRoomSays.settleAll(() => ({ success: false, error }));
+    this.pendingRoomMembers.settleAll(() => null);
   }
 
   private send(message: ControlClientMessage) {

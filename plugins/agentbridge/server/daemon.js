@@ -6,7 +6,7 @@ var __require = import.meta.require;
 import { existsSync as existsSync8, realpathSync as realpathSync3, rmSync as rmSync2 } from "fs";
 import { homedir as homedir5 } from "os";
 import { join as join12 } from "path";
-import { randomUUID as randomUUID4 } from "crypto";
+import { randomUUID as randomUUID5 } from "crypto";
 
 // src/contract-version.ts
 var CONTRACT_VERSION = 1;
@@ -30,10 +30,10 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.24", "0.0.0-source"),
-  commit: defineString("9680ce9", "source"),
+  commit: defineString("14d0305", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION),
-  codeHash: defineString("57a2f6a3851c", "source")
+  codeHash: defineString("06f071428284", "source")
 });
 function daemonStatusBuildInfo() {
   return { ...BUILD_INFO };
@@ -6810,11 +6810,15 @@ class RoomManager {
   }
 }
 
+// src/room-bridge.ts
+import { randomUUID as randomUUID4 } from "crypto";
+
 // src/broker-client.ts
 function reconnectDelay(baseMs, maxMs, attempt, rand) {
   const ceiling = Math.min(maxMs, baseMs * 2 ** attempt);
   return ceiling / 2 + rand * (ceiling / 2);
 }
+var LIST_MEMBERS_TIMEOUT_MS = 4000;
 
 class BrokerClient {
   opts;
@@ -6825,6 +6829,9 @@ class BrokerClient {
   eventHandlers = [];
   whiteboardHandlers = [];
   pendingJoins = new Map;
+  pendingMemberRequests = new Map;
+  reqSeq = 0;
+  errorHandlers = [];
   closed = false;
   authFailed = false;
   reconnectAttempt = 0;
@@ -6904,11 +6911,37 @@ class BrokerClient {
   onWhiteboard(handler) {
     this.whiteboardHandlers.push(handler);
   }
+  listMembers(roomId) {
+    if (!this.connected)
+      return Promise.reject(new Error("not connected"));
+    const requestId = `lm_${++this.reqSeq}`;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        if (this.pendingMemberRequests.delete(requestId))
+          reject(new Error("list_members timed out"));
+      }, LIST_MEMBERS_TIMEOUT_MS);
+      this.pendingMemberRequests.set(requestId, {
+        resolve: (r) => {
+          clearTimeout(timer);
+          resolve(r);
+        },
+        reject: (e) => {
+          clearTimeout(timer);
+          reject(e);
+        }
+      });
+      this.sendRaw({ type: "list_members", roomId, requestId });
+    });
+  }
+  onError(handler) {
+    this.errorHandlers.push(handler);
+  }
   close() {
     this.closed = true;
     this.clearReconnectTimer();
     this.teardownSocket();
     this.failPendingJoins("client closed");
+    this.failPendingMemberRequests("client closed");
     if (this.rejectConnect) {
       const reject = this.rejectConnect;
       this.resolveConnect = null;
@@ -6982,6 +7015,30 @@ class BrokerClient {
           this.pendingJoins.delete(msg.topic);
           p.reject(new Error(typeof msg.reason === "string" ? msg.reason : "join failed"));
         }
+      } else if (msg.type === "members") {
+        const p = this.pendingMemberRequests.get(msg.requestId);
+        if (p) {
+          this.pendingMemberRequests.delete(msg.requestId);
+          p.resolve({
+            members: Array.isArray(msg.members) ? msg.members : [],
+            ownerId: typeof msg.ownerId === "string" ? msg.ownerId : ""
+          });
+        }
+      } else if (msg.type === "members_error") {
+        const p = this.pendingMemberRequests.get(msg.requestId);
+        if (p) {
+          this.pendingMemberRequests.delete(msg.requestId);
+          p.reject(new Error(typeof msg.reason === "string" ? msg.reason : "list_members failed"));
+        }
+      } else if (msg.type === "error") {
+        const reason = typeof msg.reason === "string" ? msg.reason : "broker error";
+        for (const h of this.errorHandlers) {
+          try {
+            h(reason);
+          } catch (e) {
+            this.log(`error handler threw: ${String(e)}`);
+          }
+        }
       }
     };
     ws.onclose = () => {
@@ -6990,6 +7047,7 @@ class BrokerClient {
       this.ws = null;
       this.identity = null;
       this.failPendingJoins("connection lost before the join completed");
+      this.failPendingMemberRequests("connection lost before the roster reply");
       if (!this.closed && !this.authFailed)
         this.scheduleReconnect();
     };
@@ -7020,6 +7078,14 @@ class BrokerClient {
       return;
     const pend = [...this.pendingJoins.values()];
     this.pendingJoins.clear();
+    for (const p of pend)
+      p.reject(new Error(reason));
+  }
+  failPendingMemberRequests(reason) {
+    if (this.pendingMemberRequests.size === 0)
+      return;
+    const pend = [...this.pendingMemberRequests.values()];
+    this.pendingMemberRequests.clear();
     for (const p of pend)
       p.reject(new Error(reason));
   }
@@ -7328,7 +7394,9 @@ function resolveDbPath(explicit) {
   const env = process.env.AGENTBRIDGE_COLLAB_DB;
   if (env && env.length > 0)
     return env;
-  return join11(new StateDirResolver().dir, "collab.db");
+  const base = process.env.AGENTBRIDGE_BASE_DIR;
+  const dir = base && base.length > 0 ? base : new StateDirResolver().dir;
+  return join11(dir, "collab.db");
 }
 function resolveBrokerUrl(explicit) {
   if (explicit)
@@ -7354,7 +7422,12 @@ function openStore(dbPath) {
 }
 
 // src/room-bridge.ts
-var INERT = { stop: () => {}, roomId: null };
+var INERT = {
+  stop: () => {},
+  roomId: null,
+  send: () => ({ ok: false, info: "\u672A\u63A5\u5165\u4EFB\u4F55\u623F\u95F4\uFF08\u672A\u767B\u5F55\u6216\u5F53\u524D\u76EE\u5F55\u672A\u6620\u5C04\u5230\u623F\u95F4\uFF09" }),
+  listMembers: async () => null
+};
 var SEEN_CAP = 500;
 var FIELD_CAP = 500;
 var UNBLOCKS_CAP = 10;
@@ -7392,9 +7465,17 @@ function renderWhiteboard(wb) {
     parts2.push(`\u6700\u8FD1\uFF1A${names(milestones, "summary")}`);
   return parts2.join(" \xB7 ");
 }
-function renderRoomEvent(env) {
+function renderRoomEvent(env, selfId) {
   const from = senderId(env);
   switch (env.kind) {
+    case "chat": {
+      const p = env.payload ?? {};
+      const mentions = Array.isArray(env.mentions) ? env.mentions : [];
+      const atAll = mentions.includes("*");
+      const atMe = atAll || selfId !== undefined && selfId !== "" && mentions.includes(selfId);
+      const tag = atMe ? atAll ? " \uD83D\uDCE3@\u6240\u6709\u4EBA" : " \uD83D\uDCE3@\u4F60" : "";
+      return `${UNTRUSTED} ${from} \xB7 \uD83D\uDCAC \u623F\u95F4\u53D1\u8A00${tag}\uFF1A\u300C${safeField(p.text ?? "")}\u300D`;
+    }
     case "task_completed": {
       const p = env.payload ?? {};
       const where = [p.repo, p.branch].filter(Boolean).map(safeField).join("@");
@@ -7455,9 +7536,12 @@ async function startRoomBridge(deps) {
       if (seen.size > SEEN_CAP)
         seen.delete(seen.values().next().value);
     }
-    const text = renderRoomEvent(env);
+    const text = renderRoomEvent(env, client.whoami?.id);
     if (text)
       deps.emit(text);
+  });
+  client.onError((reason) => {
+    deps.emit(`\u26A0\uFE0F \u623F\u95F4\u64CD\u4F5C\u88AB\u62D2\u7EDD\uFF1A${safeField(reason)}`);
   });
   client.onWhiteboard((_roomId, wb) => {
     const text = renderWhiteboard(wb);
@@ -7468,7 +7552,32 @@ async function startRoomBridge(deps) {
   deps.emit(ROOM_SECURITY_PREAMBLE);
   client.connect().catch((e) => log(`room bridge: connect failed \u2014 ${String(e)}`));
   log(`room bridge: subscribed to room ${room}`);
-  return { stop: () => client.close(), roomId: room };
+  const send = (text, mentions) => {
+    const body = String(text ?? "").trim();
+    if (body === "")
+      return { ok: false, info: "\u6D88\u606F\u4E3A\u7A7A\uFF0C\u672A\u53D1\u9001" };
+    const self = client.whoami;
+    const env = {
+      roomId: room,
+      messageId: randomUUID4(),
+      traceId: randomUUID4(),
+      idempotencyKey: randomUUID4(),
+      from: { agentId: self?.id ?? "(me)", agentType: "claude" },
+      kind: "chat",
+      payload: { text: body },
+      timestamp: Date.now(),
+      deliveryMode: "store_if_offline",
+      ...mentions && mentions.length > 0 ? { mentions } : {}
+    };
+    client.publish(room, env);
+    const at = mentions && mentions.length > 0 ? mentions.includes("*") ? "\uFF08@\u6240\u6709\u4EBA\uFF09" : `\uFF08@${mentions.length}\u4EBA\uFF09` : "";
+    return { ok: true, info: `\u5DF2\u53D1\u9001\u5230\u623F\u95F4 ${room}${at}` };
+  };
+  const listMembers = async () => {
+    const roster = await client.listMembers(room);
+    return { members: roster.members, ownerId: roster.ownerId, self: client.whoami?.id ?? "" };
+  };
+  return { stop: () => client.close(), roomId: room, send, listMembers };
 }
 
 // src/daemon.ts
@@ -7500,7 +7609,7 @@ var RESUME_INJECT_MAX_ATTEMPTS = parsePositiveIntEnv("AGENTBRIDGE_RESUME_INJECT_
 var RESUME_ACK_TIMEOUT_MS = parsePositiveIntEnv("AGENTBRIDGE_RESUME_ACK_TIMEOUT_MS", 60000, log);
 var RESUME_ACK_RETRIES = parsePositiveIntEnv("AGENTBRIDGE_RESUME_ACK_RETRIES", 3, log);
 var daemonLifecycle = new DaemonLifecycle({ stateDir, controlPort: CONTROL_PORT, log });
-var DAEMON_NONCE = randomUUID4();
+var DAEMON_NONCE = randomUUID5();
 var DAEMON_STARTED_AT = Date.now();
 var codex = new CodexAdapter(CODEX_APP_PORT, CODEX_PROXY_PORT, stateDir.logFile);
 var attachCmd = `codex --enable tui_app_server --remote ${codex.proxyUrl}`;
@@ -7509,7 +7618,7 @@ var boundControlPort = false;
 var agentRegistry = new AgentRegistry;
 var nextControlClientId = 0;
 var nextSystemMessageId = 0;
-var SYSTEM_MSG_SALT = randomUUID4().slice(0, 8);
+var SYSTEM_MSG_SALT = randomUUID5().slice(0, 8);
 var attentionWindowTimer = null;
 var inAttentionWindow = false;
 var replyTracker = new ReplyRequiredTracker;
@@ -8145,6 +8254,34 @@ function handleControlMessage(ws, raw) {
         log(`handleRequestBudgetRefresh threw for #${ws.data.clientId}: ${err?.message ?? err}`);
       });
       return;
+    case "claude_to_room": {
+      const requestId = message.requestId;
+      handleClaudeToRoom(ws, requestId, message.text, message.mentions).catch((err) => {
+        log(`handleClaudeToRoom threw for #${ws.data.clientId}: ${err?.message ?? err}`);
+        sendProtocolMessage(ws, {
+          type: "claude_to_room_result",
+          requestId,
+          success: false,
+          error: `Internal bridge error: ${err?.message ?? err}`
+        });
+      });
+      return;
+    }
+    case "request_room_members": {
+      const requestId = message.requestId;
+      handleRequestRoomMembers(ws, requestId).catch((err) => {
+        log(`handleRequestRoomMembers threw for #${ws.data.clientId}: ${err?.message ?? err}`);
+        sendProtocolMessage(ws, {
+          type: "room_members_result",
+          requestId,
+          members: null,
+          ownerId: null,
+          self: null,
+          error: `Internal bridge error: ${err?.message ?? err}`
+        });
+      });
+      return;
+    }
     case "claude_to_codex": {
       handleClaudeToCodex(ws, message).catch((err) => {
         log(`handleClaudeToCodex threw for request ${message.requestId}: ${err?.message ?? err}`);
@@ -8508,6 +8645,69 @@ async function handleRequestBudgetRefresh(ws, requestId) {
   const snapshot = budgetCoordinator ? await budgetCoordinator.refreshSnapshotReadonly() : null;
   log(`request_budget_refresh from #${ws.data.clientId}: ${snapshot ? "fresh" : "unavailable"}`);
   sendProtocolMessage(ws, { type: "budget_refresh", requestId, snapshot });
+}
+async function handleClaudeToRoom(ws, requestId, text, mentions) {
+  if (!roomBridge) {
+    sendProtocolMessage(ws, {
+      type: "claude_to_room_result",
+      requestId,
+      success: false,
+      error: "\u672A\u63A5\u5165\u623F\u95F4\uFF08room bridge \u672A\u542F\u52A8\uFF09"
+    });
+    return;
+  }
+  const r = roomBridge.send(text, mentions);
+  log(`claude_to_room from #${ws.data.clientId}: ${r.ok ? "queued" : "rejected"} (${r.info})`);
+  sendProtocolMessage(ws, {
+    type: "claude_to_room_result",
+    requestId,
+    success: r.ok,
+    ...r.ok ? {} : { error: r.info }
+  });
+}
+async function handleRequestRoomMembers(ws, requestId) {
+  if (!roomBridge) {
+    sendProtocolMessage(ws, {
+      type: "room_members_result",
+      requestId,
+      members: null,
+      ownerId: null,
+      self: null,
+      error: "\u672A\u63A5\u5165\u623F\u95F4\uFF08room bridge \u672A\u542F\u52A8\uFF09"
+    });
+    return;
+  }
+  try {
+    const roster = await roomBridge.listMembers();
+    if (!roster) {
+      sendProtocolMessage(ws, {
+        type: "room_members_result",
+        requestId,
+        members: null,
+        ownerId: null,
+        self: null,
+        error: "\u672A\u63A5\u5165\u623F\u95F4\uFF08\u672A\u767B\u5F55\u6216\u5F53\u524D\u76EE\u5F55\u672A\u6620\u5C04\u5230\u623F\u95F4\uFF09"
+      });
+      return;
+    }
+    log(`request_room_members from #${ws.data.clientId}: ${roster.members.length} members`);
+    sendProtocolMessage(ws, {
+      type: "room_members_result",
+      requestId,
+      members: roster.members,
+      ownerId: roster.ownerId,
+      self: roster.self
+    });
+  } catch (e) {
+    sendProtocolMessage(ws, {
+      type: "room_members_result",
+      requestId,
+      members: null,
+      ownerId: null,
+      self: null,
+      error: `\u623F\u95F4\u540D\u5355\u83B7\u53D6\u5931\u8D25\uFF1A${e?.message ?? e}`
+    });
+  }
 }
 function evictStale(session, reason) {
   log(`Evicting stale Claude frontend #${session.clientId}: ${reason}`);

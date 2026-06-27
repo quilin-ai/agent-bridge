@@ -13,12 +13,24 @@ import { StateDirResolver } from "./state-dir";
 
 export const DEFAULT_BROKER_URL = "ws://127.0.0.1:4700/ws";
 
-/** Resolve the collab DB path: explicit > AGENTBRIDGE_COLLAB_DB > `<state>/collab.db`. */
+/**
+ * Resolve the collab DB path: explicit > AGENTBRIDGE_COLLAB_DB > `<base>/collab.db`.
+ *
+ * The collab store (identities / rooms / membership / auth-token) is USER-GLOBAL, NOT per-pair. The
+ * daemon runs with AGENTBRIDGE_STATE_DIR pointing at its PER-PAIR dir (`<base>/pairs/<id>/`), so a plain
+ * StateDirResolver would put collab.db under the pair — but `abg auth login` / `abg join` (run in a plain
+ * shell, with no per-pair override) write it under the BASE dir. The daemon's room-bridge would then read
+ * `pairs/<id>/auth-token`, never find the token, and go inert ("not logged in"). Anchor the collab store
+ * to the BASE dir: the daemon's pair wrapper exports AGENTBRIDGE_BASE_DIR to it; the plain CLI has no
+ * per-pair override, so its StateDirResolver already IS the base.
+ */
 export function resolveDbPath(explicit?: string): string {
   if (explicit) return explicit;
   const env = process.env.AGENTBRIDGE_COLLAB_DB;
   if (env && env.length > 0) return env;
-  return join(new StateDirResolver().dir, "collab.db");
+  const base = process.env.AGENTBRIDGE_BASE_DIR;
+  const dir = base && base.length > 0 ? base : new StateDirResolver().dir;
+  return join(dir, "collab.db");
 }
 
 /** Resolve the broker URL: explicit > AGENTBRIDGE_BROKER_URL > local default. */

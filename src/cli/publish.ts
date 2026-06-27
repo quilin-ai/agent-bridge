@@ -147,8 +147,14 @@ export async function publishCompletion(opts: PublishOptions = {}): Promise<Publ
   const ownStore = !opts.store;
   const store = opts.store ?? openStore(dbPath);
   try {
-    const identityId = await store.resolveToken(token);
-    if (!identityId) return { status: "skipped-no-login" };
+    // On an EDGE machine the token's (token → identity) binding lives in the BROKER's store, not here,
+    // so a LOCAL resolveToken returns null even for a perfectly valid broker-issued token. The broker
+    // authenticates the token on connect and RE-STAMPS from.agentId from the authenticated identity, so a
+    // null local identity must NOT block publishing (that's the §11.1 cross-machine path). Fall back to a
+    // placeholder used only for the local throttle key + the (broker-overwritten) from.agentId. The login
+    // gate stays the auth-token file above: no token ⇒ skipped-no-login; a bad token ⇒ broker rejects ⇒
+    // skipped-offline.
+    const identityId = (await store.resolveToken(token)) ?? "(remote)";
 
     const roomId = await new RoomService(store).resolveRoomForCwd(cwd);
     if (!roomId) return { status: "skipped-no-room" };

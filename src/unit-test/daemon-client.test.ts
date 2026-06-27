@@ -508,4 +508,47 @@ describe("DaemonClient", () => {
     const msg = await received;
     expect(msg).toEqual({ type: "claude_connect", identity });
   });
+
+  // Regression: room_say / room_members are the first MODEL-invokable round-trips and
+  // Claude can dispatch several in ONE turn (concurrent tools/call). They MUST correlate by
+  // the unique requestId — an earlier type-keyed implementation let a second call orphan the
+  // first (hang forever) and cross-settle the reply onto the wrong waiter.
+  test("concurrent room_say calls settle independently by requestId, even on out-of-order replies", async () => {
+    await client.connect();
+    const seen: Array<{ requestId: string; text: string }> = [];
+    onServerMessage = (_ws: any, raw: any) => {
+      const msg = JSON.parse(typeof raw === "string" ? raw : raw.toString());
+      if (msg.type === "claude_to_room") seen.push({ requestId: msg.requestId, text: msg.text });
+    };
+    const pA = client.sendRoomMessage("A");
+    const pB = client.sendRoomMessage("B");
+    while (seen.length < 2) await new Promise((r) => setTimeout(r, 5));
+    const reqA = seen.find((s) => s.text === "A")!;
+    const reqB = seen.find((s) => s.text === "B")!;
+    expect(reqA.requestId).not.toBe(reqB.requestId); // distinct ids despite same message type
+    // Reply OUT OF ORDER (B then A) with distinguishable outcomes.
+    sendToClient({ type: "claude_to_room_result", requestId: reqB.requestId, success: false, error: "B-failed" });
+    sendToClient({ type: "claude_to_room_result", requestId: reqA.requestId, success: true });
+    const [rA, rB] = await Promise.all([pA, pB]);
+    expect(rA).toEqual({ success: true }); // A got A's result (not orphaned, not B's)
+    expect(rB).toEqual({ success: false, error: "B-failed" }); // B got B's result
+  });
+
+  test("concurrent room_members calls settle independently by requestId", async () => {
+    await client.connect();
+    const ids: string[] = [];
+    onServerMessage = (_ws: any, raw: any) => {
+      const msg = JSON.parse(typeof raw === "string" ? raw : raw.toString());
+      if (msg.type === "request_room_members") ids.push(msg.requestId);
+    };
+    const p1 = client.requestRoomMembers();
+    const p2 = client.requestRoomMembers();
+    while (ids.length < 2) await new Promise((r) => setTimeout(r, 5));
+    // Reply to the SECOND request first, with distinguishable rosters.
+    sendToClient({ type: "room_members_result", requestId: ids[1], members: ["two@x"], ownerId: "two@x", self: "two@x" });
+    sendToClient({ type: "room_members_result", requestId: ids[0], members: ["one@x"], ownerId: "one@x", self: "one@x" });
+    const [r1, r2] = await Promise.all([p1, p2]);
+    expect(r1?.members).toEqual(["one@x"]); // request 1 got roster 1
+    expect(r2?.members).toEqual(["two@x"]); // request 2 got roster 2
+  });
 });

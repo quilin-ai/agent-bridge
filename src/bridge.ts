@@ -133,6 +133,17 @@ claude.setReplySender(async (
   return daemonClient.sendReply(msg, requireReply, onBusy, idempotencyKey, wrapUp);
 });
 
+// Agent → room (§5): post chat messages + fetch the roster via the daemon round-trips.
+// sendRoomMessage fails closed when the daemon is disabled (mirrors setReplySender);
+// requestRoomMembers is fail-open (null when the socket is closed → "unavailable").
+claude.setRoomMessageSender(async (text: string, mentions?: string[]) => {
+  if (daemonDisabled) {
+    return { success: false, error: disabledReplyError(daemonDisabledReason ?? "killed") };
+  }
+  return daemonClient.sendRoomMessage(text, mentions);
+});
+claude.setRoomMembersProvider(() => daemonClient.requestRoomMembers());
+
 // PR4: forward Claude's budget-resume ack to the daemon's ResumeAckTracker.
 // DELIBERATELY separate from setReplySender — an ack is a Claude→bridge
 // control-plane signal, NOT a Claude→Codex message. It must never travel

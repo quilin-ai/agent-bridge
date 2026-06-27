@@ -38,9 +38,9 @@ describe("ack_resume MCP tool — registration", () => {
     const result = await listTools(adapter);
     const names = result.tools.map((t: any) => t.name);
 
-    // Snapshot: reply, get_messages, get_budget were the prior three.
-    expect(names).toEqual(["reply", "get_messages", "get_budget", "ack_resume"]);
-    expect(result.tools).toHaveLength(4);
+    // Snapshot: reply, get_messages, get_budget, ack_resume + the room tools (room_members, room_say).
+    expect(names).toEqual(["reply", "get_messages", "get_budget", "ack_resume", "room_members", "room_say"]);
+    expect(result.tools).toHaveLength(6);
   });
 
   test("ack_resume schema requires resume_id and constrains status enum", async () => {
