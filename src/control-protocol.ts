@@ -132,7 +132,21 @@ export type ControlClientMessage =
    * The daemon replies with `budget_refresh` carrying a freshly fetched snapshot
    * (read-only: no directive emission, no coordinator state advance).
    */
-  | { type: "request_budget_refresh"; requestId: string };
+  | { type: "request_budget_refresh"; requestId: string }
+  /**
+   * Agent → room (§5): publish a chat message to the collaboration room. `mentions`
+   * @-highlights specific members; the wildcard `"*"` is @所有人 (broker accepts it ONLY
+   * from the room owner). The daemon forwards it through the room bridge's BrokerClient and
+   * answers with `claude_to_room_result`. Fire-and-forget at the broker level (publish has no
+   * ack); a broker rejection surfaces separately as a room-system notice.
+   */
+  | { type: "claude_to_room"; requestId: string; text: string; mentions?: string[] }
+  /**
+   * Agent → room roster lookup (§5): ask the daemon for the room's member list + owner so the
+   * agent knows who it can @. The daemon round-trips to the broker (members-only) and answers
+   * with `room_members_result`.
+   */
+  | { type: "request_room_members"; requestId: string };
 
 export type ControlServerMessage =
   | { type: "codex_to_claude"; message: BridgeMessage }
@@ -178,7 +192,22 @@ export type ControlServerMessage =
   // attached or the fetch failed). The frontend renders it and refreshes its cache.
   // `requestId` echoes the request so a straggler reply from a timed-out request
   // never settles a LATER waiter on the long-lived control socket.
-  | { type: "budget_refresh"; requestId: string; snapshot: BudgetSnapshot | null };
+  | { type: "budget_refresh"; requestId: string; snapshot: BudgetSnapshot | null }
+  // Reply to `claude_to_room`: whether the room bridge accepted the message for delivery
+  // (queued to the broker). `error` carries a Chinese reason when the bridge is inert
+  // (not logged in / no room) or the message was empty. `requestId` echoes the request.
+  | { type: "claude_to_room_result"; requestId: string; success: boolean; error?: string }
+  // Reply to `request_room_members`: the room roster. `members` is the persistent member id
+  // list (null on an inert bridge / lookup failure), `ownerId` is the room owner (only the
+  // owner may @all), `self` is the caller's own id (to mark "(你)"). `error` set on failure.
+  | {
+      type: "room_members_result";
+      requestId: string;
+      members: string[] | null;
+      ownerId: string | null;
+      self: string | null;
+      error?: string;
+    };
 
 /** WebSocket close code sent by the daemon when a newer Claude session replaces the current one. */
 export const CLOSE_CODE_REPLACED = 4001;

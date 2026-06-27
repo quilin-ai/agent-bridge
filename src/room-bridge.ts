@@ -14,6 +14,7 @@
  * notice), never repo files — code sync is git's job (§2.6).
  */
 
+import { randomUUID } from "node:crypto";
 import { BrokerClient } from "./broker-client";
 import { RoomService } from "./room-service";
 import { openStore, readAuthToken, resolveBrokerUrl, resolveDbPath } from "./collab-store";
@@ -32,13 +33,44 @@ export interface RoomBridgeDeps {
   store?: Store;
 }
 
+/** Outcome of {@link RoomBridgeHandle.send} — `ok:false` carries a Chinese reason for the agent. */
+export interface RoomSendResult {
+  ok: boolean;
+  info: string;
+}
+
+/** Room roster for {@link RoomBridgeHandle.listMembers}: members + owner + the caller's own id. */
+export interface RoomMembersResult {
+  members: string[];
+  ownerId: string;
+  /** The caller's own agent id, so the renderer can mark "(你)". */
+  self: string;
+}
+
 export interface RoomBridgeHandle {
   stop(): void;
   /** The resolved room, or null when the bridge stayed inert (not logged in / no room). */
   roomId: string | null;
+  /**
+   * Publish an agent-authored message to the room (§5 agent→room). `mentions` @-highlights the listed
+   * members — the message still broadcasts to every member, the broker just tags it for them. The
+   * wildcard `"*"` mention is @所有人, accepted by the broker ONLY from the room owner. Queues if the
+   * broker is offline; the broker re-stamps `from` from the authenticated sender. Inert handle ⇒ ok:false.
+   */
+  send(text: string, mentions?: string[]): RoomSendResult;
+  /**
+   * Fetch the room roster (members + ownerId + self) from the broker. Resolves null on an INERT
+   * handle (not logged in / no room); rejects on a connection / broker error (e.g. not connected yet).
+   */
+  listMembers(): Promise<RoomMembersResult | null>;
 }
 
-const INERT: RoomBridgeHandle = { stop: () => {}, roomId: null };
+const INERT: RoomBridgeHandle = {
+  stop: () => {},
+  roomId: null,
+  send: () => ({ ok: false, info: "未接入任何房间（未登录或当前目录未映射到房间）" }),
+  listMembers: async () => null,
+};
 const SEEN_CAP = 500; // bounded idempotency-key memory — drop a redelivered envelope once
 const FIELD_CAP = 500; // per-field char cap — one member can't flood the receiver's context (DoS)
 const UNBLOCKS_CAP = 10; // max unblock entries rendered before collapsing to a count
@@ -130,9 +162,20 @@ export function renderWhiteboard(wb: unknown): string | null {
  * Render a room Envelope into a one-line Chinese notice, or null for kinds the
  * MVP doesn't surface (those are simply not injected — never a raw payload dump).
  */
-export function renderRoomEvent(env: Envelope): string | null {
+export function renderRoomEvent(env: Envelope, selfId?: string): string | null {
   const from = senderId(env); // trustworthy: broker-stamped id, not a spoofable name
   switch (env.kind) {
+    case "chat": {
+      // Agent-authored room message (§5 agent→room). Free text → safeField (newline/marker
+      // scrub + DoS cap). @-highlight when this agent is targeted: "*" = @所有人, else the
+      // member-id list. mentions is attacker-influenced → guard the array type.
+      const p = (env.payload ?? {}) as { text?: string };
+      const mentions = Array.isArray(env.mentions) ? env.mentions : [];
+      const atAll = mentions.includes("*");
+      const atMe = atAll || (selfId !== undefined && selfId !== "" && mentions.includes(selfId));
+      const tag = atMe ? (atAll ? " 📣@所有人" : " 📣@你") : "";
+      return `${UNTRUSTED} ${from} · 💬 房间发言${tag}：「${safeField(p.text ?? "")}」`;
+    }
     case "task_completed": {
       const p = (env.payload ?? {}) as {
         summary?: string;
@@ -213,8 +256,14 @@ export async function startRoomBridge(deps: RoomBridgeDeps): Promise<RoomBridgeH
       seen.add(key);
       if (seen.size > SEEN_CAP) seen.delete(seen.values().next().value as string); // bounded FIFO-ish
     }
-    const text = renderRoomEvent(env);
+    const text = renderRoomEvent(env, client.whoami?.id); // selfId → @你 highlight when targeted
     if (text) deps.emit(text);
+  });
+  // Surface broker-pushed errors (e.g. a non-owner @all denial) as a SYSTEM notice — distinct
+  // from the UNTRUSTED member-message marker: this is the broker telling THIS agent its own
+  // action was rejected, not another member's text. safeField still scrubs the reason defensively.
+  client.onError((reason) => {
+    deps.emit(`⚠️ 房间操作被拒绝：${safeField(reason)}`);
   });
   // New-member injection (§4.4): the broker pushes the room whiteboard on join.
   client.onWhiteboard((_roomId, wb) => {
@@ -231,5 +280,40 @@ export async function startRoomBridge(deps: RoomBridgeDeps): Promise<RoomBridgeH
   client.connect().catch((e) => log(`room bridge: connect failed — ${String(e)}`));
   log(`room bridge: subscribed to room ${room}`);
 
-  return { stop: () => client.close(), roomId: room };
+  const send = (text: string, mentions?: string[]): RoomSendResult => {
+    const body = String(text ?? "").trim();
+    if (body === "") return { ok: false, info: "消息为空，未发送" };
+    const self = client.whoami;
+    const env: Envelope = {
+      roomId: room,
+      messageId: randomUUID(),
+      traceId: randomUUID(),
+      idempotencyKey: randomUUID(),
+      // The broker re-stamps from.agentId from the authenticated socket, so this is only a
+      // placeholder for the offline-queued case; agentType is a UI label (routing never reads it).
+      from: { agentId: self?.id ?? "(me)", agentType: "claude" },
+      kind: "chat",
+      payload: { text: body },
+      timestamp: Date.now(),
+      // store_if_offline so an offline member (e.g. another machine's agent) still gets it on
+      // reconnect — that is what makes a cross-machine @ actually reach a peer who's away.
+      deliveryMode: "store_if_offline",
+      ...(mentions && mentions.length > 0 ? { mentions } : {}),
+    };
+    client.publish(room, env); // queues if offline; broker enforces @all owner-only + re-stamps from
+    const at =
+      mentions && mentions.length > 0
+        ? mentions.includes("*")
+          ? "（@所有人）"
+          : `（@${mentions.length}人）`
+        : "";
+    return { ok: true, info: `已发送到房间 ${room}${at}` };
+  };
+
+  const listMembers = async (): Promise<RoomMembersResult | null> => {
+    const roster = await client.listMembers(room);
+    return { members: roster.members, ownerId: roster.ownerId, self: client.whoami?.id ?? "" };
+  };
+
+  return { stop: () => client.close(), roomId: room, send, listMembers };
 }

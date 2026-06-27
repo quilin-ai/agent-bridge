@@ -56,6 +56,7 @@ async function start() {
   const alice = await svc.issueToken("alice@x.com");
   const mallory = await svc.issueToken("mallory@x.com");
   const bob = await svc.issueToken("bob@x.com");
+  await store.createRoom(ROOM, "Secret Room", "alice@x.com"); // alice = createdBy ⇒ room OWNER (@all gate)
   await store.addMember(ROOM, "alice@x.com"); // alice + bob are members; mallory is not
   await store.addMember(ROOM, "bob@x.com");
   // memberCacheTtlMs: 0 ⇒ revocation re-check is immediate (no test sleeps).
@@ -75,6 +76,21 @@ function envelope(roomId: string) {
     payload: { summary: "malicious payload" },
     timestamp: 1,
     deliveryMode: "store_if_offline",
+  };
+}
+
+function chatEnvelope(roomId: string, mentions?: string[]) {
+  return {
+    roomId,
+    messageId: "c1",
+    traceId: "tc",
+    idempotencyKey: "kc",
+    from: { agentId: "x", agentType: "claude" }, // broker re-stamps to the authenticated sender
+    kind: "chat",
+    payload: { text: "hi room" },
+    timestamp: 1,
+    deliveryMode: "store_if_offline",
+    ...(mentions ? { mentions } : {}),
   };
 }
 
@@ -281,5 +297,132 @@ describe("Broker room authorization (§11.2) — closed by default", () => {
     a.send({ type: "subscribe", topic: ROOM });
     expect(await a.next()).toMatchObject({ type: "subscribed", topic: ROOM });
     a.close();
+  });
+});
+
+describe("Broker @all owner gate + roster (§5 agent→room)", () => {
+  let stop: (() => void) | undefined;
+  afterEach(() => {
+    stop?.();
+    stop = undefined;
+  });
+
+  test("the room OWNER may @所有人 (mentions ['*']) — members receive it", async () => {
+    const { broker, alice, bob, url } = await start(); // alice = createdBy (owner)
+    stop = () => broker.stop();
+    const b = await WsClient.connect(url);
+    b.send({ type: "hello", token: bob });
+    await b.next(); // welcome
+    b.send({ type: "subscribe", topic: ROOM });
+    await b.next(); // subscribed
+    await sleep(30);
+    const a = await WsClient.connect(url);
+    a.send({ type: "hello", token: alice });
+    await a.next(); // welcome
+    a.send({ type: "publish", topic: ROOM, envelope: chatEnvelope(ROOM, ["*"]) });
+    await sleep(60);
+    expect(b.drainNow().some((m) => m.type === "event" && m.envelope?.kind === "chat")).toBe(true);
+    a.close();
+    b.close();
+  });
+
+  test("a non-owner member is DENIED @所有人 — and the message never reaches the room", async () => {
+    const { broker, alice, bob, url } = await start();
+    stop = () => broker.stop();
+    const a = await WsClient.connect(url);
+    a.send({ type: "hello", token: alice });
+    await a.next();
+    a.send({ type: "subscribe", topic: ROOM });
+    await a.next(); // subscribed
+    await sleep(30);
+    const b = await WsClient.connect(url); // bob is a MEMBER but NOT the owner
+    b.send({ type: "hello", token: bob });
+    await b.next();
+    b.send({ type: "publish", topic: ROOM, envelope: chatEnvelope(ROOM, ["*"]) });
+    expect(await b.next()).toMatchObject({ type: "error", reason: "only the room owner may @all" });
+    await sleep(60);
+    expect(a.drainNow().some((m) => m.type === "event")).toBe(false); // alice received nothing
+    a.close();
+    b.close();
+  });
+
+  test("any member may @ a SPECIFIC member (mentions=[id]) — not owner-gated", async () => {
+    const { broker, alice, bob, url } = await start();
+    stop = () => broker.stop();
+    const a = await WsClient.connect(url);
+    a.send({ type: "hello", token: alice });
+    await a.next();
+    a.send({ type: "subscribe", topic: ROOM });
+    await a.next(); // subscribed
+    await sleep(30);
+    const b = await WsClient.connect(url);
+    b.send({ type: "hello", token: bob });
+    await b.next();
+    // bob (non-owner) @-mentions alice specifically → accepted (no owner gate), alice receives it.
+    b.send({ type: "publish", topic: ROOM, envelope: chatEnvelope(ROOM, ["alice@x.com"]) });
+    await sleep(60);
+    expect(b.drainNow().some((m) => m.type === "error")).toBe(false); // bob got no rejection
+    expect(a.drainNow().some((m) => m.type === "event" && m.envelope?.kind === "chat")).toBe(true);
+    a.close();
+    b.close();
+  });
+
+  test("mentions over the cap (>64) are rejected (DoS)", async () => {
+    const { broker, alice, url } = await start();
+    stop = () => broker.stop();
+    const a = await WsClient.connect(url);
+    a.send({ type: "hello", token: alice });
+    await a.next();
+    const many = Array.from({ length: 65 }, (_, i) => `u${i}@x.com`);
+    a.send({ type: "publish", topic: ROOM, envelope: chatEnvelope(ROOM, many) });
+    expect(await a.next()).toMatchObject({ type: "error", reason: "too many mentions (max 64)" });
+    a.close();
+  });
+
+  test("list_members returns the roster + ownerId to a member", async () => {
+    const { broker, alice, url } = await start();
+    stop = () => broker.stop();
+    const a = await WsClient.connect(url);
+    a.send({ type: "hello", token: alice });
+    await a.next();
+    a.send({ type: "list_members", roomId: ROOM, requestId: "lm1" });
+    const reply = await a.next();
+    expect(reply).toMatchObject({ type: "members", requestId: "lm1", ownerId: "alice@x.com" });
+    expect([...reply.members].sort()).toEqual(["alice@x.com", "bob@x.com"]);
+    a.close();
+  });
+
+  test("list_members is DENIED to an authenticated NON-member", async () => {
+    const { broker, mallory, url } = await start();
+    stop = () => broker.stop();
+    const m = await WsClient.connect(url);
+    m.send({ type: "hello", token: mallory });
+    await m.next();
+    m.send({ type: "list_members", roomId: ROOM, requestId: "lm2" });
+    expect(await m.next()).toMatchObject({ type: "members_error", requestId: "lm2", reason: "not a room member" });
+    m.close();
+  });
+
+  test("a room chat @所有人 is QUEUED for an OFFLINE member and drained on reconnect (the cross-machine @ claim)", async () => {
+    const { broker, alice, bob, url } = await start();
+    stop = () => broker.stop();
+    // bob is a MEMBER but OFFLINE during the publish window (e.g. another machine's agent away).
+    const a = await WsClient.connect(url);
+    a.send({ type: "hello", token: alice });
+    await a.next(); // welcome (alice = owner)
+    // alice posts a room chat (store_if_offline + no `to` ⇒ queued for ALL offline members).
+    a.send({ type: "publish", topic: ROOM, envelope: { ...chatEnvelope(ROOM, ["*"]), messageId: "chat-off", idempotencyKey: "chat-off" } });
+    await sleep(60);
+
+    // bob reconnects → the queued chat drains to him (the headline: an away peer still gets it).
+    const b = await WsClient.connect(url);
+    b.send({ type: "hello", token: bob });
+    await b.next(); // welcome
+    await sleep(60);
+    expect(
+      b.drainNow().some((m) => m.type === "event" && m.envelope?.kind === "chat" && m.envelope?.messageId === "chat-off"),
+    ).toBe(true);
+    a.close();
+    b.close();
   });
 });

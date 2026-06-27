@@ -35,6 +35,20 @@ export function reconnectDelay(baseMs: number, maxMs: number, attempt: number, r
 
 type WhiteboardHandler = (roomId: string, whiteboard: unknown) => void;
 
+// Bound the listMembers round-trip. Without it, an OLD broker that lacks the list_members
+// case answers with a generic {type:"error"} frame (uncorrelated to the request) and the
+// pending entry would leak until the socket closes. 4s < the daemon-client's 5s foreground
+// timeout, so the broker round-trip settles first and the daemon reports the real outcome.
+const LIST_MEMBERS_TIMEOUT_MS = 4000;
+
+/** Room roster returned by {@link BrokerClient.listMembers}: persistent members + the owner id. */
+export interface RoomRoster {
+  /** Persistent member agent ids (includes offline members). */
+  members: string[];
+  /** The room owner = createdBy. Only the owner may @all. Empty string if unknown. */
+  ownerId: string;
+}
+
 /**
  * Edge-side client to the control-plane broker (§5 adapter transport + §8.2
  * resilience foundation).
@@ -60,6 +74,12 @@ export class BrokerClient {
   private readonly whiteboardHandlers: WhiteboardHandler[] = [];
   /** topic → resolver for an in-flight joinWithPassword, settled by the broker's joined/join_error. */
   private readonly pendingJoins = new Map<string, { resolve: () => void; reject: (e: Error) => void }>();
+  /** requestId → resolver for an in-flight listMembers, settled by the broker's members/members_error. */
+  private readonly pendingMemberRequests = new Map<string, { resolve: (r: RoomRoster) => void; reject: (e: Error) => void }>();
+  /** Monotonic request-id source for listMembers (broker round-trips correlated by requestId). */
+  private reqSeq = 0;
+  /** Handlers for broker-pushed `error` frames (e.g. a denied @all) — surfaced as a notice, not correlated to a request. */
+  private readonly errorHandlers: Array<(reason: string) => void> = [];
   private closed = false;
   /** Set on auth_error: a bad token must NOT trigger an infinite reconnect loop. */
   private authFailed = false;
@@ -159,11 +179,48 @@ export class BrokerClient {
     this.whiteboardHandlers.push(handler);
   }
 
+  /**
+   * Ask the broker for the room roster (members + ownerId, §5 agent→room discovery).
+   * MEMBERS-ONLY on the broker side: rejects with the broker's reason for a non-member /
+   * lookup failure. Requires a live connection — call connect() first. Concurrent calls are
+   * correlated by a per-request id so their replies never cross.
+   */
+  listMembers(roomId: string): Promise<RoomRoster> {
+    if (!this.connected) return Promise.reject(new Error("not connected"));
+    const requestId = `lm_${++this.reqSeq}`;
+    return new Promise<RoomRoster>((resolve, reject) => {
+      // Bound the wait: an old/misbehaving broker may answer with a generic, uncorrelated
+      // error frame (or nothing) instead of members/members_error — the timer reaps the
+      // pending entry so it never leaks. Wrapping resolve/reject clears it on every path
+      // (members / members_error / socket close via failPendingMemberRequests).
+      const timer = setTimeout(() => {
+        if (this.pendingMemberRequests.delete(requestId)) reject(new Error("list_members timed out"));
+      }, LIST_MEMBERS_TIMEOUT_MS);
+      this.pendingMemberRequests.set(requestId, {
+        resolve: (r) => {
+          clearTimeout(timer);
+          resolve(r);
+        },
+        reject: (e) => {
+          clearTimeout(timer);
+          reject(e);
+        },
+      });
+      this.sendRaw({ type: "list_members", roomId, requestId });
+    });
+  }
+
+  /** Register a handler for broker-pushed `error` frames (denied @all, malformed/over-cap publish, …). */
+  onError(handler: (reason: string) => void): void {
+    this.errorHandlers.push(handler);
+  }
+
   close(): void {
     this.closed = true;
     this.clearReconnectTimer();
     this.teardownSocket();
     this.failPendingJoins("client closed");
+    this.failPendingMemberRequests("client closed");
     if (this.rejectConnect) {
       const reject = this.rejectConnect;
       this.resolveConnect = null;
@@ -241,6 +298,33 @@ export class BrokerClient {
           this.pendingJoins.delete(msg.topic);
           p.reject(new Error(typeof msg.reason === "string" ? msg.reason : "join failed"));
         }
+      } else if (msg.type === "members") {
+        const p = this.pendingMemberRequests.get(msg.requestId);
+        if (p) {
+          this.pendingMemberRequests.delete(msg.requestId);
+          p.resolve({
+            members: Array.isArray(msg.members) ? msg.members : [],
+            ownerId: typeof msg.ownerId === "string" ? msg.ownerId : "",
+          });
+        }
+      } else if (msg.type === "members_error") {
+        const p = this.pendingMemberRequests.get(msg.requestId);
+        if (p) {
+          this.pendingMemberRequests.delete(msg.requestId);
+          p.reject(new Error(typeof msg.reason === "string" ? msg.reason : "list_members failed"));
+        }
+      } else if (msg.type === "error") {
+        // Broker-pushed error (denied @all, over-cap/malformed publish, not-a-member). NOT
+        // correlated to a specific publish, so surface it as a notice — the agent learns the
+        // action was rejected instead of it silently vanishing.
+        const reason = typeof msg.reason === "string" ? msg.reason : "broker error";
+        for (const h of this.errorHandlers) {
+          try {
+            h(reason);
+          } catch (e) {
+            this.log(`error handler threw: ${String(e)}`);
+          }
+        }
       }
     };
     ws.onclose = () => {
@@ -251,6 +335,7 @@ export class BrokerClient {
       // caller errors out instead of hanging (the broker grants membership transactionally; a
       // drop before `joined` means it did NOT complete).
       this.failPendingJoins("connection lost before the join completed");
+      this.failPendingMemberRequests("connection lost before the roster reply");
       // A transient drop does NOT reject connect() — reconnect retries and the
       // next welcome resolves the still-pending promise. Only auth failure / close()
       // settle it. Avoids the "reject-but-secretly-reconnect" contract that induced
@@ -291,6 +376,14 @@ export class BrokerClient {
     if (this.pendingJoins.size === 0) return;
     const pend = [...this.pendingJoins.values()];
     this.pendingJoins.clear();
+    for (const p of pend) p.reject(new Error(reason));
+  }
+
+  /** Reject every in-flight listMembers (the socket went away before the broker replied). */
+  private failPendingMemberRequests(reason: string): void {
+    if (this.pendingMemberRequests.size === 0) return;
+    const pend = [...this.pendingMemberRequests.values()];
+    this.pendingMemberRequests.clear();
     for (const p of pend) p.reject(new Error(reason));
   }
 

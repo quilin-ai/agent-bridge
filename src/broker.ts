@@ -21,6 +21,9 @@ const MEMBER_CACHE_CAP = 2000;
 // the broker's fan-out bandwidth, so the cap is needed here too.)
 const PRESENCE_FIELD_CAP = 200;
 const PRESENCE_CAPS_CAP = 20;
+// @-mentions cap (DoS): mentions fans out to every member AND persists in the ledger,
+// so bound how many a single publish can carry. 64 is far above any real "@ a few people".
+const MAX_MENTIONS = 64;
 // Brute-force throttle for room-password self-join (§11.2): a room password is a guessable shared
 // secret. After MAX_JOIN_FAILS wrong attempts the IDENTITY (not the socket) is locked out of join for
 // JOIN_LOCKOUT_MS — keyed to the PSK-authenticated id, so reconnecting can't reset it. This bounds the
@@ -76,6 +79,7 @@ type ClientMessage =
   | { type: "subscribe"; topic: string }
   | { type: "unsubscribe"; topic: string }
   | { type: "join"; topic: string; password: string }
+  | { type: "list_members"; roomId: string; requestId: string }
   | { type: "publish"; topic: string; envelope: Envelope };
 
 export interface BrokerOptions {
@@ -412,6 +416,33 @@ export class Broker {
         this.log(`JOIN ${me} → ${topic} (self-service via password)`);
         return;
       }
+      case "list_members": {
+        // Room roster lookup (§5 agent→room discovery): a member asks who else is in
+        // the room so it can @-address them. MEMBERS-ONLY — a non-member must not be
+        // able to enumerate a room's roster (same closed-by-default authz as
+        // subscribe/publish, §11.2). `ownerId` (= createdBy) lets the caller see who
+        // the room owner is — only the owner may @all (enforced on the publish path).
+        const roomId = msg.roomId;
+        const requestId = typeof msg.requestId === "string" ? msg.requestId : "";
+        if (typeof roomId !== "string" || roomId === "") {
+          this.send(ws, { type: "members_error", requestId, reason: "missing roomId" });
+          return;
+        }
+        if (!(await this.isMember(roomId, me))) {
+          this.send(ws, { type: "members_error", requestId, reason: "not a room member" });
+          this.log(`DENY list_members ${me} → ${roomId} (not a member)`);
+          return;
+        }
+        try {
+          const members = await this.opts.store.getMembers(roomId);
+          const room = await this.opts.store.getRoom(roomId);
+          this.send(ws, { type: "members", requestId, roomId, members, ownerId: room?.createdBy ?? "" });
+        } catch (e) {
+          this.send(ws, { type: "members_error", requestId, reason: "roster lookup failed" });
+          this.log(`list_members store error ${me} → ${roomId}: ${String(e)}`);
+        }
+        return;
+      }
       case "publish": {
         // CONTROL PLANE ONLY: forward the structured Envelope. No filesystem,
         // no repo access — code sync is git's job (§2.6). The broker is a trust
@@ -459,6 +490,36 @@ export class Broker {
           this.send(ws, { type: "error", reason: "not a room member" });
           this.log(`DENY publish ${me} → ${msg.topic} (not a member)`);
           return;
+        }
+        // mentions shape + count (DoS): mentions is the attention vector fanned out to
+        // every member and persisted in the ledger; reject a non-array or an oversized list.
+        if (env.mentions !== undefined && !Array.isArray(env.mentions)) {
+          this.send(ws, { type: "error", reason: "envelope.mentions must be an array" });
+          return;
+        }
+        if (Array.isArray(env.mentions) && env.mentions.length > MAX_MENTIONS) {
+          this.send(ws, { type: "error", reason: `too many mentions (max ${MAX_MENTIONS})` });
+          return;
+        }
+        // @all authz (§5): the "*" wildcard mention is an attention broadcast to the WHOLE
+        // room — gate it to the room OWNER (createdBy). Anyone may @ a specific member, but
+        // only the owner may @所有人, so a single member can't ping everyone. Enforced HERE
+        // (server-side): an edge crafting mentions:["*"] directly is still rejected — the
+        // client-side tool gate is only a UX nicety, never the trust boundary.
+        if (Array.isArray(env.mentions) && env.mentions.includes("*")) {
+          let room;
+          try {
+            room = await this.opts.store.getRoom(msg.topic);
+          } catch (e) {
+            this.send(ws, { type: "error", reason: "owner check failed" });
+            this.log(`@all owner check store error ${me} → ${msg.topic}: ${String(e)}`);
+            return;
+          }
+          if (!room || room.createdBy !== me) {
+            this.send(ws, { type: "error", reason: "only the room owner may @all" });
+            this.log(`DENY @all ${me} → ${msg.topic} (not owner)`);
+            return;
+          }
         }
         // Anti-spoof + reliable loop prevention: stamp the authenticated sender
         // unconditionally (from is now guaranteed a plain object).

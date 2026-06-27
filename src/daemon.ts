@@ -1249,6 +1249,34 @@ function handleControlMessage(ws: ServerWebSocket<ControlSocketData>, raw: strin
         log(`handleRequestBudgetRefresh threw for #${ws.data.clientId}: ${err?.message ?? err}`);
       });
       return;
+    case "claude_to_room": {
+      const requestId = message.requestId;
+      handleClaudeToRoom(ws, requestId, message.text, message.mentions).catch((err: any) => {
+        log(`handleClaudeToRoom threw for #${ws.data.clientId}: ${err?.message ?? err}`);
+        sendProtocolMessage(ws, {
+          type: "claude_to_room_result",
+          requestId,
+          success: false,
+          error: `Internal bridge error: ${err?.message ?? err}`,
+        });
+      });
+      return;
+    }
+    case "request_room_members": {
+      const requestId = message.requestId;
+      handleRequestRoomMembers(ws, requestId).catch((err: any) => {
+        log(`handleRequestRoomMembers threw for #${ws.data.clientId}: ${err?.message ?? err}`);
+        sendProtocolMessage(ws, {
+          type: "room_members_result",
+          requestId,
+          members: null,
+          ownerId: null,
+          self: null,
+          error: `Internal bridge error: ${err?.message ?? err}`,
+        });
+      });
+      return;
+    }
     case "claude_to_codex": {
       // The handler is async only on the interrupt path (terminal-boundary
       // wait); steer/inject paths run synchronously to the first result.
@@ -1898,6 +1926,86 @@ async function handleRequestBudgetRefresh(ws: ServerWebSocket<ControlSocketData>
   const snapshot = budgetCoordinator ? await budgetCoordinator.refreshSnapshotReadonly() : null;
   log(`request_budget_refresh from #${ws.data.clientId}: ${snapshot ? "fresh" : "unavailable"}`);
   sendProtocolMessage(ws, { type: "budget_refresh", requestId, snapshot });
+}
+
+/**
+ * Agent → room (§5): forward a chat message to the room bridge, which queues it to the broker
+ * (the broker enforces @all owner-only + re-stamps the sender). An absent / inert bridge (not
+ * logged in / no room) → success:false with a Chinese reason, so the tool tells the agent why.
+ */
+async function handleClaudeToRoom(
+  ws: ServerWebSocket<ControlSocketData>,
+  requestId: string,
+  text: string,
+  mentions?: string[],
+) {
+  if (!roomBridge) {
+    sendProtocolMessage(ws, {
+      type: "claude_to_room_result",
+      requestId,
+      success: false,
+      error: "未接入房间（room bridge 未启动）",
+    });
+    return;
+  }
+  const r = roomBridge.send(text, mentions);
+  log(`claude_to_room from #${ws.data.clientId}: ${r.ok ? "queued" : "rejected"} (${r.info})`);
+  sendProtocolMessage(ws, {
+    type: "claude_to_room_result",
+    requestId,
+    success: r.ok,
+    ...(r.ok ? {} : { error: r.info }),
+  });
+}
+
+/**
+ * Agent → room roster (§5): ask the room bridge (→ broker, members-only) for the member list +
+ * owner so the agent knows who it can @. An absent/inert bridge → members:null with a reason; a
+ * broker/connection error → error string. The broker is the authority on the roster.
+ */
+async function handleRequestRoomMembers(ws: ServerWebSocket<ControlSocketData>, requestId: string) {
+  if (!roomBridge) {
+    sendProtocolMessage(ws, {
+      type: "room_members_result",
+      requestId,
+      members: null,
+      ownerId: null,
+      self: null,
+      error: "未接入房间（room bridge 未启动）",
+    });
+    return;
+  }
+  try {
+    const roster = await roomBridge.listMembers();
+    if (!roster) {
+      sendProtocolMessage(ws, {
+        type: "room_members_result",
+        requestId,
+        members: null,
+        ownerId: null,
+        self: null,
+        error: "未接入房间（未登录或当前目录未映射到房间）",
+      });
+      return;
+    }
+    log(`request_room_members from #${ws.data.clientId}: ${roster.members.length} members`);
+    sendProtocolMessage(ws, {
+      type: "room_members_result",
+      requestId,
+      members: roster.members,
+      ownerId: roster.ownerId,
+      self: roster.self,
+    });
+  } catch (e: any) {
+    sendProtocolMessage(ws, {
+      type: "room_members_result",
+      requestId,
+      members: null,
+      ownerId: null,
+      self: null,
+      error: `房间名单获取失败：${e?.message ?? e}`,
+    });
+  }
 }
 
 /**
