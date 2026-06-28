@@ -227,12 +227,19 @@ export class Broker {
   // rejection. Swallow + log; shutdown proceeds to store.close() regardless, and the cli
   // forceExit fuse covers a hung stop.
   async stop(): Promise<void> {
-    try {
-      await this.server?.stop(true);
-    } catch (e) {
-      this.log(`server stop failed: ${String(e)}`);
-    }
+    const server = this.server;
     this.server = null;
+    if (!server) return;
+    // Bound the close (HIGH-2): Bun 1.3.11 `server.stop(true)` can hang >5s when rejected (4401)
+    // sockets are still half-open, which blocked test afterEach teardown and the cli shutdown path
+    // (→ forceExit fuse + a stuck store.close() → unclean SQLite close). Cap it at 1s so teardown
+    // always proceeds. Attach .catch to the stop promise itself, not the race: if stop rejects
+    // AFTER the timeout wins, callers may have stopped awaiting us, so it must not surface as an
+    // unhandled rejection.
+    const closed = Promise.resolve(server.stop(true)).catch((e) =>
+      this.log(`server stop failed: ${String(e)}`),
+    );
+    await Promise.race([closed, new Promise<void>((resolve) => setTimeout(resolve, 1000))]);
   }
 
   // Bun ServerWebSocket.send() return contract (empirically verified, Bun 1.3.11):

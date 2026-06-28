@@ -30,10 +30,10 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.24", "0.0.0-source"),
-  commit: defineString("5b8eae1", "source"),
+  commit: defineString("ff990e3", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION),
-  codeHash: defineString("ecdce21da0d1", "source")
+  codeHash: defineString("45aee8e59953", "source")
 });
 function daemonStatusBuildInfo() {
   return { ...BUILD_INFO };
