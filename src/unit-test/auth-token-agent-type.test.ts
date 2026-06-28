@@ -23,7 +23,9 @@ describe("authTokenFile", () => {
   test("sanitises to [a-z0-9-] so agentType can never escape the collab dir", () => {
     expect(authTokenFile("../../etc/passwd")).toBe("auth-token-etcpasswd");
     expect(authTokenFile("a/b")).toBe("auth-token-ab");
-    expect(authTokenFile("..")).toBe("auth-token"); // sanitises to "" → bare token, never a traversal
+    // A malformed non-claude type that sanitises to "" → null (inert), NOT claude's bare token.
+    expect(authTokenFile("..")).toBeNull();
+    expect(readAuthToken("/nonexistent/collab.db", "..")).toBeNull();
   });
 });
 
@@ -51,5 +53,21 @@ describe("readAuthToken with agentType", () => {
     const dbPath = join(dir, "collab.db");
     writeFileSync(join(dir, "auth-token-codex"), "   \n");
     expect(readAuthToken(dbPath, "codex")).toBeNull();
+  });
+
+  test("env AGENTBRIDGE_<TYPE>_TOKEN provisions a secondary agent (wins over file), claude unaffected", () => {
+    const dir = mkdtempSync(join(tmpdir(), "abg-authtoken-"));
+    const dbPath = join(dir, "collab.db");
+    writeFileSync(join(dir, "auth-token"), "claude-tok"); // claude file present
+    const prev = process.env.AGENTBRIDGE_CODEX_TOKEN;
+    process.env.AGENTBRIDGE_CODEX_TOKEN = " env-codex-tok ";
+    try {
+      expect(readAuthToken(dbPath, "codex")).toBe("env-codex-tok"); // env, trimmed — no file needed
+      expect(readAuthToken(dbPath)).toBe("claude-tok"); // claude path never reads env
+      expect(readAuthToken(dbPath, "claude")).toBe("claude-tok");
+    } finally {
+      if (prev === undefined) delete process.env.AGENTBRIDGE_CODEX_TOKEN;
+      else process.env.AGENTBRIDGE_CODEX_TOKEN = prev;
+    }
   });
 });

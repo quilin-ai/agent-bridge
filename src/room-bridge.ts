@@ -36,6 +36,13 @@ export interface RoomBridgeDeps {
   agentType?: string;
   /** Capabilities advertised to other members (presence meta, render-only — routing never reads it). */
   capabilities?: string[];
+  /**
+   * Optional gate: return false to NOT inject an envelope. Claude (pushed to a socket) injects every
+   * kind cheaply, but each Codex injection costs a whole turn ({@link CodexAdapter.injectRoomNotice}),
+   * so the Codex bridge passes a filter that drops recurring presence noise (member_joined/left) and
+   * only wakes Codex for substantive events (task_completed / @-mentions). Default: inject everything.
+   */
+  eventFilter?: (env: Envelope) => boolean;
   // --- test seams ---
   dbPath?: string;
   brokerUrl?: string;
@@ -275,6 +282,7 @@ export async function startRoomBridge(deps: RoomBridgeDeps): Promise<RoomBridgeH
       seen.add(key);
       if (seen.size > SEEN_CAP) seen.delete(seen.values().next().value as string); // bounded FIFO-ish
     }
+    if (deps.eventFilter && !deps.eventFilter(env)) return; // e.g. Codex drops presence noise (per-turn cost)
     const text = renderRoomEvent(env, client.whoami?.id); // selfId → @你 highlight when targeted
     if (text) deps.emit(text);
   });

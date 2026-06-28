@@ -172,4 +172,40 @@ describe("startRoomBridge — last-mile broker→session injection (§11.1)", ()
     await waitFor(() => emitted.some((t) => t.includes("🏁")));
     expect(emitted.find((t) => t.includes("🏁"))!).toContain("auth contract ready");
   });
+
+  test("eventFilter drops presence noise (member_joined/left) but keeps task_completed (Codex per-turn cost)", async () => {
+    const { dir, store, tokenB, broker, url, dbPath } = await setup();
+    const svc = new IdentityService(store);
+    await svc.registerIdentity("codex@x.com", "Codex");
+    const tokenCodex = await svc.issueToken("codex@x.com");
+    await new RoomService(store).join(ROOM, "codex@x.com");
+    writeFileSync(join(dir, "auth-token-codex"), tokenCodex, { mode: 0o600 });
+    cleanup.push(() => broker.stop(), () => rmSync(dir, { recursive: true, force: true }));
+
+    const emitted: string[] = [];
+    const handle = await startRoomBridge({
+      cwd: dir,
+      agentType: "codex",
+      eventFilter: (env) => env.kind !== "member_joined" && env.kind !== "member_left",
+      emit: (t) => emitted.push(t),
+      store,
+      dbPath,
+      brokerUrl: url,
+    });
+    cleanup.push(() => handle.stop());
+    await delay(80);
+
+    const bob = new BrokerClient({ url, token: tokenB });
+    await bob.connect();
+    cleanup.push(() => bob.close());
+    bob.subscribe(ROOM); // 0→1 transition → broker emits member_joined to the codex bridge (must be filtered)
+    await delay(120);
+    bob.publish(
+      ROOM,
+      buildTaskCompletedEnvelope({ roomId: ROOM, from: { agentId: "bob@x.com", agentType: "claude" }, summary: "shipped" }),
+    );
+    await waitFor(() => emitted.some((t) => t.includes("🏁")));
+    expect(emitted.some((t) => t.includes("👋"))).toBe(false); // presence dropped — Codex not woken for it
+    expect(emitted.some((t) => t.includes("🏁"))).toBe(true); // substantive event kept
+  });
 });

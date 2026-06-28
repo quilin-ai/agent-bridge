@@ -2523,6 +2523,9 @@ void startRoomBridge({
   agentType: "codex",
   capabilities: ["implement", "execute"],
   emit: (text) => codex.injectRoomNotice(text),
+  // Each Codex injection costs a whole turn, so drop recurring presence noise (member_joined/left) —
+  // only wake Codex for substantive events (task_completed / @-mentions / whiteboard-on-join).
+  eventFilter: (env) => env.kind !== "member_joined" && env.kind !== "member_left",
   log,
 })
   .then((handle) => {

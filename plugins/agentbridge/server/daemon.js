@@ -30,10 +30,10 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.24", "0.0.0-source"),
-  commit: defineString("58fa8ab", "source"),
+  commit: defineString("bb0bf89", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION),
-  codeHash: defineString("874605b5a367", "source")
+  codeHash: defineString("e382de8af112", "source")
 });
 function daemonStatusBuildInfo() {
   return { ...BUILD_INFO };
@@ -7442,14 +7442,23 @@ function readPersistedBrokerUrl(dbPath) {
   }
 }
 function authTokenFile(agentType) {
-  if (!agentType)
+  if (!agentType || agentType.toLowerCase() === "claude")
     return "auth-token";
   const safe = agentType.toLowerCase().replace(/[^a-z0-9-]/g, "");
-  return safe === "" || safe === "claude" ? "auth-token" : `auth-token-${safe}`;
+  return safe === "" ? null : `auth-token-${safe}`;
 }
 function readAuthToken(dbPath, agentType) {
+  if (agentType && agentType.toLowerCase() !== "claude") {
+    const envKey = `AGENTBRIDGE_${agentType.toUpperCase().replace(/[^A-Z0-9]/g, "")}_TOKEN`;
+    const envTok = process.env[envKey]?.trim();
+    if (envTok)
+      return envTok;
+  }
+  const file = authTokenFile(agentType);
+  if (file === null)
+    return null;
   try {
-    const token = readFileSync9(join11(dirname3(dbPath), authTokenFile(agentType)), "utf-8").trim();
+    const token = readFileSync9(join11(dirname3(dbPath), file), "utf-8").trim();
     return token === "" ? null : token;
   } catch {
     return null;
@@ -7585,6 +7594,8 @@ async function startRoomBridge(deps) {
       if (seen.size > SEEN_CAP)
         seen.delete(seen.values().next().value);
     }
+    if (deps.eventFilter && !deps.eventFilter(env))
+      return;
     const text = renderRoomEvent(env, client.whoami?.id);
     if (text)
       deps.emit(text);
@@ -9083,6 +9094,7 @@ startRoomBridge({
   agentType: "codex",
   capabilities: ["implement", "execute"],
   emit: (text) => codex.injectRoomNotice(text),
+  eventFilter: (env) => env.kind !== "member_joined" && env.kind !== "member_left",
   log
 }).then((handle) => {
   if (shuttingDown)

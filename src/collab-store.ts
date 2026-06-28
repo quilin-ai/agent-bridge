@@ -78,16 +78,31 @@ export function writeBrokerUrl(dbPath: string, url: string): void {
  * agentType is sanitised to `[a-z0-9-]` before it becomes a filename (defence-in-depth: it must
  * never escape the collab dir even though it is daemon-set, not user input).
  */
-export function authTokenFile(agentType?: string): string {
-  if (!agentType) return "auth-token";
+export function authTokenFile(agentType?: string): string | null {
+  if (!agentType || agentType.toLowerCase() === "claude") return "auth-token";
   const safe = agentType.toLowerCase().replace(/[^a-z0-9-]/g, "");
-  return safe === "" || safe === "claude" ? "auth-token" : `auth-token-${safe}`;
+  // A non-claude agentType that sanitises to empty (e.g. "..") is MALFORMED — return null (→ inert),
+  // NOT the bare claude token: a bad agent must never silently borrow Claude's identity.
+  return safe === "" ? null : `auth-token-${safe}`;
 }
 
-/** Read the logged-in PSK token from `<collabDir>/auth-token[-<agentType>]`. No Store needed — cheap login gate. */
+/**
+ * Read the logged-in PSK token for an agent kind. Resolution: env `AGENTBRIDGE_<TYPE>_TOKEN`
+ * (non-claude only) > `<collabDir>/auth-token[-<agentType>]`. The env var is the provisioning path
+ * for a secondary agent (e.g. Codex) until a `--agent` CLI write lands — without it the Codex bridge
+ * has no shipped way to get a DISTINCT token and would be dead-on-arrival. Claude keeps the bare
+ * file-only path (no env) for back-compat. No Store needed — cheap login gate.
+ */
 export function readAuthToken(dbPath: string, agentType?: string): string | null {
+  if (agentType && agentType.toLowerCase() !== "claude") {
+    const envKey = `AGENTBRIDGE_${agentType.toUpperCase().replace(/[^A-Z0-9]/g, "")}_TOKEN`;
+    const envTok = process.env[envKey]?.trim();
+    if (envTok) return envTok;
+  }
+  const file = authTokenFile(agentType);
+  if (file === null) return null; // malformed non-claude agentType → inert, never falls back to claude
   try {
-    const token = readFileSync(join(dirname(dbPath), authTokenFile(agentType)), "utf-8").trim();
+    const token = readFileSync(join(dirname(dbPath), file), "utf-8").trim();
     return token === "" ? null : token;
   } catch {
     return null;
