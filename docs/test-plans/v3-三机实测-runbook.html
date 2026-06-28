@@ -137,29 +137,25 @@ abg room create demo                             # 建房间 demo，你自动成
 # 给两台边机各签发 token + 加成员 + 打印对方要跑的「一条龙」
 abg room invite demo officembp@you --broker-url ws://100.92.1.10:4700/ws
 abg room invite demo home@you     --broker-url ws://100.92.1.10:4700/ws</code></pre>
-<div class="note"><b>每条 invite 会打印 3 行</b>（每台 token 不同），形如：
-<pre><code>export AGENTBRIDGE_BROKER_URL=ws://100.92.1.10:4700/ws
-abg auth login --token &lt;一长串 token&gt;
-abg join demo</code></pre>
-把<b>对应那台</b>的 3 行通过安全渠道（私信/密码管理器，别贴进仓库）发给边机操作者。token 是秘密。</div>
+<div class="note"><b>每条 invite 会打印 2 行</b>（每台 token 不同），形如：
+<pre><code>abg auth login --token &lt;一长串 token&gt;
+abg join demo --broker-url ws://100.92.1.10:4700/ws</code></pre>
+把<b>对应那台</b>的 2 行通过安全渠道（私信/密码管理器，别贴进仓库）发给边机操作者。token 是秘密。<br>
+<code>join --broker-url</code> 会把 broker 地址持久化，daemon 启动时自动连接——<b>无需设 AGENTBRIDGE_BROKER_URL、无需写 ~/.zshrc、无需 kill 重启</b>。</div>
 <div class="note warn"><b>看到「⚠️ broker 地址仅本机可达」？</b> 说明你 <code>broker start</code> 没绑 Tailscale 地址（绑成了 127.0.0.1）。
 回 1.1 用 <code>--host 100.x</code> 重启，invite 也带上 <code>--broker-url ws://100.x:4700/ws</code>。</div>
 
 
 <h2><span class="n">2.</span> 边机 A / B — <span class="role edge">参与者（office MBP / 家里机）</span></h2>
-<p>每台边机跑<b>它自己那条 invite</b> 打印的 3 行（token 各不相同），再起会话。</p>
+<p>每台边机跑<b>它自己那条 invite</b> 打印的 2 行（token 各不相同），再起会话。</p>
 
 <h3>2.1 装 token + 加房间</h3>
-<pre><code># 贴上 broker 发给<b>这台</b>的 3 行：
-export AGENTBRIDGE_BROKER_URL=ws://100.92.1.10:4700/ws
+<pre><code># 贴上 broker 发给<b>这台</b>的 2 行：
 abg auth login --token &lt;这台的 token&gt;
-abg join demo                                    # 远程房间：只映射 cwd，成员制由 broker 强制
-
-# <b>持久化</b> broker 地址（关键！daemon 启动那刻要能读到）：
-echo 'export AGENTBRIDGE_BROKER_URL=ws://100.92.1.10:4700/ws' &gt;&gt; ~/.zshrc</code></pre>
-<div class="note danger"><b>最常见的坑。</b> <code>AGENTBRIDGE_BROKER_URL</code> 必须在 <b>daemon 启动那一刻</b>已设好。
-若你先 <code>agentbridge claude</code> 起了 daemon 再设变量，或新开的终端没这变量——daemon 会<b>静默回退</b> <code>ws://127.0.0.1:4700/ws</code>，
-然后<b>收不到任何房间事件</b>。设好变量后，先 <code>agentbridge kill</code> 再起。</div>
+abg join demo --broker-url ws://100.92.1.10:4700/ws   # 远程房间：映射 cwd + 持久化 broker 地址</code></pre>
+<div class="note ok"><b>无需再设环境变量。</b> <code>join --broker-url</code> 把 broker 地址写到 <code>&lt;collabDir&gt;/broker-url</code>，
+daemon 启动时按 <code>显式 &gt; AGENTBRIDGE_BROKER_URL &gt; 持久化 &gt; 本地默认</code> 自动读取——<b>不用写 ~/.zshrc、不用 kill 重启</b>。
+万一没传 <code>--broker-url</code> 而回退到本地，daemon 会打一条 WARN（不再静默），方便排查。</div>
 
 <h3>2.2 在项目目录起会话</h3>
 <pre><code>cd ~/你的某个项目目录          # 这台机器上的工作目录
@@ -225,7 +221,7 @@ agentbridge claude            # 起 daemon + room-bridge，连 broker、订阅 d
 <h2><span class="n">4.</span> 常见排错</h2>
 <table>
 <tr><th>症状</th><th>原因 / 排查</th></tr>
-<tr><td>边机收不到任何房间事件</td><td>九成是 <code>AGENTBRIDGE_BROKER_URL</code> 没在 daemon 启动时设好 → daemon 回退 127.0.0.1。<code>echo $AGENTBRIDGE_BROKER_URL</code> 确认，写进 ~/.zshrc，<code>agentbridge kill</code> 再起。</td></tr>
+<tr><td>边机收不到任何房间事件</td><td>九成是 join 时没带 <code>--broker-url</code> → daemon 回退 127.0.0.1（会打一条 WARN，<code>abg logs -f</code> 能看到）。重跑 <code>abg join demo --broker-url ws://100.x:4700/ws</code> 持久化地址，再 <code>agentbridge kill</code> 重起 daemon。</td></tr>
 <tr><td><code>command not found: abg</code></td><td>bun 全局 bin 不在 PATH：<code>export PATH="$HOME/.bun/bin:$PATH"</code> 进 ~/.zshrc，重开终端。</td></tr>
 <tr><td>边机 <code>auth login --token</code> / <code>join</code> 后连不上（4401）</td><td>token 是不是<b>这台</b>的（每台 invite 的 token 不同，别贴错）？broker 是否还在终端①跑着？broker 是否绑了 Tailscale 地址（非 127.0.0.1）？</td></tr>
 <tr><td><code>ping 100.x</code> 不通</td><td>Tailscale 没都在线 / 不在同一 tailnet。三台 <code>tailscale status</code> 互相看得到才行。</td></tr>
@@ -253,7 +249,7 @@ agentbridge kill                  # 停 daemon
 <tr><td><span class="role broker">broker</span></td><td><code>abg room set-password &lt;房&gt; --password-stdin</code></td><td>设房间自助口令</td></tr>
 <tr><td><span class="role broker">broker</span></td><td><code>abg auth revoke --id &lt;id&gt;</code></td><td>吊销该身份所有 token</td></tr>
 <tr><td><span class="role edge">边机</span></td><td><code>abg auth login --token &lt;T&gt;</code></td><td>装 broker 签发的 token</td></tr>
-<tr><td><span class="role edge">边机</span></td><td><code>abg join &lt;房&gt;</code> / <code>--password-stdin</code></td><td>加房间 / 凭口令自助加入</td></tr>
+<tr><td><span class="role edge">边机</span></td><td><code>abg join &lt;房&gt; --broker-url ws://100.x:4700/ws</code> / <code>--password-stdin</code></td><td>加房间（持久化 broker 地址）/ 凭口令自助加入</td></tr>
 <tr><td><span class="role edge">边机</span></td><td><code>agentbridge claude</code></td><td>起会话（daemon + room-bridge）</td></tr>
 <tr><td><span class="role edge">边机</span></td><td><code>abg publish --summary "&lt;文&gt;" --repo &lt;仓&gt; [--branch] [--contract] [--unblocks a,b]</code></td><td>手动发布完成事件</td></tr>
 <tr><td><span class="role all">通用</span></td><td><code>abg logs -f</code> · <code>agentbridge kill</code></td><td>看日志 / 停</td></tr>
