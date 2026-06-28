@@ -30,10 +30,10 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.24", "0.0.0-source"),
-  commit: defineString("14d0305", "source"),
+  commit: defineString("8443f08", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION),
-  codeHash: defineString("06f071428284", "source")
+  codeHash: defineString("18d9033e3f3f", "source")
 });
 function daemonStatusBuildInfo() {
   return { ...BUILD_INFO };
@@ -8818,10 +8818,10 @@ function currentWaitingMessage() {
 function currentReadyMessage() {
   return `\u2705 Codex TUI connected (${codex.activeThreadId}). Bridge ready.`;
 }
-function systemMessage(idPrefix, content) {
+function systemMessage(idPrefix, content, source = "codex") {
   return {
     id: `${idPrefix}_${SYSTEM_MSG_SALT}_${++nextSystemMessageId}`,
-    source: "codex",
+    source,
     content,
     timestamp: Date.now()
   };
@@ -9018,7 +9018,7 @@ armBootDeadline();
 bootCodex();
 startRoomBridge({
   cwd: process.cwd(),
-  emit: (text) => emitToClaude(systemMessage("system_room_event", text)),
+  emit: (text) => emitToClaude(systemMessage("system_room_event", text, "room")),
   log
 }).then((handle) => {
   if (shuttingDown)
